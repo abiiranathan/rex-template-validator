@@ -1,3 +1,4 @@
+// Package validator
 package validator
 
 import (
@@ -11,16 +12,16 @@ import (
 // ValidateTemplates validates all templates against their render calls
 func ValidateTemplates(renderCalls []RenderCall, baseDir string, templateRoot string) []ValidationResult {
 	var allErrors []ValidationResult
-
 	for _, rc := range renderCalls {
-		// Construct path using templateRoot
-		// If rc.Template is "views/index.html" and templateRoot is "templates",
-		// path is baseDir/templates/views/index.html
 		templatePath := filepath.Join(baseDir, templateRoot, rc.Template)
 		errors := validateTemplateFile(templatePath, rc.Vars, rc.Template, baseDir, templateRoot)
+		// Stamp each error with the originating Go file/line
+		for i := range errors {
+			errors[i].GoFile = rc.File
+			errors[i].GoLine = rc.Line
+		}
 		allErrors = append(allErrors, errors...)
 	}
-
 	return allErrors
 }
 
@@ -38,24 +39,34 @@ func validateTemplateFile(templatePath string, vars []TemplateVar, templateName 
 		}}
 	}
 
-	// Build root scope from vars
 	varMap := make(map[string]TemplateVar)
 	for _, v := range vars {
 		varMap[v.Name] = v
 	}
 
-	// Parse template and validate
 	return validateTemplateContent(string(content), varMap, templateName, baseDir, templateRoot)
+}
+
+// isFileBasedPartial returns true if the template name looks like a file path
+// (contains a path separator or has a file extension like .html, .tmpl, .gohtml)
+func isFileBasedPartial(name string) bool {
+	if strings.ContainsAny(name, "/\\") {
+		return true
+	}
+	ext := strings.ToLower(filepath.Ext(name))
+	switch ext {
+	case ".html", ".tmpl", ".gohtml", ".tpl", ".htm":
+		return true
+	}
+	return false
 }
 
 // validateTemplateContent validates template content with proper scope tracking
 func validateTemplateContent(content string, varMap map[string]TemplateVar, templateName string, baseDir, templateRoot string) []ValidationResult {
 	var errors []ValidationResult
 
-	// Build a stack of scopes
 	var scopeStack []ScopeType
 
-	// Initialize with root scope containing all top-level variables
 	rootScope := ScopeType{
 		IsRoot: true,
 		Fields: make([]FieldInfo, 0),
@@ -70,7 +81,6 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 	}
 	scopeStack = append(scopeStack, rootScope)
 
-	// Find all template actions
 	actionPattern := regexp.MustCompile(`\{\{\s*(.+?)\s*\}\}`)
 	lines := strings.Split(content, "\n")
 
@@ -83,9 +93,8 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 			}
 
 			action := strings.TrimSpace(line[match[2]:match[3]])
-			col := match[2] + 1 // 1-based column
+			col := match[2] + 1
 
-			// Skip comments
 			if strings.HasPrefix(action, "/*") || strings.HasPrefix(action, "//") {
 				continue
 			}
@@ -114,57 +123,87 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 				continue
 			}
 
-			// Handle if/else - they don't change scope
+			// Handle if/else
 			if strings.HasPrefix(action, "if ") || action == "else" || strings.HasPrefix(action, "else if") {
 				continue
 			}
 
 			// Handle template calls
 			if strings.HasPrefix(action, "template ") {
-				// Parse template call arguments
 				parts := parseTemplateAction(action)
 
-				// Check partial existence
 				if len(parts) >= 1 {
 					tmplName := parts[0]
-					// Partial paths are usually relative to the template root (or match what is passed to ParseFiles)
+
+					// FIX 1: Only resolve file-based partials, not named blocks
+					if !isFileBasedPartial(tmplName) {
+						// It's a named block (defined with {{ define "blockName" }}), skip file resolution
+						// but still validate the context argument if present
+						if len(parts) >= 2 {
+							contextArg := parts[1]
+							if strings.HasPrefix(contextArg, ".") && contextArg != "." {
+								if err := validateVariableInScope(contextArg, scopeStack, varMap, lineNum+1, col, templateName); err != nil {
+									errors = append(errors, *err)
+								}
+							}
+						}
+						continue
+					}
+
+					// File-based partial: check existence
+					// FIX 2: Use tmplName (relative) for error reporting, not the full path
 					fullPath := filepath.Join(baseDir, templateRoot, tmplName)
 					if _, err := os.Stat(fullPath); os.IsNotExist(err) {
 						errors = append(errors, ValidationResult{
-							Template: templateName,
+							Template: templateName, // caller template name (relative)
 							Line:     lineNum + 1,
 							Column:   col,
 							Variable: tmplName,
 							Message:  fmt.Sprintf(`Partial template "%s" could not be found at %s`, tmplName, fullPath),
 							Severity: "error",
 						})
+						continue
 					}
-				}
 
-				if len(parts) >= 2 {
-					// Check if the context argument exists
-					contextArg := parts[1]
-					if strings.HasPrefix(contextArg, ".") && contextArg != "." {
-						if err := validateVariableInScope(contextArg, scopeStack, varMap, lineNum+1, col, templateName); err != nil {
-							errors = append(errors, *err)
+					// FIX 3: Resolve context passed to partial and recursively validate it
+					if len(parts) >= 2 {
+						contextArg := parts[1]
+
+						// Resolve the scope that will be passed as "." to the partial
+						partialScope := resolvePartialScope(contextArg, scopeStack, varMap)
+
+						// Build a varMap for the partial based on the resolved scope
+						partialVarMap := buildPartialVarMap(contextArg, partialScope, scopeStack, varMap)
+
+						// Validate the context argument itself in current scope
+						if strings.HasPrefix(contextArg, ".") && contextArg != "." {
+							if err := validateVariableInScope(contextArg, scopeStack, varMap, lineNum+1, col, templateName); err != nil {
+								errors = append(errors, *err)
+							}
 						}
+
+						// Recursively validate the partial with the resolved scope
+						// Use tmplName as the logical name for diagnostics (FIX 2)
+						partialErrors := validateTemplateFile(fullPath, scopeVarsToTemplateVars(partialVarMap), tmplName, baseDir, templateRoot)
+						errors = append(errors, partialErrors...)
+					} else {
+						// No context passed — validate partial with empty scope
+						partialErrors := validateTemplateFile(fullPath, nil, tmplName, baseDir, templateRoot)
+						errors = append(errors, partialErrors...)
 					}
 				}
 				continue
 			}
 
-			// Check for variable access
-			// Pattern: starts with . or $ (but $ is always root)
+			// Variable access starting with .
 			if strings.HasPrefix(action, ".") && !strings.HasPrefix(action, "..") {
-				// This is a variable access
 				if err := validateVariableInScope(action, scopeStack, varMap, lineNum+1, col, templateName); err != nil {
 					errors = append(errors, *err)
 				}
 				continue
 			}
 
-			// Check function calls that might contain variable references
-			// e.g., "not .IsLast", "eq .Name "foo""
+			// Check function call arguments for variable references
 			words := strings.Fields(action)
 			for _, word := range words {
 				if strings.HasPrefix(word, ".") && !strings.HasPrefix(word, "..") {
@@ -179,11 +218,78 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 	return errors
 }
 
+// resolvePartialScope resolves what scope/type the context argument refers to
+func resolvePartialScope(contextArg string, scopeStack []ScopeType, varMap map[string]TemplateVar) ScopeType {
+	if contextArg == "." {
+		// Pass current scope as-is
+		if len(scopeStack) > 0 {
+			return scopeStack[len(scopeStack)-1]
+		}
+		return ScopeType{IsRoot: true}
+	}
+	if strings.HasPrefix(contextArg, ".") {
+		return createScopeFromExpression(contextArg, scopeStack, varMap)
+	}
+	return ScopeType{Fields: []FieldInfo{}}
+}
+
+// buildPartialVarMap builds a varMap for a partial based on the context argument and resolved scope.
+// When "." is passed, the partial sees all fields of the current scope as top-level vars.
+// When ".SomeVar" is passed, the partial sees SomeVar's fields as top-level vars.
+func buildPartialVarMap(contextArg string, partialScope ScopeType, scopeStack []ScopeType, varMap map[string]TemplateVar) map[string]TemplateVar {
+	result := make(map[string]TemplateVar)
+
+	if contextArg == "." {
+		// The partial receives the current dot — expose all fields of current scope
+		// If we're in root scope, that means all top-level vars are available
+		if len(scopeStack) > 0 {
+			currentScope := scopeStack[len(scopeStack)-1]
+			if currentScope.IsRoot {
+				// Pass through all root variables
+				for k, v := range varMap {
+					result[k] = v
+				}
+			} else {
+				// Pass scope fields as top-level vars accessible via .FieldName
+				for _, f := range currentScope.Fields {
+					result[f.Name] = TemplateVar{
+						Name:    f.Name,
+						TypeStr: f.TypeStr,
+						Fields:  f.Fields,
+						IsSlice: f.IsSlice,
+					}
+				}
+			}
+		}
+		return result
+	}
+
+	// ".SomeVar" — the partial's dot IS SomeVar, so its fields become top-level
+	for _, f := range partialScope.Fields {
+		result[f.Name] = TemplateVar{
+			Name:    f.Name,
+			TypeStr: f.TypeStr,
+			Fields:  f.Fields,
+			IsSlice: f.IsSlice,
+		}
+	}
+
+	return result
+}
+
+// scopeVarsToTemplateVars converts a varMap back to a []TemplateVar slice
+func scopeVarsToTemplateVars(varMap map[string]TemplateVar) []TemplateVar {
+	var vars []TemplateVar
+	for _, v := range varMap {
+		vars = append(vars, v)
+	}
+	return vars
+}
+
 // createScopeFromRange creates a new scope for a range block
 func createScopeFromRange(expr string, scopeStack []ScopeType, varMap map[string]TemplateVar) ScopeType {
 	expr = strings.TrimSpace(expr)
 
-	// Handle variable assignment like "$item := .Items"
 	if strings.Contains(expr, ":=") {
 		parts := strings.SplitN(expr, ":=", 2)
 		if len(parts) == 2 {
@@ -204,7 +310,6 @@ func createScopeFromWith(expr string, scopeStack []ScopeType, varMap map[string]
 func createScopeFromExpression(expr string, scopeStack []ScopeType, varMap map[string]TemplateVar) ScopeType {
 	expr = strings.TrimSpace(expr)
 
-	// Handle root reference "."
 	if expr == "." {
 		if len(scopeStack) > 0 {
 			return scopeStack[len(scopeStack)-1]
@@ -217,7 +322,6 @@ func createScopeFromExpression(expr string, scopeStack []ScopeType, varMap map[s
 	}
 
 	parts := strings.Split(expr, ".")
-	// parts[0] is empty. parts[1] is the first segment.
 	if len(parts) < 2 {
 		return ScopeType{Fields: []FieldInfo{}}
 	}
@@ -227,7 +331,6 @@ func createScopeFromExpression(expr string, scopeStack []ScopeType, varMap map[s
 
 	firstPart := parts[1]
 
-	// 1. Try finding in current scope (context-relative)
 	if len(scopeStack) > 0 {
 		currentScope := scopeStack[len(scopeStack)-1]
 		for _, f := range currentScope.Fields {
@@ -240,7 +343,6 @@ func createScopeFromExpression(expr string, scopeStack []ScopeType, varMap map[s
 		}
 	}
 
-	// 2. If not found, try root scope (top-level variables)
 	if currentField == nil {
 		if v, ok := varMap[firstPart]; ok {
 			currentField = &FieldInfo{
@@ -254,11 +356,9 @@ func createScopeFromExpression(expr string, scopeStack []ScopeType, varMap map[s
 	}
 
 	if currentField == nil {
-		// Not found
 		return ScopeType{Fields: []FieldInfo{}}
 	}
 
-	// 3. Traverse remaining path
 	for _, part := range remainingParts {
 		found := false
 		for _, f := range currentField.Fields {
@@ -287,12 +387,10 @@ func createScopeFromExpression(expr string, scopeStack []ScopeType, varMap map[s
 func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[string]TemplateVar, line, col int, templateName string) *ValidationResult {
 	varExpr = strings.TrimSpace(varExpr)
 
-	// Root reference "." is always valid
 	if varExpr == "." {
 		return nil
 	}
 
-	// Remove trailing dots or other punctuation
 	varExpr = strings.TrimRight(varExpr, ".")
 
 	parts := strings.Split(varExpr, ".")
@@ -300,12 +398,10 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 		return nil
 	}
 
-	// If we're inside a range block (more than just root scope), check against current scope first
 	if len(scopeStack) > 1 {
 		currentScope := scopeStack[len(scopeStack)-1]
 		fieldName := parts[1]
 
-		// Check if this field exists in the current scope
 		var foundField *FieldInfo
 		for _, f := range currentScope.Fields {
 			if f.Name == fieldName {
@@ -316,21 +412,16 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 		}
 
 		if foundField != nil {
-			// Found in current scope, now validate the rest of the path
 			if len(parts) > 2 {
 				return validateNestedFields(parts[2:], foundField.Fields, foundField.TypeStr, varExpr, line, col, templateName)
 			}
 			return nil
 		}
-
-		// If not found in current scope, fall through to check root scope
 	}
 
-	// Check if this is accessing root context (.VarName) - only 1 level deep
 	if len(parts) == 2 {
 		rootVar := parts[1]
 
-		// Check if it exists in the root scope
 		rootScope := scopeStack[0]
 		for _, f := range rootScope.Fields {
 			if f.Name == rootVar {
@@ -338,12 +429,10 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 			}
 		}
 
-		// Check varMap directly
 		if _, ok := varMap[rootVar]; ok {
 			return nil
 		}
 
-		// Not found in root
 		return &ValidationResult{
 			Template: templateName,
 			Line:     line,
@@ -354,25 +443,19 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 		}
 	}
 
-	// Multi-part access like .visit.Patient.Name
-	// Validate each part
 	rootVar := parts[1]
 
-	// First check if root exists
 	var rootVarInfo *TemplateVar
 	if v, ok := varMap[rootVar]; ok {
 		rootVarInfo = &v
 	} else {
-		// Check root scope
 		rootScope := scopeStack[0]
 		for _, f := range rootScope.Fields {
 			if f.Name == rootVar {
-				// Found, now check nested fields
 				return validateNestedFields(parts[2:], f.Fields, f.TypeStr, varExpr, line, col, templateName)
 			}
 		}
 
-		// Not found
 		return &ValidationResult{
 			Template: templateName,
 			Line:     line,
@@ -383,7 +466,6 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 		}
 	}
 
-	// Validate the rest of the path
 	if rootVarInfo != nil {
 		return validateNestedFields(parts[2:], rootVarInfo.Fields, rootVarInfo.TypeStr, varExpr, line, col, templateName)
 	}
@@ -410,7 +492,6 @@ func validateNestedFields(fieldParts []string, fields []FieldInfo, parentTypeNam
 		}
 
 		if !found {
-			// Build the partial expression up to this point
 			if parentType == "" {
 				parentType = "unknown"
 			}
@@ -432,7 +513,6 @@ func validateNestedFields(fieldParts []string, fields []FieldInfo, parentTypeNam
 
 // parseTemplateAction parses a template action to extract arguments
 func parseTemplateAction(action string) []string {
-	// Remove "template " prefix
 	rest := strings.TrimPrefix(action, "template ")
 	rest = strings.TrimSpace(rest)
 

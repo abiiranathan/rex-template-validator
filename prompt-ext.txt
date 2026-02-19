@@ -1,0 +1,2067 @@
+==> extension/tsconfig.json <==
+{
+  "compilerOptions": {
+    "module": "commonjs",
+    "target": "ES2020",
+    "outDir": "./out",
+    "lib": ["ES2020"],
+    "sourceMap": true,
+    "rootDir": "./src",
+    "strict": true,
+    "esModuleInterop": true
+  },
+  "exclude": ["node_modules", ".vscode-test"]
+}
+
+==> extension/package.json <==
+{
+  "name": "rex-template-validator",
+  "displayName": "Rex Template Validator",
+  "description": "Validates Go template variables in .html/.tmpl files used with the rex framework",
+  "version": "0.1.0",
+  "publisher": "Nabiizy",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Linters",
+    "Other"
+  ],
+  "keywords": [
+    "go",
+    "golang",
+    "template",
+    "html",
+    "rex",
+    "validation"
+  ],
+  "activationEvents": [
+    "workspaceContains:**/*.go",
+    "onLanguage:html",
+    "onLanguage:go-template"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "rexTemplateValidator.validate",
+        "title": "Rex: Validate Template Variables",
+        "icon": "$(check-all)"
+      },
+      {
+        "command": "rexTemplateValidator.rebuildIndex",
+        "title": "Rex: Rebuild Template Index",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "rexTemplateValidator.showKnowledgeGraph",
+        "title": "Rex: Show Template Knowledge Graph"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "rexTemplateValidator.validate",
+          "when": "resourceExtname == .html || resourceExtname == .tmpl",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Rex Template Validator",
+      "properties": {
+        "rexTemplateValidator.goAnalyzerPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the rex-analyzer binary. Leave empty to use the bundled binary."
+        },
+        "rexTemplateValidator.scanDirectories": {
+          "type": "array",
+          "default": [],
+          "description": "Additional directories to scan for Go files. Empty = entire workspace."
+        },
+        "rexTemplateValidator.templateRoot": {
+          "type": "string",
+          "default": "",
+          "description": "Root directory for templates relative to workspace root (e.g. 'templates'). Useful when using embed.FS or subdirectory views."
+        },
+        "rexTemplateValidator.debounceMs": {
+          "type": "number",
+          "default": 1500,
+          "description": "Debounce delay in ms before re-validating on file change."
+        },
+        "rexTemplateValidator.enableAutoValidate": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically validate templates on save."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile && npm run build-analyzer",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "build-analyzer": "cd ../analyzer && go build -o ../extension/out/rex-analyzer .",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {}
+}
+==> extension/src/types.ts <==
+// Types mirroring the Go analyzer output
+
+export interface FieldInfo {
+  name: string;
+  type: string;
+  fields?: FieldInfo[];
+  isSlice: boolean;
+  methods?: string[];
+}
+
+export interface TemplateVar {
+  name: string;
+  type: string;
+  fields?: FieldInfo[];
+  isSlice: boolean;
+  elemType?: string;
+}
+
+export interface RenderCall {
+  file: string;
+  line: number;
+  template: string;
+  vars: TemplateVar[];
+}
+
+export interface GoValidationError {
+  template: string;
+  line: number;
+  column: number;
+  variable: string;
+  message: string;
+  severity: 'error' | 'warning';
+  goFile?: string;  // relative path to the .go file with the c.Render() call
+  goLine?: number;
+}
+
+export interface AnalysisResult {
+  renderCalls: RenderCall[];
+  errors: string[];
+  validationErrors?: GoValidationError[];
+}
+
+// Template knowledge graph
+export interface TemplateContext {
+  templatePath: string;         // e.g. "views/inpatient/treatment-chart.html"
+  vars: Map<string, TemplateVar>;
+  renderCalls: RenderCall[];    // all Go render calls pointing here
+}
+
+export interface KnowledgeGraph {
+  // template path -> context
+  templates: Map<string, TemplateContext>;
+  // last analysis time
+  analyzedAt: Date;
+}
+
+// Template parse results
+export interface TemplateNode {
+  kind: 'variable' | 'range' | 'if' | 'with' | 'block' | 'partial' | 'call';
+  path: string[];        // e.g. ["Visit", "Doctor", "DisplayName"]
+  rawText: string;
+  line: number;
+  col: number;
+  endLine?: number;
+  endCol?: number;
+  children?: TemplateNode[];
+  partialName?: string;  // for 'partial' kind
+}
+
+export interface ValidationError {
+  message: string;
+  line: number;
+  col: number;
+  severity: 'error' | 'warning' | 'info';
+  variable?: string;
+}
+
+==> extension/src/validator.ts <==
+import * as fs from 'fs';
+import * as vscode from 'vscode';
+import { TemplateContext, TemplateNode, TemplateVar, ValidationError, FieldInfo } from './types';
+import { TemplateParser, resolvePath } from './templateParser';
+import { KnowledgeGraphBuilder } from './knowledgeGraph';
+
+interface ScopeFrame {
+  key: string;
+  typeStr: string;
+  fields?: FieldInfo[];
+  isRange?: boolean;
+}
+
+export class TemplateValidator {
+  private parser = new TemplateParser();
+  private outputChannel: vscode.OutputChannel;
+  private graphBuilder: KnowledgeGraphBuilder;
+
+  constructor(outputChannel: vscode.OutputChannel, graphBuilder: KnowledgeGraphBuilder) {
+    this.outputChannel = outputChannel;
+    this.graphBuilder = graphBuilder;
+  }
+
+  /**
+   * Validate a template document and return VSCode diagnostics.
+   */
+  async validateDocument(document: vscode.TextDocument): Promise<vscode.Diagnostic[]> {
+    const ctx = this.graphBuilder.findContextForFile(document.uri.fsPath);
+
+    if (!ctx) {
+      // No Go render call found for this template - warn softly
+      return [
+        new vscode.Diagnostic(
+          new vscode.Range(0, 0, 0, 0),
+          'No rex.Render() call found for this template. Run "Rex: Rebuild Template Index" if you just added it.',
+          vscode.DiagnosticSeverity.Information
+        ),
+      ];
+    }
+
+    const content = document.getText();
+    const errors = this.validate(content, ctx, document.uri.fsPath);
+
+    return errors.map((e) => {
+      const line = Math.max(0, e.line - 1);
+      const col = Math.max(0, e.col - 1);
+      const range = new vscode.Range(line, col, line, col + (e.variable?.length ?? 10));
+      return new vscode.Diagnostic(
+        range,
+        e.message,
+        e.severity === 'error'
+          ? vscode.DiagnosticSeverity.Error
+          : e.severity === 'warning'
+            ? vscode.DiagnosticSeverity.Warning
+            : vscode.DiagnosticSeverity.Information
+      );
+    });
+  }
+
+  /**
+   * Core validation logic. Returns errors.
+   */
+  validate(
+    content: string,
+    ctx: TemplateContext,
+    filePath: string
+  ): ValidationError[] {
+    const errors: ValidationError[] = [];
+    const nodes = this.parser.parse(content);
+
+    // Build a scope-aware traversal
+    this.validateNodes(nodes, ctx.vars, [], errors, ctx, filePath, content);
+
+    return errors;
+  }
+
+  private validateNodes(
+    nodes: TemplateNode[],
+    vars: Map<string, TemplateVar>,
+    scopeStack: ScopeFrame[],
+    errors: ValidationError[],
+    ctx: TemplateContext,
+    filePath: string,
+    fullContent: string
+  ) {
+    for (const node of nodes) {
+      this.validateNode(node, vars, scopeStack, errors, ctx, filePath, fullContent);
+    }
+  }
+
+  private validateNode(
+    node: TemplateNode,
+    vars: Map<string, TemplateVar>,
+    scopeStack: ScopeFrame[],
+    errors: ValidationError[],
+    ctx: TemplateContext,
+    filePath: string,
+    fullContent: string
+  ) {
+    switch (node.kind) {
+      case 'variable': {
+        const result = resolvePath(node.path, vars, scopeStack);
+        if (!result.found && node.path.length > 0 && node.path[0] !== '.') {
+          errors.push({
+            message: `Template variable ".${node.path.join('.')}" is not defined in the render context`,
+            line: node.line,
+            col: node.col,
+            severity: 'error',
+            variable: node.path[0],
+          });
+        }
+        break;
+      }
+
+      case 'range': {
+        // Check the range variable exists and is a slice
+        if (node.path.length > 0 && node.path[0] !== '.') {
+          const result = resolvePath(node.path, vars, scopeStack);
+          if (!result.found) {
+            errors.push({
+              message: `Range target ".${node.path.join('.')}" is not defined in the render context`,
+              line: node.line,
+              col: node.col,
+              severity: 'error',
+              variable: node.path[0],
+            });
+          } else {
+            // Push elem type into scope as "."
+            const topVar = vars.get(node.path[0]);
+            if (topVar && topVar.isSlice) {
+              scopeStack.push({
+                key: '.',
+                typeStr: topVar.elemType ?? 'unknown',
+                fields: topVar.fields,
+                isRange: true,
+              });
+            }
+          }
+        }
+        break;
+      }
+
+      case 'with':
+      case 'if': {
+        if (node.path.length > 0 && node.path[0] !== '.') {
+          const result = resolvePath(node.path, vars, scopeStack);
+          if (!result.found) {
+            errors.push({
+              message: `Condition ".${node.path.join('.')}" is not defined in the render context`,
+              line: node.line,
+              col: node.col,
+              severity: 'warning',
+              variable: node.path[0],
+            });
+          }
+        }
+        break;
+      }
+
+      case 'partial': {
+        this.validatePartial(node, vars, scopeStack, errors, ctx, filePath, fullContent);
+        break;
+      }
+    }
+
+    // Recurse children
+    if (node.children) {
+      this.validateNodes(node.children, vars, scopeStack, errors, ctx, filePath, fullContent);
+    }
+  }
+
+  private validatePartial(
+    node: TemplateNode,
+    _vars: Map<string, TemplateVar>,
+    _scopeStack: ScopeFrame[],
+    errors: ValidationError[],
+    ctx: TemplateContext,
+    filePath: string,
+    _fullContent: string
+  ) {
+    if (!node.partialName) return;
+
+    const partialCtx = this.graphBuilder.findPartialContext(node.partialName, filePath);
+    if (!partialCtx) {
+      errors.push({
+        message: `Partial template "${node.partialName}" could not be found`,
+        line: node.line,
+        col: node.col,
+        severity: 'warning',
+        variable: node.partialName,
+      });
+      return;
+    }
+
+    // Read and validate the partial with the passed context
+    const partialPath = partialCtx.templatePath;
+    if (!fs.existsSync(partialPath)) return;
+
+    try {
+      const partialContent = fs.readFileSync(partialPath, 'utf8');
+      // Validate partial using the same vars (context is passed down)
+      const partialErrors = this.validate(partialContent, ctx, partialPath);
+      for (const e of partialErrors) {
+        errors.push({
+          ...e,
+          message: `[in partial "${node.partialName}"] ${e.message}`,
+        });
+      }
+    } catch {
+      // ignore read errors
+    }
+  }
+
+  /**
+   * Get hover information for a variable at a given position.
+   */
+  getHoverInfo(
+    document: vscode.TextDocument,
+    position: vscode.Position,
+    ctx: TemplateContext
+  ): vscode.Hover | null {
+    const content = document.getText();
+    const nodes = this.parser.parse(content);
+    
+    const hit = this.findNodeAndScope(nodes, position, ctx.vars, []);
+    if (!hit) {
+        return null;
+    }
+    
+    const { node, stack } = hit;
+    
+    // Resolve the variable using the found scope stack
+    const result = resolvePath(node.path, ctx.vars, stack);
+
+    if (result.found) {
+      // Reconstruct variable name from path
+      // If path starts with valid char, assume it's root or field.
+      // We usually prefix with . for display unless it's a root var?
+      // Standardize on dot notation for display.
+      const varName = '.' + node.path.join('.');
+      
+      const md = new vscode.MarkdownString();
+      md.appendCodeblock(`${varName}: ${result.typeStr}`, 'go');
+
+      if (result.fields && result.fields.length > 0) {
+        md.appendMarkdown('\n\n**Available fields:**\n');
+        for (const f of result.fields.slice(0, 15)) {
+          md.appendMarkdown(`- \`.${f.name}\`: \`${f.type}\`\n`);
+        }
+      }
+
+      return new vscode.Hover(md);
+    }
+
+    return null;
+  }
+
+  private findNodeAndScope(
+    nodes: TemplateNode[],
+    position: vscode.Position,
+    vars: Map<string, TemplateVar>,
+    scopeStack: ScopeFrame[]
+  ): { node: TemplateNode; stack: ScopeFrame[] } | null {
+    for (const node of nodes) {
+      const startLine = node.line - 1;
+      const startCol = node.col - 1;
+
+      // Check if position is after start of node
+      if (position.line < startLine || (position.line === startLine && position.character < startCol)) {
+        continue;
+      }
+
+      // Variable node (leaf)
+      if (node.kind === 'variable') {
+        // Approximate end
+        const endCol = startCol + node.rawText.length;
+        if (position.line === startLine && position.character <= endCol) {
+          return { node, stack: scopeStack };
+        }
+        continue;
+      }
+
+      // Block node
+      if (node.endLine !== undefined && node.endCol !== undefined) {
+        const endLine = node.endLine - 1;
+        const endCol = node.endCol - 1;
+
+        // Check if cursor is on the OPENING tag (to hover the condition/range var)
+        const openingEndCol = startCol + node.rawText.length;
+        if (position.line === startLine && position.character >= startCol && position.character <= openingEndCol) {
+             return { node, stack: scopeStack }; // Use current stack
+        }
+
+        const beforeEnd =
+          position.line < endLine || (position.line === endLine && position.character <= endCol);
+
+        if (beforeEnd) {
+          // Inside block content
+          let nextStack = scopeStack;
+
+          if (node.kind === 'range' || node.kind === 'with') {
+            const result = resolvePath(node.path, vars, scopeStack);
+            if (result.found && result.fields) {
+                // Determine implicit type for "."
+                // For range, result.fields are element fields (if slice)
+                // For with, result.fields are struct fields
+                
+                const newFrame: ScopeFrame = {
+                    key: '.',
+                    typeStr: result.typeStr, 
+                    fields: result.fields,
+                    isRange: node.kind === 'range'
+                };
+                nextStack = [...scopeStack, newFrame];
+            }
+          }
+
+          if (node.children) {
+            const found = this.findNodeAndScope(node.children, position, vars, nextStack);
+            if (found) return found;
+          }
+          
+          // Cursor is inside block but not on a child variable?
+          // Return null as we only hover variables
+        }
+      }
+    }
+    return null;
+  }
+
+
+  /**
+   * Get completion items for dot expressions.
+   */
+  getCompletions(
+    document: vscode.TextDocument,
+    position: vscode.Position,
+    ctx: TemplateContext
+  ): vscode.CompletionItem[] {
+    const line = document.lineAt(position.line).text.slice(0, position.character);
+
+    // Find what's before the cursor
+    const dotMatch = line.match(/\{\{.*?\.([\w.]*)$/);
+    if (!dotMatch) return [];
+
+    const partial = dotMatch[1];
+    const parts = partial.split('.');
+
+    // If one part, suggest top-level vars
+    if (parts.length <= 1) {
+      const prefix = parts[0] ?? '';
+      return [...ctx.vars.values()]
+        .filter((v) => v.name.toLowerCase().startsWith(prefix.toLowerCase()))
+        .map((v) => {
+          const item = new vscode.CompletionItem(v.name, vscode.CompletionItemKind.Variable);
+          item.detail = v.type;
+          item.documentation = new vscode.MarkdownString(`**Type:** \`${v.type}\``);
+          return item;
+        });
+    }
+
+    // Resolve parent path and suggest fields
+    const parentPath = parts.slice(0, -1);
+    const prefix = parts[parts.length - 1];
+    const topVar = ctx.vars.get(parentPath[0]);
+
+    if (!topVar || !topVar.fields) return [];
+
+    let fields = topVar.fields;
+    for (let i = 1; i < parentPath.length; i++) {
+      const field = fields.find((f) => f.name === parentPath[i]);
+      if (!field) return [];
+      fields = field.fields ?? [];
+    }
+
+    return fields
+      .filter((f) => f.name.toLowerCase().startsWith(prefix.toLowerCase()))
+      .map((f) => {
+        const kind =
+          f.type === 'method'
+            ? vscode.CompletionItemKind.Method
+            : vscode.CompletionItemKind.Field;
+        const item = new vscode.CompletionItem(f.name, kind);
+        item.detail = f.type;
+        return item;
+      });
+  }
+}
+
+==> extension/src/graphPanel.ts <==
+import * as vscode from 'vscode';
+import { KnowledgeGraph } from './types';
+
+export class KnowledgeGraphPanel {
+  private static currentPanel: KnowledgeGraphPanel | undefined;
+  private readonly panel: vscode.WebviewPanel;
+  private disposables: vscode.Disposable[] = [];
+
+  static show(context: vscode.ExtensionContext, graph: KnowledgeGraph) {
+    if (KnowledgeGraphPanel.currentPanel) {
+      KnowledgeGraphPanel.currentPanel.panel.reveal();
+      KnowledgeGraphPanel.currentPanel.update(graph);
+      return;
+    }
+
+    const panel = vscode.window.createWebviewPanel(
+      'rexKnowledgeGraph',
+      'Rex Template Knowledge Graph',
+      vscode.ViewColumn.Beside,
+      { enableScripts: true }
+    );
+
+    KnowledgeGraphPanel.currentPanel = new KnowledgeGraphPanel(panel, graph, context);
+  }
+
+  private constructor(
+    panel: vscode.WebviewPanel,
+    graph: KnowledgeGraph,
+    context: vscode.ExtensionContext
+  ) {
+    this.panel = panel;
+    this.panel.webview.html = this.buildHTML(graph);
+
+    this.panel.onDidDispose(
+      () => {
+        KnowledgeGraphPanel.currentPanel = undefined;
+        this.dispose();
+      },
+      null,
+      this.disposables
+    );
+  }
+
+  update(graph: KnowledgeGraph) {
+    this.panel.webview.html = this.buildHTML(graph);
+  }
+
+  private dispose() {
+    this.disposables.forEach((d) => d.dispose());
+  }
+
+  private shortType(typeStr: string): string {
+    // "github.com/example/pkg.TypeName" -> "TypeName"
+    // "*github.com/example/pkg.TypeName" -> "*TypeName"
+    const prefix = typeStr.startsWith('*') ? '*' : '';
+    const base = typeStr.replace(/^\*/, '');
+    const parts = base.split('.');
+    return prefix + parts[parts.length - 1];
+  }
+
+  private buildHTML(graph: KnowledgeGraph): string {
+    const nodes: { id: string; label: string; group: string }[] = [];
+    const edges: { from: string; to: string; label?: string }[] = [];
+
+    for (const [tplPath, ctx] of graph.templates) {
+      const tplId = `tpl:${tplPath}`;
+      nodes.push({
+        id: tplId,
+        label: tplPath.split('/').slice(-2).join('/'),
+        group: 'template',
+      });
+
+      for (const [varName, v] of ctx.vars) {
+        const varId = `var:${tplPath}:${varName}`;
+        nodes.push({
+          id: varId,
+          label: `${varName}\n(${this.shortType(v.type)})`,
+          group: 'variable',
+        });
+        edges.push({ from: tplId, to: varId });
+
+        // Show fields
+        if (v.fields) {
+          for (const f of v.fields.slice(0, 8)) {
+            const fId = `field:${tplPath}:${varName}:${f.name}`;
+            nodes.push({
+              id: fId,
+              label: `${f.name}\n(${this.shortType(f.type)})`,
+              group: 'field',
+            });
+            edges.push({ from: varId, to: fId, label: '' });
+          }
+        }
+      }
+
+      // Go source -> template edges
+      for (const rc of ctx.renderCalls) {
+        const srcId = `src:${rc.file}:${rc.line}`;
+        const existingNode = nodes.find((n) => n.id === srcId);
+        if (!existingNode) {
+          const shortFile = rc.file.split('/').slice(-2).join('/');
+          nodes.push({
+            id: srcId,
+            label: `${shortFile}\nL${rc.line}`,
+            group: 'gofile',
+          });
+        }
+        edges.push({ from: srcId, to: tplId, label: 'Render()' });
+      }
+    }
+
+    const nodesJson = JSON.stringify(nodes);
+    const edgesJson = JSON.stringify(edges);
+    const analyzedAt = graph.analyzedAt.toLocaleTimeString();
+
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Rex Template Knowledge Graph</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --border: #2a2d3a;
+    --accent: #6c63ff;
+    --green: #00d9a3;
+    --yellow: #ffd166;
+    --red: #ef476f;
+    --text: #e2e8f0;
+    --muted: #64748b;
+    --font: 'Fira Code', 'Cascadia Code', monospace;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  header {
+    padding: 12px 20px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+
+  header h1 {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--accent);
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+
+  .badge {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 4px;
+    background: rgba(108,99,255,0.15);
+    color: var(--accent);
+    border: 1px solid rgba(108,99,255,0.3);
+  }
+
+  .time {
+    margin-left: auto;
+    font-size: 11px;
+    color: var(--muted);
+  }
+
+  .legend {
+    display: flex;
+    gap: 16px;
+    padding: 8px 20px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    font-size: 11px;
+  }
+
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--muted);
+  }
+
+  .dot {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+  }
+
+  .dot.template { background: var(--accent); }
+  .dot.variable { background: var(--green); }
+  .dot.field    { background: var(--yellow); }
+  .dot.gofile   { background: #ff6b9d; }
+
+  #graph-container {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+  }
+
+  canvas {
+    width: 100%;
+    height: 100%;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>⬡ Rex Template Knowledge Graph</h1>
+  <span class="badge">${nodes.length} nodes · ${edges.length} edges</span>
+  <span class="time">Analyzed at ${analyzedAt}</span>
+</header>
+<div class="legend">
+  <div class="legend-item"><div class="dot gofile"></div> Go Handler</div>
+  <div class="legend-item"><div class="dot template"></div> Template</div>
+  <div class="legend-item"><div class="dot variable"></div> Variable</div>
+  <div class="legend-item"><div class="dot field"></div> Field</div>
+</div>
+<div id="graph-container">
+  ${nodes.length === 0 ? `
+    <div class="no-data">
+      <div class="icon">🔍</div>
+      <div>No render calls found. Rebuild the index first.</div>
+    </div>` : '<canvas id="canvas"></canvas>'}
+  <div class="tooltip" id="tooltip"></div>
+</div>
+
+<script>
+const RAW_NODES = ${nodesJson};
+const RAW_EDGES = ${edgesJson};
+
+function log(msg) {
+    console.log(msg);
+}
+
+if (RAW_NODES.length > 0) {
+  const canvas = document.getElementById('canvas');
+  const tooltip = document.getElementById('tooltip');
+  const container = document.getElementById('graph-container');
+  const ctx = canvas.getContext('2d');
+
+  const COLORS = {
+    template: '#6c63ff',
+    variable: '#00d9a3',
+    field: '#ffd166',
+    gofile: '#ff6b9d',
+  };
+
+  let width = 0, height = 0;
+  let nodes = [], edges = [];
+  let transform = { x: 0, y: 0, scale: 1 };
+  let dragging = null, panning = false, lastMouse = null;
+  let animFrame;
+
+  function resize() {
+    if (!container) return;
+    width = canvas.width = container.clientWidth;
+    height = canvas.height = container.clientHeight;
+    log(\`Size: \${width}x\${height} | Nodes: \${nodes.length}\`);
+    
+    // Center the graph if offset
+    transform.x = width / 2;
+    transform.y = height / 2;
+    // We render relative to center (0,0 is center)
+  }
+
+  function initNodes() {
+    // Need dimensions to place initially
+    if (width === 0 || height === 0) return;
+
+    const angleStep = (2 * Math.PI) / Math.max(RAW_NODES.length, 1);
+    const radius = Math.min(width, height) * 0.35;
+    
+    nodes = RAW_NODES.map((n, i) => ({
+      ...n,
+      // Initialize around (0,0) which we will center with transform
+      x: radius * Math.cos(i * angleStep),
+      y: radius * Math.sin(i * angleStep),
+      vx: 0, vy: 0,
+    }));
+    
+    edges = RAW_EDGES.map(e => ({
+      ...e,
+      source: nodes.find(n => n.id === e.from),
+      target: nodes.find(n => n.id === e.to),
+    })).filter(e => e.source && e.target);
+    
+    log(\`Initialized \${nodes.length} nodes\`);
+  }
+
+  // Force-directed layout
+  function tick() {
+    const repulse = 5000; // Stronger repulsion
+    const attract = 0.05;
+
+    // Repulsion
+    for (let i = 0; i < nodes.length; i++) {
+      for (let j = i + 1; j < nodes.length; j++) {
+        const a = nodes[i], b = nodes[j];
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let dist = Math.sqrt(dx*dx + dy*dy);
+        
+        // Jitter if overlapping
+        if (dist < 0.1) {
+            dx = (Math.random() - 0.5);
+            dy = (Math.random() - 0.5);
+            dist = Math.sqrt(dx*dx + dy*dy) || 1;
+        }
+        
+        const force = repulse / (dist * dist);
+        a.vx -= force * dx / dist;
+        a.vy -= force * dy / dist;
+        b.vx += force * dx / dist;
+        b.vy += force * dy / dist;
+      }
+    }
+
+    // Attraction along edges
+    for (const e of edges) {
+      if (!e.source || !e.target) continue;
+      const dx = e.target.x - e.source.x;
+      const dy = e.target.y - e.source.y;
+      const dist = Math.sqrt(dx*dx + dy*dy) || 1;
+      const force = attract * (dist - 100);
+      e.source.vx += force * dx / dist;
+      e.source.vy += force * dy / dist;
+      e.target.vx -= force * dx / dist;
+      e.target.vy -= force * dy / dist;
+    }
+    
+    // Center gravity (pull to 0,0)
+    for (const n of nodes) {
+        const dist = Math.sqrt(n.x*n.x + n.y*n.y) || 1;
+        const force = 0.01 * dist; // Weak pull to center
+        n.vx -= force * n.x / dist;
+        n.vy -= force * n.y / dist;
+    }
+
+    // Damping + integrate
+    for (const n of nodes) {
+      n.vx *= 0.85; n.vy *= 0.85;
+      n.x += n.vx; n.y += n.vy;
+    }
+  }
+
+  function draw() {
+    try {
+        ctx.clearRect(0, 0, width, height);
+        
+        // Debug border
+        ctx.strokeStyle = '#333';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(0, 0, width, height);
+
+        ctx.save();
+        // Move origin to center + transform offset
+        ctx.translate(transform.x, transform.y);
+        ctx.scale(transform.scale, transform.scale);
+
+        // Edges
+        ctx.strokeStyle = 'rgba(100,116,139,0.35)';
+        ctx.lineWidth = 1;
+        for (const e of edges) {
+          if (!e.source || !e.target) continue;
+          ctx.beginPath();
+          ctx.moveTo(e.source.x, e.source.y);
+          ctx.lineTo(e.target.x, e.target.y);
+          ctx.stroke();
+        }
+
+        // Nodes
+        for (const n of nodes) {
+          const r = n.group === 'template' ? 28 : n.group === 'gofile' ? 22 : 18;
+          const color = COLORS[n.group] || '#888';
+
+          // Glow
+          const grd = ctx.createRadialGradient(n.x, n.y, 0, n.x, n.y, r + 8);
+          grd.addColorStop(0, color + '33');
+          grd.addColorStop(1, 'transparent');
+          ctx.beginPath();
+          ctx.arc(n.x, n.y, r + 8, 0, Math.PI * 2);
+          ctx.fillStyle = grd;
+          ctx.fill();
+
+          // Circle
+          ctx.beginPath();
+          ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
+          ctx.fillStyle = '#1a1d27';
+          ctx.fill();
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 2;
+          ctx.stroke();
+
+          // Label
+          ctx.fillStyle = color;
+          ctx.font = '9px Fira Code, monospace';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          const lines = n.label.split('\\n');
+          lines.forEach((line, i) => {
+            ctx.fillText(line, n.x, n.y + (i - (lines.length-1)/2) * 11);
+          });
+        }
+
+        ctx.restore();
+    } catch(e) {
+        log('Draw error: ' + e);
+    }
+  }
+
+  function loop() {
+    tick();
+    draw();
+    animFrame = requestAnimationFrame(loop);
+  }
+
+  // Mouse interaction
+  function screenToWorld(x, y) {
+    return {
+      x: (x - transform.x) / transform.scale,
+      y: (y - transform.y) / transform.scale,
+    };
+  }
+
+  function nodeAt(wx, wy) {
+    for (const n of nodes) {
+      const r = n.group === 'template' ? 28 : 20;
+      const dx = n.x - wx, dy = n.y - wy;
+      if (dx*dx + dy*dy <= r*r) return n;
+    }
+    return null;
+  }
+
+  canvas.addEventListener('mousedown', e => {
+    const w = screenToWorld(e.offsetX, e.offsetY);
+    const n = nodeAt(w.x, w.y);
+    if (n) { dragging = n; }
+    else { panning = true; lastMouse = { x: e.offsetX, y: e.offsetY }; }
+  });
+
+  canvas.addEventListener('mousemove', e => {
+    if (dragging) {
+      const w = screenToWorld(e.offsetX, e.offsetY);
+      dragging.x = w.x; dragging.y = w.y;
+      dragging.vx = 0; dragging.vy = 0;
+    } else if (panning && lastMouse) {
+      transform.x += e.offsetX - lastMouse.x;
+      transform.y += e.offsetY - lastMouse.y;
+      lastMouse = { x: e.offsetX, y: e.offsetY };
+    } else {
+      const w = screenToWorld(e.offsetX, e.offsetY);
+      const n = nodeAt(w.x, w.y);
+      if (n) {
+        tooltip.style.display = 'block';
+        tooltip.style.left = (e.offsetX + 12) + 'px';
+        tooltip.style.top = (e.offsetY - 8) + 'px';
+        tooltip.textContent = n.id;
+      } else {
+        tooltip.style.display = 'none';
+      }
+    }
+  });
+
+  canvas.addEventListener('mouseup', () => { dragging = null; panning = false; lastMouse = null; });
+  canvas.addEventListener('mouseleave', () => { dragging = null; panning = false; tooltip.style.display = 'none'; });
+
+  canvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    const factor = e.deltaY > 0 ? 0.9 : 1.1;
+    // Zoom towards cursor (cx, cy)
+    // transform.x and y are translation.
+    // screenX = worldX * scale + transX
+    // newScale = scale * factor
+    // transX' = cx - (cx - transX) * factor
+    const cx = e.offsetX, cy = e.offsetY;
+    transform.x = cx - factor * (cx - transform.x);
+    transform.y = cy - factor * (cy - transform.y);
+    transform.scale *= factor;
+  }, { passive: false });
+
+  window.addEventListener('resize', () => {
+      resize();
+      // If we haven't initialized nodes yet (because width was 0), do it now
+      if (nodes.length === 0 && width > 0) {
+          initNodes();
+      }
+  });
+  
+  if (window.ResizeObserver) {
+    const ro = new ResizeObserver(() => {
+        resize();
+        if (nodes.length === 0 && width > 0) {
+             initNodes();
+        }
+    });
+    ro.observe(container);
+  }
+
+  resize();
+  initNodes();
+  loop();
+}
+</script>
+</body>
+</html>`;
+  }
+}
+
+==> extension/src/analyzer.ts <==
+import * as cp from 'child_process';
+import * as path from 'path';
+import * as fs from 'fs';
+import * as vscode from 'vscode';
+import { AnalysisResult } from './types';
+
+export class GoAnalyzer {
+  private analyzerPath: string;
+  private outputChannel: vscode.OutputChannel;
+
+  constructor(context: vscode.ExtensionContext, outputChannel: vscode.OutputChannel) {
+    this.outputChannel = outputChannel;
+    this.analyzerPath = this.resolveAnalyzerPath(context);
+  }
+
+  private resolveAnalyzerPath(context: vscode.ExtensionContext): string {
+    const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+    const configPath = config.get<string>('goAnalyzerPath');
+
+    if (configPath && fs.existsSync(configPath)) {
+      return configPath;
+    }
+
+    // Bundled binary
+    const ext = process.platform === 'win32' ? '.exe' : '';
+    const bundled = path.join(context.extensionPath, 'out', `rex-analyzer${ext}`);
+    if (fs.existsSync(bundled)) {
+      return bundled;
+    }
+
+    // Try system PATH
+    return 'rex-analyzer';
+  }
+
+  /**
+   * Analyze a Go source directory. Returns parsed render calls with type info.
+   */
+  async analyzeDirectory(dir: string): Promise<AnalysisResult> {
+    return new Promise((resolve) => {
+      const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+      const templateRoot = config.get<string>('templateRoot') || '';
+      
+      const args = ['-dir', dir, '-template-root', templateRoot, '-validate'];
+      this.outputChannel.appendLine(`[Analyzer] Running: ${this.analyzerPath} ${args.join(' ')}`);
+
+      let stdout = '';
+      let stderr = '';
+
+      const proc = cp.spawn(this.analyzerPath, args, {
+        cwd: dir,
+        env: process.env,
+      });
+
+      proc.stdout.on('data', (data: Buffer) => {
+        stdout += data.toString();
+      });
+
+      proc.stderr.on('data', (data: Buffer) => {
+        stderr += data.toString();
+      });
+
+      proc.on('error', (err) => {
+        this.outputChannel.appendLine(`[Analyzer] Failed to spawn: ${err.message}`);
+        resolve({
+          renderCalls: [],
+          errors: [`Failed to run analyzer: ${err.message}. Make sure rex-analyzer is built.`],
+        });
+      });
+
+      proc.on('close', (code) => {
+        if (stderr) {
+          this.outputChannel.appendLine(`[Analyzer] stderr: ${stderr}`);
+        }
+
+        if (code !== 0 && !stdout) {
+          resolve({
+            renderCalls: [],
+            errors: [`Analyzer exited with code ${code}: ${stderr}`],
+          });
+          return;
+        }
+
+        try {
+          const result: AnalysisResult = JSON.parse(stdout);
+          this.outputChannel.appendLine(
+            `[Analyzer] Found ${result.renderCalls?.length ?? 0} render calls`
+          );
+          resolve(result);
+        } catch (e) {
+          this.outputChannel.appendLine(`[Analyzer] JSON parse error: ${e}`);
+          resolve({
+            renderCalls: [],
+            errors: [`Failed to parse analyzer output: ${e}`],
+          });
+        }
+      });
+    });
+  }
+
+  /**
+   * Run the analyzer across multiple directories (e.g. all packages in workspace)
+   */
+  async analyzeWorkspace(workspaceRoot: string): Promise<AnalysisResult> {
+    const goPackageDirs = await this.findGoPackageDirs(workspaceRoot);
+    this.outputChannel.appendLine(`[Analyzer] Scanning ${goPackageDirs.length} Go package dirs`);
+
+    const results = await Promise.all(goPackageDirs.map((d) => this.analyzeDirectory(d)));
+
+    // Merge
+    const merged: AnalysisResult = { renderCalls: [], errors: [], validationErrors: [] };
+    for (const r of results) {
+      merged.renderCalls.push(...(r.renderCalls ?? []));
+      merged.errors.push(...(r.errors ?? []));
+      merged.validationErrors?.push(...(r.validationErrors ?? []));
+    }
+
+    return merged;
+  }
+
+  private async findGoPackageDirs(root: string): Promise<string[]> {
+    return new Promise((resolve) => {
+      const dirs = new Set<string>();
+
+      const walk = (dir: string) => {
+        try {
+          const entries = fs.readdirSync(dir, { withFileTypes: true });
+          let hasGo = false;
+
+          for (const e of entries) {
+            if (e.isDirectory()) {
+              if (!['vendor', 'node_modules', '.git', 'testdata'].includes(e.name)) {
+                walk(path.join(dir, e.name));
+              }
+            } else if (e.name.endsWith('.go') && !e.name.endsWith('_test.go')) {
+              hasGo = true;
+            }
+          }
+
+          if (hasGo) {
+            dirs.add(dir);
+          }
+        } catch {
+          // Skip unreadable dirs
+        }
+      };
+
+      walk(root);
+      resolve(Array.from(dirs));
+    });
+  }
+}
+
+==> extension/src/knowledgeGraph.ts <==
+import * as path from 'path';
+import * as fs from 'fs';
+import * as vscode from 'vscode';
+import {
+  AnalysisResult,
+  KnowledgeGraph,
+  RenderCall,
+  TemplateContext,
+  TemplateVar,
+} from './types';
+
+/**
+ * Builds and maintains a knowledge graph mapping template paths to their
+ * available variables (from Go render calls).
+ */
+export class KnowledgeGraphBuilder {
+  private graph: KnowledgeGraph = {
+    templates: new Map(),
+    analyzedAt: new Date(),
+  };
+
+  private workspaceRoot: string;
+  private outputChannel: vscode.OutputChannel;
+
+  constructor(workspaceRoot: string, outputChannel: vscode.OutputChannel) {
+    this.workspaceRoot = workspaceRoot;
+    this.outputChannel = outputChannel;
+  }
+
+  build(analysisResult: AnalysisResult): KnowledgeGraph {
+    const templates = new Map<string, TemplateContext>();
+
+    for (const rc of analysisResult.renderCalls ?? []) {
+      const resolved = this.resolveTemplatePath(rc);
+      if (!resolved) continue;
+
+      let ctx = templates.get(resolved);
+      if (!ctx) {
+        ctx = {
+          templatePath: resolved,
+          vars: new Map(),
+          renderCalls: [],
+        };
+        templates.set(resolved, ctx);
+      }
+
+      ctx.renderCalls.push(rc);
+
+      // Merge vars (last one wins for type info)
+      for (const v of rc.vars ?? []) {
+        const existing = ctx.vars.get(v.name);
+        if (!existing || (v.fields && v.fields.length > 0)) {
+          ctx.vars.set(v.name, v);
+        }
+      }
+    }
+
+    this.graph = { templates, analyzedAt: new Date() };
+
+    this.outputChannel.appendLine(
+      `[KnowledgeGraph] Built graph with ${templates.size} templates`
+    );
+    for (const [tpl, ctx] of templates) {
+      this.outputChannel.appendLine(
+        `  ${tpl}: ${[...ctx.vars.keys()].join(', ')} (from ${ctx.renderCalls.length} call(s))`
+      );
+    }
+
+    return this.graph;
+  }
+
+  getGraph(): KnowledgeGraph {
+    return this.graph;
+  }
+
+  /**
+   * Find the template context for a given absolute file path.
+   */
+  findContextForFile(absolutePath: string): TemplateContext | undefined {
+    // Try to match relative paths
+    let rel = path.relative(this.workspaceRoot, absolutePath).replace(/\\/g, '/');
+
+    const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+    const templateRoot = config.get<string>('templateRoot') || '';
+    
+    // If templateRoot is set, strip it from start of path to match render call paths
+    if (templateRoot && rel.startsWith(templateRoot + '/')) {
+        rel = rel.slice(templateRoot.length + 1);
+    } else if (templateRoot && rel === templateRoot) {
+        rel = ''; // Should not happen for file
+    }
+
+    // Direct match
+    if (this.graph.templates.has(rel)) {
+      return this.graph.templates.get(rel);
+    }
+
+    // Suffix match (template path may be partial)
+    for (const [tplPath, ctx] of this.graph.templates) {
+      if (rel.endsWith(tplPath) || tplPath.endsWith(rel)) {
+        return ctx;
+      }
+      // Match on filename portion
+      if (path.basename(rel) === path.basename(tplPath)) {
+        return ctx;
+      }
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Try to find a partial template in the workspace.
+   */
+  findPartialContext(partialName: string, currentFile: string): TemplateContext | undefined {
+    // partialName might be relative or just a basename
+    // Try all template contexts
+    for (const [tplPath, ctx] of this.graph.templates) {
+      if (
+        tplPath.endsWith(partialName) ||
+        path.basename(tplPath) === partialName ||
+        path.basename(tplPath, '.html') === partialName
+      ) {
+        return ctx;
+      }
+    }
+
+    // Also try to find the file in the workspace even without a render call
+    const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+    const templateRoot = config.get<string>('templateRoot') || '';
+
+    const dir = path.dirname(currentFile);
+    const candidates = [
+      path.join(dir, partialName),
+      path.join(this.workspaceRoot, partialName),
+    ];
+    
+    if (templateRoot) {
+        candidates.push(path.join(this.workspaceRoot, templateRoot, partialName));
+    }
+
+    for (const c of candidates) {
+      if (fs.existsSync(c)) {
+        return {
+          templatePath: c,
+          vars: new Map(),
+          renderCalls: [],
+        };
+      }
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Convert render call template path to a workspace-relative path.
+   */
+  private resolveTemplatePath(rc: RenderCall): string | null {
+    let tplPath = rc.template;
+
+    // Handle glob/pattern (e.g. "views/*.html") - just use as-is
+    // Remove leading "./"
+    tplPath = tplPath.replace(/^\.\//, '');
+
+    return tplPath;
+  }
+
+  toJSON(): object {
+    const obj: Record<string, unknown> = {};
+    for (const [key, ctx] of this.graph.templates) {
+      obj[key] = {
+        vars: Object.fromEntries(
+          [...ctx.vars.entries()].map(([k, v]) => [k, { type: v.type, fields: v.fields }])
+        ),
+        renderCalls: ctx.renderCalls.map((r) => ({
+          file: r.file,
+          line: r.line,
+        })),
+      };
+    }
+    return obj;
+  }
+}
+
+==> extension/src/extension.ts <==
+import * as vscode from 'vscode';
+import * as path from 'path';
+import { GoAnalyzer } from './analyzer';
+import { KnowledgeGraphBuilder } from './knowledgeGraph';
+import { TemplateValidator } from './validator';
+import { KnowledgeGraphPanel } from './graphPanel';
+import { KnowledgeGraph } from './types';
+
+const TEMPLATE_SELECTOR: vscode.DocumentSelector = [
+  { language: 'html', scheme: 'file' },
+  { language: 'go-template', scheme: 'file' },
+  { pattern: '**/*.tmpl' },
+  { pattern: '**/*.html' },
+];
+
+let diagnosticCollection: vscode.DiagnosticCollection;
+let outputChannel: vscode.OutputChannel;
+let graphBuilder: KnowledgeGraphBuilder | undefined;
+let validator: TemplateValidator | undefined;
+let currentGraph: KnowledgeGraph | undefined;
+let analyzer: GoAnalyzer | undefined;
+let debounceTimer: NodeJS.Timeout | undefined;
+
+export async function activate(context: vscode.ExtensionContext) {
+  outputChannel = vscode.window.createOutputChannel('Rex Template Validator');
+  diagnosticCollection = vscode.languages.createDiagnosticCollection('rex-templates');
+
+  context.subscriptions.push(outputChannel, diagnosticCollection);
+
+  outputChannel.appendLine('[Rex] Extension activated');
+
+  const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  if (!workspaceRoot) {
+    outputChannel.appendLine('[Rex] No workspace folder found');
+    return;
+  }
+
+  analyzer = new GoAnalyzer(context, outputChannel);
+  graphBuilder = new KnowledgeGraphBuilder(workspaceRoot, outputChannel);
+  validator = new TemplateValidator(outputChannel, graphBuilder);
+
+  // Register commands
+  context.subscriptions.push(
+    vscode.commands.registerCommand('rexTemplateValidator.validate', async () => {
+      const doc = vscode.window.activeTextEditor?.document;
+      if (doc) {
+        await validateDocument(doc);
+      }
+    }),
+
+    vscode.commands.registerCommand('rexTemplateValidator.rebuildIndex', async () => {
+      await rebuildIndex(workspaceRoot);
+    }),
+
+    vscode.commands.registerCommand('rexTemplateValidator.showKnowledgeGraph', () => {
+      if (currentGraph) {
+        KnowledgeGraphPanel.show(context, currentGraph);
+      } else {
+        vscode.window.showInformationMessage(
+          'No template index yet. Run "Rex: Rebuild Template Index" first.'
+        );
+      }
+    })
+  );
+
+  // Hover provider
+  context.subscriptions.push(
+    vscode.languages.registerHoverProvider(TEMPLATE_SELECTOR, {
+      provideHover(document, position) {
+        if (!validator || !graphBuilder) return;
+        const ctx = graphBuilder.findContextForFile(document.uri.fsPath);
+        if (!ctx) return;
+        return validator.getHoverInfo(document, position, ctx);
+      },
+    })
+  );
+
+  // Completion provider
+  context.subscriptions.push(
+    vscode.languages.registerCompletionItemProvider(
+      TEMPLATE_SELECTOR,
+      {
+        provideCompletionItems(document, position) {
+          if (!validator || !graphBuilder) return;
+          const ctx = graphBuilder.findContextForFile(document.uri.fsPath);
+          if (!ctx) return [];
+          return validator.getCompletions(document, position, ctx);
+        },
+      },
+      '.'
+    )
+  );
+
+  // File watcher for Go files → rebuild index
+  const goWatcher = vscode.workspace.createFileSystemWatcher('**/*.go');
+  context.subscriptions.push(
+    goWatcher,
+    goWatcher.onDidChange(() => scheduleRebuild(workspaceRoot)),
+    goWatcher.onDidCreate(() => scheduleRebuild(workspaceRoot)),
+    goWatcher.onDidDelete(() => scheduleRebuild(workspaceRoot))
+  );
+
+  // File watcher for templates → validate
+  const tplWatcher = vscode.workspace.createFileSystemWatcher('**/*.{html,tmpl}');
+  context.subscriptions.push(
+    tplWatcher,
+    tplWatcher.onDidChange(async (uri) => {
+      const doc = await vscode.workspace.openTextDocument(uri);
+      scheduleValidate(doc);
+    })
+  );
+
+  // Validate on open
+  context.subscriptions.push(
+    vscode.workspace.onDidOpenTextDocument((doc) => {
+      if (isTemplate(doc)) {
+        scheduleValidate(doc);
+      }
+    }),
+    vscode.workspace.onDidSaveTextDocument((doc) => {
+      if (isTemplate(doc)) {
+        scheduleValidate(doc);
+      }
+    })
+  );
+
+  // Initial index build
+  await rebuildIndex(workspaceRoot);
+
+  // Validate any already-open template docs
+  for (const doc of vscode.workspace.textDocuments) {
+    if (isTemplate(doc)) {
+      await validateDocument(doc);
+    }
+  }
+
+  outputChannel.appendLine('[Rex] Ready');
+  vscode.window.setStatusBarMessage('$(check) Rex templates indexed', 3000);
+}
+
+function isTemplate(doc: vscode.TextDocument): boolean {
+  return (
+    doc.uri.scheme === 'file' &&
+    (doc.fileName.endsWith('.html') || doc.fileName.endsWith('.tmpl'))
+  );
+}
+
+async function rebuildIndex(workspaceRoot: string) {
+  if (!analyzer || !graphBuilder) return;
+
+  const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
+  statusBarItem.text = '$(sync~spin) Rex: Analyzing...';
+  statusBarItem.show();
+
+  // Read config — must match the CLI flags -dir and -template-root
+  const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+  const sourceDir: string = config.get('sourceDir') ?? '.';
+  const templateRoot: string = config.get('templateRoot') ?? '';
+
+  try {
+    const result = await analyzer.analyzeWorkspace(workspaceRoot);
+    currentGraph = graphBuilder.build(result);
+
+    if (result.errors?.length) {
+      outputChannel.appendLine('[Rex] Analysis warnings:');
+      result.errors.slice(0, 10).forEach((e) => outputChannel.appendLine(`  ${e}`));
+    }
+
+    const count = currentGraph.templates.size;
+
+    if (count === 0) {
+      outputChannel.appendLine('[Rex] No templates found in analysis result.');
+      if (result.renderCalls.length === 0) {
+        outputChannel.appendLine('[Rex] No render calls found. Check if your Go code calls c.Render().');
+      }
+    }
+
+    statusBarItem.text = `$(check) Rex: ${count} templates indexed`;
+
+    // Apply diagnostics from Go analyzer
+    diagnosticCollection.clear();
+
+    if (result.validationErrors) {
+      const issuesByFile = new Map<string, vscode.Diagnostic[]>();
+
+      for (const err of result.validationErrors) {
+        // Full absolute path: workspaceRoot / sourceDir / templateRoot / err.template
+        // err.template is the logical relative path from the analyzer,
+        // e.g. "views/inpatient/treatment-chart.html"
+        const absPath = path.join(workspaceRoot, sourceDir, templateRoot, err.template);
+
+        const range = new vscode.Range(
+          Math.max(0, err.line - 1),
+          Math.max(0, err.column - 1),
+          Math.max(0, err.line - 1),
+          Math.max(0, err.column - 1 + (err.variable?.length || 1))
+        );
+
+        const diag = new vscode.Diagnostic(
+          range,
+          err.message,
+          err.severity === 'warning' ? vscode.DiagnosticSeverity.Warning : vscode.DiagnosticSeverity.Error
+        );
+        diag.source = 'Rex';
+
+        // Attach the Go source file as related information so the user can
+        // jump from the template diagnostic back to the c.Render() call site.
+        if (err.goFile) {
+          const goFileAbs = path.join(workspaceRoot, sourceDir, err.goFile);
+          diag.relatedInformation = [
+            new vscode.DiagnosticRelatedInformation(
+              new vscode.Location(
+                vscode.Uri.file(goFileAbs),
+                new vscode.Position(Math.max(0, (err.goLine ?? 1) - 1), 0)
+              ),
+              'Variable passed from here'
+            ),
+          ];
+        }
+
+        const list = issuesByFile.get(absPath) || [];
+        list.push(diag);
+        issuesByFile.set(absPath, list);
+      }
+
+      for (const [filePath, issues] of issuesByFile) {
+        diagnosticCollection.set(vscode.Uri.file(filePath), issues);
+      }
+
+      outputChannel.appendLine(`[Rex] Applied ${result.validationErrors.length} diagnostics from analyzer`);
+    }
+  } catch (err) {
+    outputChannel.appendLine(`[Rex] Rebuild failed: ${err}`);
+    statusBarItem.text = '$(error) Rex: Index failed';
+  } finally {
+    setTimeout(() => statusBarItem.dispose(), 4000);
+  }
+}
+
+async function validateDocument(doc: vscode.TextDocument) {
+  const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  if (workspaceRoot) {
+    scheduleRebuild(workspaceRoot);
+  }
+}
+
+function scheduleRebuild(workspaceRoot: string) {
+  const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+  const debounceMs = config.get<number>('debounceMs') ?? 1500;
+
+  if (debounceTimer) clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(() => rebuildIndex(workspaceRoot), debounceMs * 2);
+}
+
+function scheduleValidate(doc: vscode.TextDocument) {
+  const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+  const debounceMs = config.get<number>('debounceMs') ?? 1500;
+
+  if (debounceTimer) clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(() => validateDocument(doc), debounceMs);
+}
+
+export function deactivate() {
+  diagnosticCollection?.dispose();
+  outputChannel?.dispose();
+}
+
+==> extension/src/templateParser.ts <==
+import { TemplateNode } from './types';
+
+/**
+ * Go template parser that produces a proper nested tree.
+ * range/with/if blocks contain their children so the validator
+ * can push/pop scope correctly.
+ */
+export class TemplateParser {
+  parse(content: string): TemplateNode[] {
+    const tokens = this.tokenize(content);
+    const { nodes } = this.buildTree(tokens, 0);
+    return nodes;
+  }
+
+  // ── Tokenizer ────────────────────────────────────────────────────────────
+
+  private tokenize(content: string): Token[] {
+    const tokens: Token[] = [];
+    const actionRe = /\{\{-?\s*(.*?)\s*-?\}\}/gs;
+
+    const lines = content.split('\n');
+    const lineOffsets: number[] = [0];
+    for (const l of lines) {
+      lineOffsets.push(lineOffsets[lineOffsets.length - 1] + l.length + 1);
+    }
+
+    const getPos = (offset: number) => {
+      let lo = 0, hi = lineOffsets.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (lineOffsets[mid] <= offset) lo = mid; else hi = mid - 1;
+      }
+      return { line: lo + 1, col: offset - lineOffsets[lo] + 1 };
+    };
+
+    let m: RegExpExecArray | null;
+    while ((m = actionRe.exec(content)) !== null) {
+      const inner = m[1].trim();
+      const pos = getPos(m.index);
+      tokens.push({ inner, line: pos.line, col: pos.col, raw: m[0] });
+    }
+
+    return tokens;
+  }
+
+  // ── Tree builder ─────────────────────────────────────────────────────────
+
+  /**
+   * Recursively consume tokens into a node list.
+   * Returns when it hits {{end}} or runs out of tokens.
+   * `pos` is the current index into `tokens` (mutated via returned nextPos).
+   */
+  private buildTree(tokens: Token[], pos: number): { nodes: TemplateNode[]; nextPos: number; endToken?: Token } {
+    const nodes: TemplateNode[] = [];
+
+    while (pos < tokens.length) {
+      const tok = tokens[pos];
+      const inner = tok.inner;
+
+      // end / else → stop this level
+      if (inner === 'end' || inner === 'else') {
+        return { nodes, nextPos: pos + 1, endToken: tok };
+      }
+
+      // Comments
+      if (inner.startsWith('/*') || inner.startsWith('-/*')) {
+        pos++; continue;
+      }
+
+      // ── Block openers ──────────────────────────────────────────────────
+
+      if (inner.startsWith('range ')) {
+        const expr = inner.slice(6).trim();
+        // strip "$_, $v :=" or "$v :=" assignment prefix
+        const cleanExpr = expr.replace(/^\$\w+\s*(?:,\s*\$\w+)?\s*:=\s*/, '').trim();
+        const child = this.buildTree(tokens, pos + 1);
+        nodes.push({
+          kind: 'range',
+          path: this.parseDotPath(cleanExpr),
+          rawText: tok.raw,
+          line: tok.line,
+          col: tok.col,
+          endLine: child.endToken?.line,
+          endCol: child.endToken?.col,
+          children: child.nodes,
+        });
+        pos = child.nextPos;
+        continue;
+      }
+
+      if (inner.startsWith('with ')) {
+        const expr = inner.slice(5).trim().replace(/^\$\w+\s*:=\s*/, '').trim();
+        const child = this.buildTree(tokens, pos + 1);
+        nodes.push({
+          kind: 'with',
+          path: this.parseDotPath(expr),
+          rawText: tok.raw,
+          line: tok.line,
+          col: tok.col,
+          endLine: child.endToken?.line,
+          endCol: child.endToken?.col,
+          children: child.nodes,
+        });
+        pos = child.nextPos;
+        continue;
+      }
+
+      if (inner.startsWith('if ')) {
+        const expr = inner.slice(3).trim();
+        const child = this.buildTree(tokens, pos + 1);
+        nodes.push({
+          kind: 'if',
+          path: this.parseDotPath(expr),
+          rawText: tok.raw,
+          line: tok.line,
+          col: tok.col,
+          endLine: child.endToken?.line,
+          endCol: child.endToken?.col,
+          children: child.nodes,
+        });
+        pos = child.nextPos;
+        continue;
+      }
+
+      if (inner.startsWith('block ')) {
+        const child = this.buildTree(tokens, pos + 1);
+        nodes.push({
+          kind: 'block',
+          path: [],
+          rawText: tok.raw,
+          line: tok.line,
+          col: tok.col,
+          endLine: child.endToken?.line,
+          endCol: child.endToken?.col,
+          children: child.nodes,
+        });
+        pos = child.nextPos;
+        continue;
+      }
+
+      // ── Partials ───────────────────────────────────────────────────────
+
+      if (inner.startsWith('template ')) {
+        const tplMatch = inner.match(/template\s+"([^"]+)"\s*(.*)/);
+        if (tplMatch) {
+          nodes.push({
+            kind: 'partial',
+            path: tplMatch[2].trim() ? this.parseDotPath(tplMatch[2].trim()) : ['.'],
+            rawText: tok.raw,
+            line: tok.line,
+            col: tok.col,
+            partialName: tplMatch[1],
+          });
+        }
+        pos++; continue;
+      }
+
+      // ── Variable / pipeline ────────────────────────────────────────────
+
+      const varNode = this.tryParseVariable(tok);
+      if (varNode) nodes.push(varNode);
+
+      pos++;
+    }
+
+    return { nodes, nextPos: pos };
+  }
+
+  // ── Helpers ──────────────────────────────────────────────────────────────
+
+  private tryParseVariable(tok: Token): TemplateNode | null {
+    const inner = tok.inner;
+
+    if (inner.startsWith('.')) {
+      return { kind: 'variable', path: this.parseDotPath(inner), rawText: tok.raw, line: tok.line, col: tok.col };
+    }
+
+    // Pipelines / builtins that reference a dot path: "len .Items", "index .Map key"
+    if (inner.includes('.')) {
+      const dotParts = inner.match(/(\.[A-Za-z_][A-Za-z0-9_.]*)/g);
+      if (dotParts) {
+        return { kind: 'variable', path: this.parseDotPath(dotParts[0]), rawText: tok.raw, line: tok.line, col: tok.col };
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Parse ".Visit.Doctor.Name" → ["Visit", "Doctor", "Name"]
+   * "."                        → ["."]
+   */
+  parseDotPath(expr: string): string[] {
+    expr = expr.replace(/^\$\w+\s*:=\s*/, '').trim();
+
+    // (call .Method args) → .Method
+    const callMatch = expr.match(/\(call\s+(\.[^\s)]+)/);
+    if (callMatch) expr = callMatch[1];
+
+    if (expr === '.' || expr === '') return ['.'];
+    if (!expr.startsWith('.')) return [];
+
+    // Take path segment up to first space/pipe/paren
+    const pathPart = expr.split(/[\s|()|,]/)[0];
+    return pathPart.split('.').filter(p => p.length > 0);
+  }
+}
+
+interface Token {
+  inner: string;
+  line: number;
+  col: number;
+  raw: string;
+}
+
+/**
+ * Resolve a dot-path against the context variables map to find the type.
+ * Returns null if resolution fails.
+ */
+export function resolvePath(
+  path: string[],
+  vars: Map<string, import('./types').TemplateVar>,
+  scopeStack: ScopeFrame[]
+): { typeStr: string; found: boolean; fields?: import('./types').FieldInfo[] } {
+  if (path.length === 0 || (path.length === 1 && path[0] === '.')) {
+    return { typeStr: 'context', found: true };
+  }
+
+  // Check scope stack for "." (range/with element)
+  if (path[0] === '.') {
+    const frame = [...scopeStack].reverse().find(f => f.key === '.');
+    if (frame) return { typeStr: frame.typeStr, found: true, fields: frame.fields };
+    return { typeStr: 'context', found: true };
+  }
+
+  // Check scope stack for named variables
+  for (let i = scopeStack.length - 1; i >= 0; i--) {
+    const frame = scopeStack[i];
+    if (frame.key === path[0]) {
+      if (path.length === 1) return { typeStr: frame.typeStr, found: true, fields: frame.fields };
+      return resolveFields(path.slice(1), frame.fields ?? []);
+    }
+  }
+
+  // Check innermost dot context (current scope)
+  for (let i = scopeStack.length - 1; i >= 0; i--) {
+    if (scopeStack[i].key === '.') {
+        const frame = scopeStack[i];
+        if (frame.fields) {
+            const res = resolveFields(path, frame.fields);
+            if (res.found) return res;
+        }
+        break; // Only check the innermost dot scope
+    }
+  }
+
+  // Check top-level vars
+  const topVar = vars.get(path[0]);
+  if (!topVar) {
+    return { typeStr: 'unknown', found: false };
+  }
+
+  if (path.length === 1) {
+    return { typeStr: topVar.type, found: true, fields: topVar.fields };
+  }
+
+  return resolveFields(path.slice(1), topVar.fields ?? []);
+}
+
+interface ScopeFrame {
+  key: string;
+  typeStr: string;
+  fields?: import('./types').FieldInfo[];
+  isRange?: boolean;
+}
+
+function resolveFields(
+  parts: string[],
+  fields: import('./types').FieldInfo[]
+): { typeStr: string; found: boolean; fields?: import('./types').FieldInfo[] } {
+  let current = fields;
+
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    const field = current.find(
+      (f) => f.name === part || f.name.toLowerCase() === part.toLowerCase()
+    );
+    if (!field) {
+      return { typeStr: 'unknown', found: false };
+    }
+    if (i === parts.length - 1) {
+      return { typeStr: field.type, found: true, fields: field.fields };
+    }
+    current = field.fields ?? [];
+  }
+
+  return { typeStr: 'unknown', found: false };
+}
+
+==> extension/package-lock.json <==
+{
+  "name": "rex-template-validator",
+  "version": "0.1.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "rex-template-validator",
+      "version": "0.1.0",
+      "devDependencies": {
+        "@types/node": "^20.0.0",
+        "@types/vscode": "^1.85.0",
+        "typescript": "^5.3.0"
+      },
+      "engines": {
+        "vscode": "^1.85.0"
+      }
+    },
+    "node_modules/@types/node": {
+      "version": "20.19.33",
+      "resolved": "https://registry.npmjs.org/@types/node/-/node-20.19.33.tgz",
+      "integrity": "sha512-Rs1bVAIdBs5gbTIKza/tgpMuG1k3U/UMJLWecIMxNdJFDMzcM5LOiLVRYh3PilWEYDIeUDv7bpiHPLPsbydGcw==",
+      "dev": true,
+      "license": "MIT",
+      "dependencies": {
+        "undici-types": "~6.21.0"
+      }
+    },
+    "node_modules/@types/vscode": {
+      "version": "1.109.0",
+      "resolved": "https://registry.npmjs.org/@types/vscode/-/vscode-1.109.0.tgz",
+      "integrity": "sha512-0Pf95rnwEIwDbmXGC08r0B4TQhAbsHQ5UyTIgVgoieDe4cOnf92usuR5dEczb6bTKEp7ziZH4TV1TRGPPCExtw==",
+      "dev": true,
+      "license": "MIT"
+    },
+    "node_modules/typescript": {
+      "version": "5.9.3",
+      "resolved": "https://registry.npmjs.org/typescript/-/typescript-5.9.3.tgz",
+      "integrity": "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==",
+      "dev": true,
+      "license": "Apache-2.0",
+      "bin": {
+        "tsc": "bin/tsc",
+        "tsserver": "bin/tsserver"
+      },
+      "engines": {
+        "node": ">=14.17"
+      }
+    },
+    "node_modules/undici-types": {
+      "version": "6.21.0",
+      "resolved": "https://registry.npmjs.org/undici-types/-/undici-types-6.21.0.tgz",
+      "integrity": "sha512-iwDZqg0QAGrg9Rav5H4n0M64c3mkR59cJ6wQp+7C4nI0gsmExaedaYLNO44eT4AtBBwjbTiGPMlt2Md0T9H9JQ==",
+      "dev": true,
+      "license": "MIT"
+    }
+  }
+}

@@ -12,7 +12,8 @@ import (
 	"strings"
 )
 
-// AnalyzeDir analyzes a Go source directory for c.Render calls
+// AnalyzeDir analyzes a Go source directory for c.Render calls.
+// dir should be an absolute path.
 func AnalyzeDir(dir string) AnalysisResult {
 	result := AnalysisResult{}
 
@@ -23,28 +24,6 @@ func AnalyzeDir(dir string) AnalysisResult {
 		return result
 	}
 
-	// Collect all files
-	var files []*ast.File
-	for _, pkg := range pkgs {
-		for _, f := range pkg.Files {
-			files = append(files, f)
-		}
-	}
-
-	// Type-check
-	cfg := &types.Config{
-		Importer: importer.ForCompiler(fset, "gc", nil),
-		Error: func(err error) {
-			result.Errors = append(result.Errors, fmt.Sprintf("type error: %v", err))
-		},
-	}
-
-	info := &types.Info{
-		Types: make(map[ast.Expr]types.TypeAndValue),
-		Defs:  make(map[*ast.Ident]types.Object),
-		Uses:  make(map[*ast.Ident]types.Object),
-	}
-
 	var allFiles []*ast.File
 	for _, pkg := range pkgs {
 		for _, f := range pkg.Files {
@@ -52,14 +31,34 @@ func AnalyzeDir(dir string) AnalysisResult {
 		}
 	}
 
-	_, typeErr := cfg.Check(dir, fset, allFiles, info)
-	if typeErr != nil {
-		// Non-fatal, we still try to extract info
-		result.Errors = append(result.Errors, fmt.Sprintf("type check warning: %v", typeErr))
+	// Type-check with a best-effort importer. Missing third-party packages are
+	// expected when running outside the module cache; we still extract useful
+	// type information for packages that do resolve.
+	info := &types.Info{
+		Types: make(map[ast.Expr]types.TypeAndValue),
+		Defs:  make(map[*ast.Ident]types.Object),
+		Uses:  make(map[*ast.Ident]types.Object),
 	}
 
-	// Walk AST looking for c.Render(...)  calls
-	for _, f := range files {
+	cfg := &types.Config{
+		// Use the default gc importer (resolves stdlib + anything in GOPATH/module cache).
+		Importer: importer.ForCompiler(fset, "gc", nil),
+		// Collect type errors but treat them as non-fatal — we fall back to AST
+		// inference for values whose types couldn't be resolved.
+		Error: func(err error) {
+			msg := err.Error()
+			if !isImportRelatedError(msg) {
+				// Only surface genuine, actionable type errors.
+				result.Errors = append(result.Errors, fmt.Sprintf("type error: %v", err))
+			}
+		},
+	}
+
+	// Non-fatal: we still walk the AST even if type-check fails partially.
+	cfg.Check(dir, fset, allFiles, info) //nolint:errcheck
+
+	// Walk AST looking for c.Render(...) calls
+	for _, f := range allFiles {
 		ast.Inspect(f, func(n ast.Node) bool {
 			call, ok := n.(*ast.CallExpr)
 			if !ok {
@@ -79,18 +78,26 @@ func AnalyzeDir(dir string) AnalysisResult {
 				return true
 			}
 
-			// First arg should be template path string
 			templatePath := extractString(call.Args[0])
 			if templatePath == "" {
 				return true
 			}
 
-			// Second arg should be rex.Map{...}
 			vars := extractMapVars(call.Args[1], info, fset)
 
 			pos := fset.Position(call.Pos())
+
+			// Normalise the file path: make it relative to dir so that it is
+			// stable regardless of where the binary is invoked from.
+			relFile := pos.Filename
+			if abs, err := filepath.Abs(pos.Filename); err == nil {
+				if rel, err := filepath.Rel(dir, abs); err == nil {
+					relFile = rel
+				}
+			}
+
 			rc := RenderCall{
-				File:     pos.Filename,
+				File:     relFile,
 				Line:     pos.Line,
 				Template: templatePath,
 				Vars:     vars,
@@ -101,6 +108,24 @@ func AnalyzeDir(dir string) AnalysisResult {
 	}
 
 	return result
+}
+
+// isImportRelatedError returns true for errors that stem solely from missing
+// third-party dependencies rather than from actual code problems.
+func isImportRelatedError(msg string) bool {
+	lower := strings.ToLower(msg)
+	phrases := []string{
+		"could not import",
+		"can't find import",
+		"cannot find package",
+		"no required module provides",
+	}
+	for _, p := range phrases {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
 }
 
 func extractString(expr ast.Expr) string {
@@ -141,20 +166,17 @@ func extractMapVars(expr ast.Expr, info *types.Info, fset *token.FileSet) []Temp
 
 		tv := TemplateVar{Name: name}
 
-		// Try to get type from type checker
 		if typeInfo, ok := info.Types[kv.Value]; ok {
-			tv.TypeStr = typeInfo.Type.String()
+			tv.TypeStr = normalizeTypeStr(typeInfo.Type.String())
 			tv.Fields = extractFields(typeInfo.Type)
 
-			// Check if it's a slice (direct or named type)
 			elemType := getElementType(typeInfo.Type)
 			if elemType != nil {
 				tv.IsSlice = true
-				tv.ElemType = elemType.String()
+				tv.ElemType = normalizeTypeStr(elemType.String())
 				tv.Fields = extractFields(elemType)
 			}
 		} else {
-			// Fallback: infer from AST
 			tv.TypeStr = inferTypeFromAST(kv.Value)
 		}
 
@@ -164,27 +186,48 @@ func extractMapVars(expr ast.Expr, info *types.Info, fset *token.FileSet) []Temp
 	return vars
 }
 
-// getElementType returns the element type if the given type is a slice, or nil otherwise
+// normalizeTypeStr strips absolute directory paths from type strings produced
+// by types.Type.String(), leaving only the short package-qualified name.
+//
+// e.g. "[]/home/user/project/sample.Drug"  → "[]sample.Drug"
+//
+//	"*/home/user/project/sample.Visit"   → "*sample.Visit"
+//	"/home/user/project/sample.Patient"  → "sample.Patient"
+func normalizeTypeStr(s string) string {
+	prefix := ""
+	base := s
+	for {
+		if strings.HasPrefix(base, "[]") {
+			prefix += "[]"
+			base = base[2:]
+		} else if strings.HasPrefix(base, "*") {
+			prefix += "*"
+			base = base[1:]
+		} else {
+			break
+		}
+	}
+	// If base contains a slash it's an absolute-path-qualified import path.
+	// Keep only everything after the last slash ("pkg.TypeName").
+	if idx := strings.LastIndex(base, "/"); idx >= 0 {
+		base = base[idx+1:]
+	}
+	return prefix + base
+}
+
 func getElementType(t types.Type) types.Type {
 	if t == nil {
 		return nil
 	}
-
-	// Direct slice type
 	if sliceT, ok := t.(*types.Slice); ok {
 		return sliceT.Elem()
 	}
-
-	// Pointer to slice
 	if ptr, ok := t.(*types.Pointer); ok {
 		return getElementType(ptr.Elem())
 	}
-
-	// Named type - check underlying type
 	if named, ok := t.(*types.Named); ok {
 		return getElementType(named.Underlying())
 	}
-
 	return nil
 }
 
@@ -192,8 +235,6 @@ func extractFields(t types.Type) []FieldInfo {
 	if t == nil {
 		return nil
 	}
-
-	// Dereference pointer
 	if ptr, ok := t.(*types.Pointer); ok {
 		return extractFields(ptr.Elem())
 	}
@@ -205,14 +246,13 @@ func extractFields(t types.Type) []FieldInfo {
 
 	strct, ok := named.Underlying().(*types.Struct)
 	if !ok {
-		// Collect methods
 		var fields []FieldInfo
 		for i := 0; i < named.NumMethods(); i++ {
 			m := named.Method(i)
 			if m.Exported() {
 				fields = append(fields, FieldInfo{
 					Name:    m.Name(),
-					TypeStr: m.Type().String(),
+					TypeStr: normalizeTypeStr(m.Type().String()),
 				})
 			}
 		}
@@ -228,10 +268,9 @@ func extractFields(t types.Type) []FieldInfo {
 
 		fi := FieldInfo{
 			Name:    f.Name(),
-			TypeStr: f.Type().String(),
+			TypeStr: normalizeTypeStr(f.Type().String()),
 		}
 
-		// Recurse into nested structs
 		ft := f.Type()
 		if ptr, ok := ft.(*types.Pointer); ok {
 			ft = ptr.Elem()
@@ -246,7 +285,6 @@ func extractFields(t types.Type) []FieldInfo {
 		fields = append(fields, fi)
 	}
 
-	// Also collect methods
 	for i := 0; i < named.NumMethods(); i++ {
 		m := named.Method(i)
 		if m.Exported() {

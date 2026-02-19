@@ -1,0 +1,1051 @@
+==> analyzer/go.mod <==
+module github.com/rex-template-analyzer
+
+go 1.21
+
+==> analyzer/validator/types.go <==
+package validator
+
+// TemplateVar represents a variable available in a template context
+type TemplateVar struct {
+	Name     string      `json:"name"`
+	TypeStr  string      `json:"type"`
+	Fields   []FieldInfo `json:"fields,omitempty"`
+	IsSlice  bool        `json:"isSlice"`
+	ElemType string      `json:"elemType,omitempty"`
+}
+
+// FieldInfo represents a field in a struct type
+type FieldInfo struct {
+	Name    string      `json:"name"`
+	TypeStr string      `json:"type"`
+	Fields  []FieldInfo `json:"fields,omitempty"`
+	IsSlice bool        `json:"isSlice"`
+	Methods []string    `json:"methods,omitempty"`
+}
+
+// RenderCall represents a c.Render() call found in Go source
+type RenderCall struct {
+	File     string        `json:"file"`
+	Line     int           `json:"line"`
+	Template string        `json:"template"`
+	Vars     []TemplateVar `json:"vars"`
+}
+
+// ValidationResult represents a validation error
+type ValidationResult struct {
+	Template string `json:"template"`
+	Line     int    `json:"line"`
+	Column   int    `json:"column"`
+	Variable string `json:"variable"`
+	Message  string `json:"message"`
+	Severity string `json:"severity"` // "error" or "warning"
+}
+
+// AnalysisResult is the top-level output
+type AnalysisResult struct {
+	RenderCalls []RenderCall `json:"renderCalls"`
+	Errors      []string     `json:"errors"`
+}
+
+// ScopeType represents the type of a scope (root or element type in a range)
+type ScopeType struct {
+	IsRoot   bool
+	VarName  string // Name of the variable (e.g., "breadcrumbs")
+	TypeStr  string // Type string (e.g., "handlers.Breadcrumbs")
+	ElemType string // For slices: element type (e.g., "handlers.Breadcrumb")
+	Fields   []FieldInfo
+	IsSlice  bool
+}
+
+==> analyzer/validator/ast_analysis.go <==
+package validator
+
+import (
+	"fmt"
+	"go/ast"
+	"go/importer"
+	"go/parser"
+	"go/token"
+	"go/types"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+// AnalyzeDir analyzes a Go source directory for c.Render calls
+func AnalyzeDir(dir string) AnalysisResult {
+	result := AnalysisResult{}
+
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, dir, nil, parser.AllErrors)
+	if err != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf("parse error: %v", err))
+		return result
+	}
+
+	// Collect all files
+	var files []*ast.File
+	for _, pkg := range pkgs {
+		for _, f := range pkg.Files {
+			files = append(files, f)
+		}
+	}
+
+	// Type-check
+	cfg := &types.Config{
+		Importer: importer.ForCompiler(fset, "gc", nil),
+		Error: func(err error) {
+			result.Errors = append(result.Errors, fmt.Sprintf("type error: %v", err))
+		},
+	}
+
+	info := &types.Info{
+		Types: make(map[ast.Expr]types.TypeAndValue),
+		Defs:  make(map[*ast.Ident]types.Object),
+		Uses:  make(map[*ast.Ident]types.Object),
+	}
+
+	var allFiles []*ast.File
+	for _, pkg := range pkgs {
+		for _, f := range pkg.Files {
+			allFiles = append(allFiles, f)
+		}
+	}
+
+	_, typeErr := cfg.Check(dir, fset, allFiles, info)
+	if typeErr != nil {
+		// Non-fatal, we still try to extract info
+		result.Errors = append(result.Errors, fmt.Sprintf("type check warning: %v", typeErr))
+	}
+
+	// Walk AST looking for c.Render(...)  calls
+	for _, f := range files {
+		ast.Inspect(f, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+
+			if sel.Sel.Name != "Render" {
+				return true
+			}
+
+			if len(call.Args) < 2 {
+				return true
+			}
+
+			// First arg should be template path string
+			templatePath := extractString(call.Args[0])
+			if templatePath == "" {
+				return true
+			}
+
+			// Second arg should be rex.Map{...}
+			vars := extractMapVars(call.Args[1], info, fset)
+
+			pos := fset.Position(call.Pos())
+			rc := RenderCall{
+				File:     pos.Filename,
+				Line:     pos.Line,
+				Template: templatePath,
+				Vars:     vars,
+			}
+			result.RenderCalls = append(result.RenderCalls, rc)
+			return true
+		})
+	}
+
+	return result
+}
+
+func extractString(expr ast.Expr) string {
+	lit, ok := expr.(*ast.BasicLit)
+	if !ok {
+		return ""
+	}
+	if lit.Kind != token.STRING {
+		return ""
+	}
+	s := lit.Value
+	if len(s) >= 2 {
+		return s[1 : len(s)-1]
+	}
+	return ""
+}
+
+func extractMapVars(expr ast.Expr, info *types.Info, fset *token.FileSet) []TemplateVar {
+	var vars []TemplateVar
+
+	comp, ok := expr.(*ast.CompositeLit)
+	if !ok {
+		return vars
+	}
+
+	for _, elt := range comp.Elts {
+		kv, ok := elt.(*ast.KeyValueExpr)
+		if !ok {
+			continue
+		}
+
+		keyLit, ok := kv.Key.(*ast.BasicLit)
+		if !ok {
+			continue
+		}
+
+		name := strings.Trim(keyLit.Value, `"`)
+
+		tv := TemplateVar{Name: name}
+
+		// Try to get type from type checker
+		if typeInfo, ok := info.Types[kv.Value]; ok {
+			tv.TypeStr = typeInfo.Type.String()
+			tv.Fields = extractFields(typeInfo.Type)
+
+			// Check if it's a slice (direct or named type)
+			elemType := getElementType(typeInfo.Type)
+			if elemType != nil {
+				tv.IsSlice = true
+				tv.ElemType = elemType.String()
+				tv.Fields = extractFields(elemType)
+			}
+		} else {
+			// Fallback: infer from AST
+			tv.TypeStr = inferTypeFromAST(kv.Value)
+		}
+
+		vars = append(vars, tv)
+	}
+
+	return vars
+}
+
+// getElementType returns the element type if the given type is a slice, or nil otherwise
+func getElementType(t types.Type) types.Type {
+	if t == nil {
+		return nil
+	}
+
+	// Direct slice type
+	if sliceT, ok := t.(*types.Slice); ok {
+		return sliceT.Elem()
+	}
+
+	// Pointer to slice
+	if ptr, ok := t.(*types.Pointer); ok {
+		return getElementType(ptr.Elem())
+	}
+
+	// Named type - check underlying type
+	if named, ok := t.(*types.Named); ok {
+		return getElementType(named.Underlying())
+	}
+
+	return nil
+}
+
+func extractFields(t types.Type) []FieldInfo {
+	if t == nil {
+		return nil
+	}
+
+	// Dereference pointer
+	if ptr, ok := t.(*types.Pointer); ok {
+		return extractFields(ptr.Elem())
+	}
+
+	named, ok := t.(*types.Named)
+	if !ok {
+		return nil
+	}
+
+	strct, ok := named.Underlying().(*types.Struct)
+	if !ok {
+		// Collect methods
+		var fields []FieldInfo
+		for i := 0; i < named.NumMethods(); i++ {
+			m := named.Method(i)
+			if m.Exported() {
+				fields = append(fields, FieldInfo{
+					Name:    m.Name(),
+					TypeStr: m.Type().String(),
+				})
+			}
+		}
+		return fields
+	}
+
+	var fields []FieldInfo
+	for i := 0; i < strct.NumFields(); i++ {
+		f := strct.Field(i)
+		if !f.Exported() {
+			continue
+		}
+
+		fi := FieldInfo{
+			Name:    f.Name(),
+			TypeStr: f.Type().String(),
+		}
+
+		// Recurse into nested structs
+		ft := f.Type()
+		if ptr, ok := ft.(*types.Pointer); ok {
+			ft = ptr.Elem()
+		}
+		if slice, ok := ft.(*types.Slice); ok {
+			fi.IsSlice = true
+			fi.Fields = extractFields(slice.Elem())
+		} else {
+			fi.Fields = extractFields(ft)
+		}
+
+		fields = append(fields, fi)
+	}
+
+	// Also collect methods
+	for i := 0; i < named.NumMethods(); i++ {
+		m := named.Method(i)
+		if m.Exported() {
+			fields = append(fields, FieldInfo{
+				Name:    m.Name(),
+				TypeStr: "method",
+			})
+		}
+	}
+
+	return fields
+}
+
+func inferTypeFromAST(expr ast.Expr) string {
+	switch e := expr.(type) {
+	case *ast.BasicLit:
+		switch e.Kind {
+		case token.STRING:
+			return "string"
+		case token.INT:
+			return "int"
+		case token.FLOAT:
+			return "float64"
+		}
+	case *ast.Ident:
+		return e.Name
+	case *ast.SelectorExpr:
+		return fmt.Sprintf("%v.%s", e.X, e.Sel.Name)
+	case *ast.CallExpr:
+		if sel, ok := e.Fun.(*ast.SelectorExpr); ok {
+			return fmt.Sprintf("call:%s", sel.Sel.Name)
+		}
+	case *ast.CompositeLit:
+		if e.Type != nil {
+			return fmt.Sprintf("%v", e.Type)
+		}
+	case *ast.UnaryExpr:
+		return "unary"
+	}
+	return "unknown"
+}
+
+// FindGoFiles recursively finds .go files
+func FindGoFiles(root string) ([]string, error) {
+	var files []string
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !info.IsDir() && strings.HasSuffix(path, ".go") {
+			files = append(files, path)
+		}
+		return nil
+	})
+	return files, err
+}
+
+==> analyzer/validator/validator_test.go <==
+package validator
+
+import (
+	"testing"
+)
+
+func TestValidateTemplateContent(t *testing.T) {
+	// Setup test variables
+	vars := map[string]TemplateVar{
+		"User": {
+			Name:    "User",
+			TypeStr: "User",
+			Fields: []FieldInfo{
+				{Name: "Name", TypeStr: "string"},
+				{Name: "Age", TypeStr: "int"},
+				{
+					Name:    "Address",
+					TypeStr: "Address",
+					Fields: []FieldInfo{
+						{Name: "City", TypeStr: "string"},
+						{Name: "Zip", TypeStr: "string"},
+					},
+				},
+			},
+		},
+		"Items": {
+			Name:     "Items",
+			TypeStr:  "[]Item",
+			IsSlice:  true,
+			ElemType: "Item",
+			Fields: []FieldInfo{ // Fields of the element type Item
+				{Name: "Title", TypeStr: "string"},
+				{Name: "Price", TypeStr: "float64"},
+			},
+		},
+	}
+
+	tests := []struct {
+		name     string
+		content  string
+		expected []ValidationResult
+	}{
+		{
+			name:     "Valid variable access",
+			content:  "{{ .User.Name }}",
+			expected: nil,
+		},
+		{
+			name:    "Invalid variable access",
+			content: "{{ .User.Invalid }}",
+			expected: []ValidationResult{
+				{
+					Variable: ".User.Invalid",
+					Message:  `Field "Invalid" does not exist on type User`,
+					Line:     1,
+					Column:   4, // {{ .User.Invalid }} starts at col 1? No, {{ is col 1. .User is col 4.
+					Severity: "error",
+				},
+			},
+		},
+		{
+			name:     "Valid nested variable access",
+			content:  "{{ .User.Address.City }}",
+			expected: nil,
+		},
+		{
+			name:    "Invalid nested variable access",
+			content: "{{ .User.Address.Invalid }}",
+			expected: []ValidationResult{
+				{
+					Variable: ".User.Address.Invalid",
+					Message:  `Field "Invalid" does not exist on type Address`,
+					Line:     1,
+					Column:   4,
+					Severity: "error",
+				},
+			},
+		},
+		{
+			name:     "Valid range access",
+			content:  "{{ range .Items }}{{ .Title }}{{ end }}",
+			expected: nil,
+		},
+		{
+			name:    "Invalid range access",
+			content: "{{ range .Items }}{{ .Invalid }}{{ end }}",
+			expected: []ValidationResult{
+				{
+					Variable: ".Invalid",
+					Message:  `Template variable ".Invalid" is not defined in the render context`,
+					Line:     1,
+					Column:   22,
+					Severity: "error",
+				},
+			},
+		},
+		{
+			name:     "Valid with block",
+			content:  "{{ with .User }}{{ .Name }}{{ end }}",
+			expected: nil,
+		},
+		{
+			name:    "Invalid with block access",
+			content: "{{ with .User }}{{ .Invalid }}{{ end }}",
+			expected: []ValidationResult{
+				{
+					Variable: ".Invalid",
+					Message:  `Template variable ".Invalid" is not defined in the render context`,
+					Line:     1,
+					Column:   20,
+					Severity: "error",
+				},
+			},
+		},
+		{
+			name: "Nested scoped access (bug reproduction)",
+			content: `
+				{{ with .User }}
+					{{ .Address.City }}
+				{{ end }}
+			`,
+			expected: nil,
+		},
+		{
+			name: "Invalid nested scoped access",
+			content: `
+				{{ with .User }}
+					{{ .Address.Invalid }}
+				{{ end }}
+			`,
+			expected: []ValidationResult{
+				{
+					Variable: ".Address.Invalid",
+					Message:  `Field "Invalid" does not exist on type Address`,
+					Line:     3,
+					Column:   9, // Indentation + {{
+					Severity: "error",
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := validateTemplateContent(tt.content, vars, "test.html", ".")
+
+			// Compare expected and got
+			if len(got) != len(tt.expected) {
+				t.Errorf("expected %d errors, got %d", len(tt.expected), len(got))
+				for i, err := range got {
+					t.Logf("Got error %d: %v", i, err)
+				}
+				return
+			}
+
+			for i := range got {
+				if got[i].Message != tt.expected[i].Message {
+					t.Errorf("error %d message mismatch: expected %q, got %q", i, tt.expected[i].Message, got[i].Message)
+				}
+				if got[i].Variable != tt.expected[i].Variable {
+					t.Errorf("error %d variable mismatch: expected %q, got %q", i, tt.expected[i].Variable, got[i].Variable)
+				}
+				// We skip Line/Column strict check for multiline strings if not critical, but here let's try
+				// For the "Invalid variable access" case, I put expected Line/Column.
+			}
+		})
+	}
+}
+
+==> analyzer/validator/validator.go <==
+package validator
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+)
+
+// ValidateTemplates validates all templates against their render calls
+func ValidateTemplates(renderCalls []RenderCall, baseDir string, templateRoot string) []ValidationResult {
+	var allErrors []ValidationResult
+
+	for _, rc := range renderCalls {
+		// Construct path using templateRoot
+		// If rc.Template is "views/index.html" and templateRoot is "templates",
+		// path is baseDir/templates/views/index.html
+		templatePath := filepath.Join(baseDir, templateRoot, rc.Template)
+		errors := validateTemplateFile(templatePath, rc.Vars, rc.Template, baseDir, templateRoot)
+		allErrors = append(allErrors, errors...)
+	}
+
+	return allErrors
+}
+
+// validateTemplateFile validates a single template file
+func validateTemplateFile(templatePath string, vars []TemplateVar, templateName string, baseDir, templateRoot string) []ValidationResult {
+	content, err := os.ReadFile(templatePath)
+	if err != nil {
+		return []ValidationResult{{
+			Template: templateName,
+			Line:     0,
+			Column:   0,
+			Variable: "",
+			Message:  fmt.Sprintf("Could not read template file: %v", err),
+			Severity: "error",
+		}}
+	}
+
+	// Build root scope from vars
+	varMap := make(map[string]TemplateVar)
+	for _, v := range vars {
+		varMap[v.Name] = v
+	}
+
+	// Parse template and validate
+	return validateTemplateContent(string(content), varMap, templateName, baseDir, templateRoot)
+}
+
+// validateTemplateContent validates template content with proper scope tracking
+func validateTemplateContent(content string, varMap map[string]TemplateVar, templateName string, baseDir, templateRoot string) []ValidationResult {
+	var errors []ValidationResult
+
+	// Build a stack of scopes
+	var scopeStack []ScopeType
+
+	// Initialize with root scope containing all top-level variables
+	rootScope := ScopeType{
+		IsRoot: true,
+		Fields: make([]FieldInfo, 0),
+	}
+	for name, v := range varMap {
+		rootScope.Fields = append(rootScope.Fields, FieldInfo{
+			Name:    name,
+			TypeStr: v.TypeStr,
+			IsSlice: v.IsSlice,
+			Fields:  v.Fields,
+		})
+	}
+	scopeStack = append(scopeStack, rootScope)
+
+	// Find all template actions
+	actionPattern := regexp.MustCompile(`\{\{\s*(.+?)\s*\}\}`)
+	lines := strings.Split(content, "\n")
+
+	for lineNum, line := range lines {
+		matches := actionPattern.FindAllStringSubmatchIndex(line, -1)
+
+		for _, match := range matches {
+			if len(match) < 4 {
+				continue
+			}
+
+			action := strings.TrimSpace(line[match[2]:match[3]])
+			col := match[2] + 1 // 1-based column
+
+			// Skip comments
+			if strings.HasPrefix(action, "/*") || strings.HasPrefix(action, "//") {
+				continue
+			}
+
+			// Handle range
+			if strings.HasPrefix(action, "range ") {
+				rangeExpr := strings.TrimSpace(action[6:])
+				newScope := createScopeFromRange(rangeExpr, scopeStack, varMap)
+				scopeStack = append(scopeStack, newScope)
+				continue
+			}
+
+			// Handle with
+			if strings.HasPrefix(action, "with ") {
+				withExpr := strings.TrimSpace(action[5:])
+				newScope := createScopeFromWith(withExpr, scopeStack, varMap)
+				scopeStack = append(scopeStack, newScope)
+				continue
+			}
+
+			// Handle end
+			if action == "end" {
+				if len(scopeStack) > 1 {
+					scopeStack = scopeStack[:len(scopeStack)-1]
+				}
+				continue
+			}
+
+			// Handle if/else - they don't change scope
+			if strings.HasPrefix(action, "if ") || action == "else" || strings.HasPrefix(action, "else if") {
+				continue
+			}
+
+			// Handle template calls
+			if strings.HasPrefix(action, "template ") {
+				// Parse template call arguments
+				parts := parseTemplateAction(action)
+
+				// Check partial existence
+				if len(parts) >= 1 {
+					tmplName := parts[0]
+					// Partial paths are usually relative to the template root (or match what is passed to ParseFiles)
+					fullPath := filepath.Join(baseDir, templateRoot, tmplName)
+					if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+						errors = append(errors, ValidationResult{
+							Template: templateName,
+							Line:     lineNum + 1,
+							Column:   col,
+							Variable: tmplName,
+							Message:  fmt.Sprintf(`Partial template "%s" could not be found at %s`, tmplName, fullPath),
+							Severity: "error",
+						})
+					}
+				}
+
+				if len(parts) >= 2 {
+					// Check if the context argument exists
+					contextArg := parts[1]
+					if strings.HasPrefix(contextArg, ".") && contextArg != "." {
+						if err := validateVariableInScope(contextArg, scopeStack, varMap, lineNum+1, col, templateName); err != nil {
+							errors = append(errors, *err)
+						}
+					}
+				}
+				continue
+			}
+
+			// Check for variable access
+			// Pattern: starts with . or $ (but $ is always root)
+			if strings.HasPrefix(action, ".") && !strings.HasPrefix(action, "..") {
+				// This is a variable access
+				if err := validateVariableInScope(action, scopeStack, varMap, lineNum+1, col, templateName); err != nil {
+					errors = append(errors, *err)
+				}
+				continue
+			}
+
+			// Check function calls that might contain variable references
+			// e.g., "not .IsLast", "eq .Name "foo""
+			words := strings.Fields(action)
+			for _, word := range words {
+				if strings.HasPrefix(word, ".") && !strings.HasPrefix(word, "..") {
+					if err := validateVariableInScope(word, scopeStack, varMap, lineNum+1, col, templateName); err != nil {
+						errors = append(errors, *err)
+					}
+				}
+			}
+		}
+	}
+
+	return errors
+}
+
+// createScopeFromRange creates a new scope for a range block
+func createScopeFromRange(expr string, scopeStack []ScopeType, varMap map[string]TemplateVar) ScopeType {
+	expr = strings.TrimSpace(expr)
+
+	// Handle variable assignment like "$item := .Items"
+	if strings.Contains(expr, ":=") {
+		parts := strings.SplitN(expr, ":=", 2)
+		if len(parts) == 2 {
+			varExpr := strings.TrimSpace(parts[1])
+			return createScopeFromExpression(varExpr, scopeStack, varMap)
+		}
+	}
+
+	return createScopeFromExpression(expr, scopeStack, varMap)
+}
+
+// createScopeFromWith creates a new scope for a with block
+func createScopeFromWith(expr string, scopeStack []ScopeType, varMap map[string]TemplateVar) ScopeType {
+	return createScopeFromExpression(expr, scopeStack, varMap)
+}
+
+// createScopeFromExpression creates a scope from a variable expression with path traversal
+func createScopeFromExpression(expr string, scopeStack []ScopeType, varMap map[string]TemplateVar) ScopeType {
+	expr = strings.TrimSpace(expr)
+
+	// Handle root reference "."
+	if expr == "." {
+		if len(scopeStack) > 0 {
+			return scopeStack[len(scopeStack)-1]
+		}
+		return ScopeType{IsRoot: true}
+	}
+
+	if !strings.HasPrefix(expr, ".") {
+		return ScopeType{Fields: []FieldInfo{}}
+	}
+
+	parts := strings.Split(expr, ".")
+	// parts[0] is empty. parts[1] is the first segment.
+	if len(parts) < 2 {
+		return ScopeType{Fields: []FieldInfo{}}
+	}
+
+	var currentField *FieldInfo
+	var remainingParts []string
+
+	firstPart := parts[1]
+
+	// 1. Try finding in current scope (context-relative)
+	if len(scopeStack) > 0 {
+		currentScope := scopeStack[len(scopeStack)-1]
+		for _, f := range currentScope.Fields {
+			if f.Name == firstPart {
+				fCopy := f
+				currentField = &fCopy
+				remainingParts = parts[2:]
+				break
+			}
+		}
+	}
+
+	// 2. If not found, try root scope (top-level variables)
+	if currentField == nil {
+		if v, ok := varMap[firstPart]; ok {
+			currentField = &FieldInfo{
+				Name:    v.Name,
+				TypeStr: v.TypeStr,
+				Fields:  v.Fields,
+				IsSlice: v.IsSlice,
+			}
+			remainingParts = parts[2:]
+		}
+	}
+
+	if currentField == nil {
+		// Not found
+		return ScopeType{Fields: []FieldInfo{}}
+	}
+
+	// 3. Traverse remaining path
+	for _, part := range remainingParts {
+		found := false
+		for _, f := range currentField.Fields {
+			if f.Name == part {
+				fCopy := f
+				currentField = &fCopy
+				found = true
+				break
+			}
+		}
+		if !found {
+			return ScopeType{Fields: []FieldInfo{}}
+		}
+	}
+
+	return ScopeType{
+		IsRoot:  false,
+		VarName: expr,
+		TypeStr: currentField.TypeStr,
+		Fields:  currentField.Fields,
+		IsSlice: currentField.IsSlice,
+	}
+}
+
+// validateVariableInScope validates a variable access in the current scope
+func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[string]TemplateVar, line, col int, templateName string) *ValidationResult {
+	varExpr = strings.TrimSpace(varExpr)
+
+	// Root reference "." is always valid
+	if varExpr == "." {
+		return nil
+	}
+
+	// Remove trailing dots or other punctuation
+	varExpr = strings.TrimRight(varExpr, ".")
+
+	parts := strings.Split(varExpr, ".")
+	if len(parts) < 2 {
+		return nil
+	}
+
+	// If we're inside a range block (more than just root scope), check against current scope first
+	if len(scopeStack) > 1 {
+		currentScope := scopeStack[len(scopeStack)-1]
+		fieldName := parts[1]
+
+		// Check if this field exists in the current scope
+		var foundField *FieldInfo
+		for _, f := range currentScope.Fields {
+			if f.Name == fieldName {
+				fCopy := f
+				foundField = &fCopy
+				break
+			}
+		}
+
+		if foundField != nil {
+			// Found in current scope, now validate the rest of the path
+			if len(parts) > 2 {
+				return validateNestedFields(parts[2:], foundField.Fields, foundField.TypeStr, varExpr, line, col, templateName)
+			}
+			return nil
+		}
+
+		// If not found in current scope, fall through to check root scope
+	}
+
+	// Check if this is accessing root context (.VarName) - only 1 level deep
+	if len(parts) == 2 {
+		rootVar := parts[1]
+
+		// Check if it exists in the root scope
+		rootScope := scopeStack[0]
+		for _, f := range rootScope.Fields {
+			if f.Name == rootVar {
+				return nil
+			}
+		}
+
+		// Check varMap directly
+		if _, ok := varMap[rootVar]; ok {
+			return nil
+		}
+
+		// Not found in root
+		return &ValidationResult{
+			Template: templateName,
+			Line:     line,
+			Column:   col,
+			Variable: varExpr,
+			Message:  fmt.Sprintf(`Template variable %q is not defined in the render context`, varExpr),
+			Severity: "error",
+		}
+	}
+
+	// Multi-part access like .visit.Patient.Name
+	// Validate each part
+	rootVar := parts[1]
+
+	// First check if root exists
+	var rootVarInfo *TemplateVar
+	if v, ok := varMap[rootVar]; ok {
+		rootVarInfo = &v
+	} else {
+		// Check root scope
+		rootScope := scopeStack[0]
+		for _, f := range rootScope.Fields {
+			if f.Name == rootVar {
+				// Found, now check nested fields
+				return validateNestedFields(parts[2:], f.Fields, f.TypeStr, varExpr, line, col, templateName)
+			}
+		}
+
+		// Not found
+		return &ValidationResult{
+			Template: templateName,
+			Line:     line,
+			Column:   col,
+			Variable: varExpr,
+			Message:  fmt.Sprintf(`Template variable %q is not defined in the render context`, varExpr),
+			Severity: "error",
+		}
+	}
+
+	// Validate the rest of the path
+	if rootVarInfo != nil {
+		return validateNestedFields(parts[2:], rootVarInfo.Fields, rootVarInfo.TypeStr, varExpr, line, col, templateName)
+	}
+
+	return nil
+}
+
+// validateNestedFields validates a field path against available fields
+func validateNestedFields(fieldParts []string, fields []FieldInfo, parentTypeName, fullExpr string, line, col int, templateName string) *ValidationResult {
+	currentFields := fields
+	parentType := parentTypeName
+
+	for _, fieldName := range fieldParts {
+		found := false
+		var nextFields []FieldInfo
+
+		for _, f := range currentFields {
+			if f.Name == fieldName {
+				found = true
+				nextFields = f.Fields
+				parentType = f.TypeStr
+				break
+			}
+		}
+
+		if !found {
+			// Build the partial expression up to this point
+			if parentType == "" {
+				parentType = "unknown"
+			}
+			return &ValidationResult{
+				Template: templateName,
+				Line:     line,
+				Column:   col,
+				Variable: fullExpr,
+				Message:  fmt.Sprintf(`Field %q does not exist on type %s`, fieldName, parentType),
+				Severity: "error",
+			}
+		}
+
+		currentFields = nextFields
+	}
+
+	return nil
+}
+
+// parseTemplateAction parses a template action to extract arguments
+func parseTemplateAction(action string) []string {
+	// Remove "template " prefix
+	rest := strings.TrimPrefix(action, "template ")
+	rest = strings.TrimSpace(rest)
+
+	var parts []string
+	var current strings.Builder
+	inString := false
+	stringChar := rune(0)
+
+	for _, r := range rest {
+		switch {
+		case !inString && (r == '"' || r == '`'):
+			inString = true
+			stringChar = r
+			if current.Len() > 0 {
+				parts = append(parts, strings.TrimSpace(current.String()))
+				current.Reset()
+			}
+		case inString && r == stringChar:
+			inString = false
+			parts = append(parts, current.String())
+			current.Reset()
+		case !inString && r == ' ':
+			if current.Len() > 0 {
+				parts = append(parts, strings.TrimSpace(current.String()))
+				current.Reset()
+			}
+		default:
+			current.WriteRune(r)
+		}
+	}
+
+	if current.Len() > 0 {
+		parts = append(parts, strings.TrimSpace(current.String()))
+	}
+
+	return parts
+}
+
+==> analyzer/main.go <==
+package main
+
+import (
+	"encoding/json"
+	"flag"
+	"os"
+
+	"github.com/rex-template-analyzer/validator"
+)
+
+func main() {
+	dir := flag.String("dir", ".", "Go source directory to analyze")
+	templateRoot := flag.String("template-root", "", "Root directory for templates (relative to project dir)")
+	validate := flag.Bool("validate", false, "Validate templates against render calls")
+	flag.Parse()
+
+	result := validator.AnalyzeDir(*dir)
+
+	if *validate {
+		// Validate templates
+		validationErrors := validator.ValidateTemplates(result.RenderCalls, *dir, *templateRoot)
+		output := struct {
+			RenderCalls      []validator.RenderCall       `json:"renderCalls"`
+			ValidationErrors []validator.ValidationResult `json:"validationErrors"`
+			Errors           []string                     `json:"errors"`
+		}{
+			RenderCalls:      result.RenderCalls,
+			ValidationErrors: validationErrors,
+			Errors:           result.Errors,
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		enc.Encode(output)
+	} else {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		enc.Encode(result)
+	}
+}

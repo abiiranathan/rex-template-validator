@@ -33,7 +33,9 @@ type ValidationResult struct {
 	Column   int    `json:"column"`
 	Variable string `json:"variable"`
 	Message  string `json:"message"`
-	Severity string `json:"severity"` // "error" or "warning"
+	Severity string `json:"severity"`         // "error" or "warning"
+	GoFile   string `json:"goFile,omitempty"` // source .go file containing the c.Render() call
+	GoLine   int    `json:"goLine,omitempty"` // line of the c.Render() call
 }
 
 // AnalysisResult is the top-level output

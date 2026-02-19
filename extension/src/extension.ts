@@ -152,6 +152,11 @@ async function rebuildIndex(workspaceRoot: string) {
   statusBarItem.text = '$(sync~spin) Rex: Analyzing...';
   statusBarItem.show();
 
+  // Read config — must match the CLI flags -dir and -template-root
+  const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+  const sourceDir: string = config.get('sourceDir') ?? '.';
+  const templateRoot: string = config.get('templateRoot') ?? '';
+
   try {
     const result = await analyzer.analyzeWorkspace(workspaceRoot);
     currentGraph = graphBuilder.build(result);
@@ -162,52 +167,68 @@ async function rebuildIndex(workspaceRoot: string) {
     }
 
     const count = currentGraph.templates.size;
-    
+
     if (count === 0) {
-       outputChannel.appendLine('[Rex] No templates found in analysis result.');
-       if (result.renderCalls.length === 0) {
-           outputChannel.appendLine('[Rex] No render calls found. Check if your Go code calls c.Render().');
-       }
+      outputChannel.appendLine('[Rex] No templates found in analysis result.');
+      if (result.renderCalls.length === 0) {
+        outputChannel.appendLine('[Rex] No render calls found. Check if your Go code calls c.Render().');
+      }
     }
 
     statusBarItem.text = `$(check) Rex: ${count} templates indexed`;
 
     // Apply diagnostics from Go analyzer
     diagnosticCollection.clear();
-    
+
     if (result.validationErrors) {
       const issuesByFile = new Map<string, vscode.Diagnostic[]>();
-      
+
       for (const err of result.validationErrors) {
-        // Resolve absolute path
-        const absPath = path.join(workspaceRoot, err.template);
-        
-        // Construct diagnostic
+        // Full absolute path: workspaceRoot / sourceDir / templateRoot / err.template
+        // err.template is the logical relative path from the analyzer,
+        // e.g. "views/inpatient/treatment-chart.html"
+        const absPath = path.join(workspaceRoot, sourceDir, templateRoot, err.template);
+
         const range = new vscode.Range(
-          Math.max(0, err.line - 1), Math.max(0, err.column - 1), 
-          Math.max(0, err.line - 1), Math.max(0, err.column - 1 + (err.variable?.length || 1))
+          Math.max(0, err.line - 1),
+          Math.max(0, err.column - 1),
+          Math.max(0, err.line - 1),
+          Math.max(0, err.column - 1 + (err.variable?.length || 1))
         );
-        
+
         const diag = new vscode.Diagnostic(
           range,
           err.message,
           err.severity === 'warning' ? vscode.DiagnosticSeverity.Warning : vscode.DiagnosticSeverity.Error
         );
         diag.source = 'Rex';
-        
+
+        // Attach the Go source file as related information so the user can
+        // jump from the template diagnostic back to the c.Render() call site.
+        if (err.goFile) {
+          const goFileAbs = path.join(workspaceRoot, sourceDir, err.goFile);
+          diag.relatedInformation = [
+            new vscode.DiagnosticRelatedInformation(
+              new vscode.Location(
+                vscode.Uri.file(goFileAbs),
+                new vscode.Position(Math.max(0, (err.goLine ?? 1) - 1), 0)
+              ),
+              'Variable passed from here'
+            ),
+          ];
+        }
+
         const list = issuesByFile.get(absPath) || [];
         list.push(diag);
         issuesByFile.set(absPath, list);
       }
-      
-      // Set diagnostics
-      for (const [path, issues] of issuesByFile) {
-        diagnosticCollection.set(vscode.Uri.file(path), issues);
+
+      for (const [filePath, issues] of issuesByFile) {
+        diagnosticCollection.set(vscode.Uri.file(filePath), issues);
       }
-      
+
       outputChannel.appendLine(`[Rex] Applied ${result.validationErrors.length} diagnostics from analyzer`);
     }
-
   } catch (err) {
     outputChannel.appendLine(`[Rex] Rebuild failed: ${err}`);
     statusBarItem.text = '$(error) Rex: Index failed';
@@ -217,16 +238,9 @@ async function rebuildIndex(workspaceRoot: string) {
 }
 
 async function validateDocument(doc: vscode.TextDocument) {
-  // If we rely on analyzer for validation, we just need to trigger rebuildIndex
-  // But we might want to debounce strictly for the single file?
-  // Current analyzer validates ALL files.
-  // So simply calling rebuildIndex is correct and sufficient.
-  // But validateDocument is called by watchers.
-  
-  // We can just call scheduleRebuild.
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   if (workspaceRoot) {
-      scheduleRebuild(workspaceRoot);
+    scheduleRebuild(workspaceRoot);
   }
 }
 

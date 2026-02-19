@@ -30,6 +30,8 @@ export interface GoValidationError {
   variable: string;
   message: string;
   severity: 'error' | 'warning';
+  goFile?: string;  // relative path to the .go file with the c.Render() call
+  goLine?: number;
 }
 
 export interface AnalysisResult {
