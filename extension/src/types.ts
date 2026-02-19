@@ -6,6 +6,12 @@ export interface FieldInfo {
   fields?: FieldInfo[];
   isSlice: boolean;
   methods?: string[];
+  // Definition location in Go source (for go-to-definition)
+  defFile?: string;  // Go file where the field is defined
+  defLine?: number;  // Line number where the field is defined (1-based)
+  defCol?: number;   // Column number where the field is defined (1-based)
+  // Documentation
+  doc?: string;  // Documentation comment for the field
 }
 
 export interface TemplateVar {
@@ -14,6 +20,12 @@ export interface TemplateVar {
   fields?: FieldInfo[];
   isSlice: boolean;
   elemType?: string;
+  // Definition location in Go source (for go-to-definition)
+  defFile?: string;  // Go file where the variable is defined
+  defLine?: number;  // Line number where the variable is defined (1-based)
+  defCol?: number;   // Column number where the variable is defined (1-based)
+  // Documentation
+  doc?: string;  // Documentation comment for the type
 }
 
 export interface RenderCall {
@@ -85,6 +97,8 @@ export interface ScopeFrame {
   typeStr: string;
   fields?: FieldInfo[];
   isRange?: boolean;
+  /** For ranges: the source variable being iterated (e.g., "prescriptions" from {{ range .prescriptions }}) */
+  sourceVar?: TemplateVar;
 }
 
 // ─── Definition location ──────────────────────────────────────────────────────

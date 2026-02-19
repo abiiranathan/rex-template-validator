@@ -7,6 +7,12 @@ type TemplateVar struct {
 	Fields   []FieldInfo `json:"fields,omitempty"`
 	IsSlice  bool        `json:"isSlice"`
 	ElemType string      `json:"elemType,omitempty"`
+	// Definition location in Go source (for go-to-definition)
+	DefFile string `json:"defFile,omitempty"` // Go file where the variable is defined
+	DefLine int    `json:"defLine,omitempty"` // Line number where the variable is defined
+	DefCol  int    `json:"defCol,omitempty"`  // Column number where the variable is defined
+	// Documentation
+	Doc string `json:"doc,omitempty"` // Documentation comment for the type
 }
 
 // FieldInfo represents a field in a struct type
@@ -16,6 +22,12 @@ type FieldInfo struct {
 	Fields  []FieldInfo `json:"fields,omitempty"`
 	IsSlice bool        `json:"isSlice"`
 	Methods []string    `json:"methods,omitempty"`
+	// Definition location in Go source (for go-to-definition)
+	DefFile string `json:"defFile,omitempty"` // Go file where the field is defined
+	DefLine int    `json:"defLine,omitempty"` // Line number where the field is defined
+	DefCol  int    `json:"defCol,omitempty"`  // Column number where the field is defined
+	// Documentation
+	Doc string `json:"doc,omitempty"` // Documentation comment for the field
 }
 
 // RenderCall represents a c.Render() call found in Go source

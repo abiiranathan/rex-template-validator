@@ -18,7 +18,7 @@ func AnalyzeDir(dir string) AnalysisResult {
 	result := AnalysisResult{}
 
 	fset := token.NewFileSet()
-	pkgs, err := parser.ParseDir(fset, dir, nil, parser.AllErrors)
+	pkgs, err := parser.ParseDir(fset, dir, nil, parser.AllErrors|parser.ParseComments)
 	if err != nil {
 		result.Errors = append(result.Errors, fmt.Sprintf("parse error: %v", err))
 		return result
@@ -57,6 +57,16 @@ func AnalyzeDir(dir string) AnalysisResult {
 	// Non-fatal: we still walk the AST even if type-check fails partially.
 	cfg.Check(dir, fset, allFiles, info) //nolint:errcheck
 
+	// Build file map for struct field position lookup
+	filesMap := make(map[string]*ast.File)
+	for _, f := range allFiles {
+		pos := fset.File(f.Pos())
+		if pos != nil {
+			filesMap[pos.Name()] = f
+		}
+	}
+	setPkgCache(fset, filesMap)
+
 	// Walk AST looking for c.Render(...) calls
 	for _, f := range allFiles {
 		ast.Inspect(f, func(n ast.Node) bool {
@@ -83,7 +93,7 @@ func AnalyzeDir(dir string) AnalysisResult {
 				return true
 			}
 
-			vars := extractMapVars(call.Args[1], info)
+			vars := extractMapVars(call.Args[1], info, fset)
 
 			pos := fset.Position(call.Pos())
 
@@ -143,7 +153,7 @@ func extractString(expr ast.Expr) string {
 	return ""
 }
 
-func extractMapVars(expr ast.Expr, info *types.Info) []TemplateVar {
+func extractMapVars(expr ast.Expr, info *types.Info, fset *token.FileSet) []TemplateVar {
 	var vars []TemplateVar
 
 	comp, ok := expr.(*ast.CompositeLit)
@@ -168,22 +178,92 @@ func extractMapVars(expr ast.Expr, info *types.Info) []TemplateVar {
 
 		if typeInfo, ok := info.Types[kv.Value]; ok {
 			tv.TypeStr = normalizeTypeStr(typeInfo.Type.String())
-			tv.Fields = extractFields(typeInfo.Type)
+			tv.Fields, tv.Doc = extractFieldsWithDocs(typeInfo.Type)
 
 			elemType := getElementType(typeInfo.Type)
 			if elemType != nil {
 				tv.IsSlice = true
 				tv.ElemType = normalizeTypeStr(elemType.String())
-				tv.Fields = extractFields(elemType)
+				elemFields, elemDoc := extractFieldsWithDocs(elemType)
+				tv.Fields = elemFields
+				// Use element documentation for slice element type
+				if elemDoc != "" {
+					tv.Doc = elemDoc
+				}
 			}
 		} else {
 			tv.TypeStr = inferTypeFromAST(kv.Value)
 		}
 
+		// Track definition location for go-to-definition
+		tv.DefFile, tv.DefLine, tv.DefCol = findDefinitionLocation(kv.Value, info, fset)
+
 		vars = append(vars, tv)
 	}
 
 	return vars
+}
+
+// findDefinitionLocation finds where a variable/value is defined in the Go source
+// Returns file path, line, and column (1-based)
+func findDefinitionLocation(expr ast.Expr, info *types.Info, fset *token.FileSet) (string, int, int) {
+	// Try to find the definition of an identifier
+	var ident *ast.Ident
+
+	switch e := expr.(type) {
+	case *ast.Ident:
+		// Direct identifier reference
+		ident = e
+	case *ast.UnaryExpr:
+		// &Variable - get the operand
+		if id, ok := e.X.(*ast.Ident); ok {
+			ident = id
+		}
+	case *ast.CallExpr:
+		// Function call - point to the call itself
+		pos := fset.Position(e.Pos())
+		if pos.Filename != "" {
+			return pos.Filename, pos.Line, pos.Column
+		}
+	case *ast.CompositeLit:
+		// Composite literal - point to the literal itself
+		pos := fset.Position(e.Pos())
+		if pos.Filename != "" {
+			return pos.Filename, pos.Line, pos.Column
+		}
+	case *ast.SelectorExpr:
+		// Field access like obj.Field - use the selector
+		pos := fset.Position(e.Sel.Pos())
+		if pos.Filename != "" {
+			return pos.Filename, pos.Line, pos.Column
+		}
+	}
+
+	if ident != nil {
+		// Look up the definition of this identifier
+		if obj, ok := info.Defs[ident]; ok && obj != nil {
+			pos := fset.Position(obj.Pos())
+			if pos.Filename != "" {
+				return pos.Filename, pos.Line, pos.Column
+			}
+		}
+		// If not a definition, check if it's a use of something defined elsewhere
+		if obj, ok := info.Uses[ident]; ok && obj != nil {
+			pos := fset.Position(obj.Pos())
+			if pos.Filename != "" {
+				return pos.Filename, pos.Line, pos.Column
+			}
+		}
+		// Fallback: use the identifier position itself
+		pos := fset.Position(ident.Pos())
+		if pos.Filename != "" {
+			return pos.Filename, pos.Line, pos.Column
+		}
+	}
+
+	// Last resort: use the expression position
+	pos := fset.Position(expr.Pos())
+	return pos.Filename, pos.Line, pos.Column
 }
 
 // normalizeTypeStr strips absolute directory paths from type strings produced
@@ -231,17 +311,41 @@ func getElementType(t types.Type) types.Type {
 	return nil
 }
 
+// Package cache for storing AST files per package
+type pkgCache struct {
+	fset  *token.FileSet
+	files map[string]*ast.File
+}
+
+var globalPkgCache *pkgCache
+
+func init() {
+	globalPkgCache = &pkgCache{
+		files: make(map[string]*ast.File),
+	}
+}
+
+func setPkgCache(fset *token.FileSet, files map[string]*ast.File) {
+	globalPkgCache.fset = fset
+	globalPkgCache.files = files
+}
+
 func extractFields(t types.Type) []FieldInfo {
+	fields, _ := extractFieldsWithDocs(t)
+	return fields
+}
+
+func extractFieldsWithDocs(t types.Type) ([]FieldInfo, string) {
 	if t == nil {
-		return nil
+		return nil, ""
 	}
 	if ptr, ok := t.(*types.Pointer); ok {
-		return extractFields(ptr.Elem())
+		return extractFieldsWithDocs(ptr.Elem())
 	}
 
 	named, ok := t.(*types.Named)
 	if !ok {
-		return nil
+		return nil, ""
 	}
 
 	strct, ok := named.Underlying().(*types.Struct)
@@ -256,8 +360,15 @@ func extractFields(t types.Type) []FieldInfo {
 				})
 			}
 		}
-		return fields
+		return fields, ""
 	}
+
+	// Get the struct name and package to find AST
+	structName := named.Obj().Name()
+	pkgPath := named.Obj().Pkg().Path()
+
+	// Try to find struct field positions and docs from AST
+	fieldPositions, typeDoc := findStructFieldPositions(structName, pkgPath)
 
 	var fields []FieldInfo
 	for i := 0; i < strct.NumFields(); i++ {
@@ -277,9 +388,19 @@ func extractFields(t types.Type) []FieldInfo {
 		}
 		if slice, ok := ft.(*types.Slice); ok {
 			fi.IsSlice = true
-			fi.Fields = extractFields(slice.Elem())
+			childFields, _ := extractFieldsWithDocs(slice.Elem())
+			fi.Fields = childFields
 		} else {
-			fi.Fields = extractFields(ft)
+			childFields, _ := extractFieldsWithDocs(ft)
+			fi.Fields = childFields
+		}
+
+		// Add definition location and documentation if we found it
+		if pos, ok := fieldPositions[f.Name()]; ok {
+			fi.DefFile = pos.file
+			fi.DefLine = pos.line
+			fi.DefCol = pos.col
+			fi.Doc = pos.doc
 		}
 
 		fields = append(fields, fi)
@@ -295,7 +416,106 @@ func extractFields(t types.Type) []FieldInfo {
 		}
 	}
 
-	return fields
+	return fields, typeDoc
+}
+
+// fieldInfo stores file location and documentation
+type fieldInfo struct {
+	file string
+	line int
+	col  int
+	doc  string
+}
+
+// getTypeDoc extracts documentation for a type declaration
+func getTypeDoc(genDecl *ast.GenDecl, typeSpec *ast.TypeSpec) string {
+	// Block comment above the declaration (most common, godoc style)
+	if genDecl.Doc != nil {
+		return genDecl.Doc.Text()
+	}
+	// TypeSpec-level block comment (inside grouped type blocks)
+	if typeSpec.Doc != nil {
+		return typeSpec.Doc.Text()
+	}
+	// Inline comment on the same line as the struct
+	if typeSpec.Comment != nil {
+		return typeSpec.Comment.Text()
+	}
+	return ""
+}
+
+// getFieldDoc extracts documentation for a struct field
+func getFieldDoc(field *ast.Field) string {
+	// Block comment above the field
+	if field.Doc != nil {
+		return field.Doc.Text()
+	}
+	// Inline comment on the same line as the field
+	if field.Comment != nil {
+		return field.Comment.Text()
+	}
+	return ""
+}
+
+// findStructFieldPositions searches the AST for struct type definitions and extracts docs
+// Returns field positions and the type documentation
+func findStructFieldPositions(structName, pkgPath string) (map[string]fieldInfo, string) {
+	positions := make(map[string]fieldInfo)
+	typeDoc := ""
+
+	if globalPkgCache == nil || globalPkgCache.files == nil {
+		return positions, typeDoc
+	}
+
+	for _, f := range globalPkgCache.files {
+		ast.Inspect(f, func(n ast.Node) bool {
+			// Look for type declarations
+			genDecl, ok := n.(*ast.GenDecl)
+			if !ok || genDecl.Tok != token.TYPE {
+				return true
+			}
+
+			for _, spec := range genDecl.Specs {
+				typeSpec, ok := spec.(*ast.TypeSpec)
+				if !ok {
+					continue
+				}
+
+				// Check if this is the struct we're looking for
+				if typeSpec.Name.Name != structName {
+					continue
+				}
+
+				structType, ok := typeSpec.Type.(*ast.StructType)
+				if !ok {
+					continue
+				}
+
+				// Capture type documentation using helper function
+				typeDoc = getTypeDoc(genDecl, typeSpec)
+
+				// Record positions and docs for each field
+				for _, field := range structType.Fields.List {
+					pos := globalPkgCache.fset.Position(field.Pos())
+					fieldDoc := getFieldDoc(field)
+					for _, name := range field.Names {
+						positions[name.Name] = fieldInfo{
+							file: pos.Filename,
+							line: pos.Line,
+							col:  pos.Column,
+							doc:  fieldDoc,
+						}
+					}
+				}
+
+				return false
+			}
+
+			return true
+		})
+	}
+
+	return positions, typeDoc
 }
 
 func inferTypeFromAST(expr ast.Expr) string {

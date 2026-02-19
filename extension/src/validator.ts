@@ -1,4 +1,5 @@
 import * as fs from 'fs';
+import * as path from 'path';
 import * as vscode from 'vscode';
 import { FieldInfo, ScopeFrame, TemplateContext, TemplateNode, TemplateVar, ValidationError } from './types';
 import { TemplateParser, resolvePath, ResolveResult } from './templateParser';
@@ -112,7 +113,7 @@ export class TemplateValidator {
             });
           } else {
             // Build child scope from element type
-            const elemScope = this.buildRangeScope(node.path, vars, scopeStack);
+            const elemScope = this.buildRangeScope(node.path, vars, scopeStack, ctx);
             const childStack = elemScope ? [...scopeStack, elemScope] : scopeStack;
             if (node.children) {
               this.validateNodes(node.children, vars, childStack, errors, ctx, filePath);
@@ -188,7 +189,8 @@ export class TemplateValidator {
   private buildRangeScope(
     path: string[],
     vars: Map<string, TemplateVar>,
-    scopeStack: ScopeFrame[]
+    scopeStack: ScopeFrame[],
+    ctx: TemplateContext
   ): ScopeFrame | null {
     // The range target should be a slice; its element type becomes the new dot
     const topVar = vars.get(path[0]);
@@ -198,17 +200,28 @@ export class TemplateValidator {
         typeStr: topVar.elemType ?? topVar.type,
         fields: topVar.fields,
         isRange: true,
+        sourceVar: topVar,
       };
     }
 
     // Try resolving through scope
     const result = resolvePath(path, vars, scopeStack);
     if (result.found && result.isSlice && result.fields) {
+      // Find the source variable from render calls to track definition
+      let sourceVar: TemplateVar | undefined;
+      for (const rc of ctx.renderCalls) {
+        const v = rc.vars.find(v => v.name === path[0]);
+        if (v?.isSlice) {
+          sourceVar = v;
+          break;
+        }
+      }
       return {
         key: '.',
         typeStr: result.typeStr,
         fields: result.fields,
         isRange: true,
+        sourceVar,
       };
     }
 
@@ -338,17 +351,88 @@ export class TemplateValidator {
     const varName = node.path[0] === '.' ? '.' : '.' + node.path.join('.');
     const md = new vscode.MarkdownString();
     md.isTrusted = true;
+
+    // Find the variable info to get documentation
+    const varInfo = this.findVariableInfo(node.path, ctx.vars, stack);
+
+    // Build hover content similar to gopls
     md.appendCodeblock(`${varName}: ${result.typeStr}`, 'go');
 
+    // Add documentation if available
+    if (varInfo?.doc) {
+      md.appendMarkdown('\n\n---\n\n');
+      md.appendMarkdown(varInfo.doc);
+    }
+
+    // Add field information with documentation
     if (result.fields && result.fields.length > 0) {
-      md.appendMarkdown('\n\n**Available fields:**\n');
-      for (const f of result.fields.slice(0, 20)) {
+      md.appendMarkdown('\n\n---\n\n');
+      md.appendMarkdown('**Fields:**\n\n');
+
+      for (const f of result.fields.slice(0, 30)) {
         const typeLabel = f.isSlice ? `[]${f.type}` : f.type;
-        md.appendMarkdown(`- \`.${f.name}\`: \`${typeLabel}\`\n`);
+
+        // Field signature
+        md.appendMarkdown(`**${f.name}** \`${typeLabel}\`\n`);
+
+        // Field documentation if available
+        if (f.doc) {
+          md.appendMarkdown(`\n${f.doc}\n`);
+        }
+
+        md.appendMarkdown('\n');
       }
     }
 
     return new vscode.Hover(md);
+  }
+
+  /**
+   * Find variable information including documentation for a path
+   */
+  private findVariableInfo(
+    path: string[],
+    vars: Map<string, TemplateVar>,
+    scopeStack: ScopeFrame[]
+  ): { typeStr: string; doc?: string } | null {
+    if (path.length === 0) return null;
+
+    const topVarName = path[0] === '.' ? null : path[0];
+    if (!topVarName) return null;
+
+    // Check top-level vars
+    const topVar = vars.get(topVarName);
+    if (!topVar) {
+      // Check scope stack
+      const dotFrame = scopeStack.slice().reverse().find(f => f.key === '.');
+      if (dotFrame?.fields) {
+        const field = dotFrame.fields.find(f => f.name === topVarName);
+        if (field) {
+          return { typeStr: field.type, doc: field.doc };
+        }
+      }
+      return null;
+    }
+
+    // If just the top-level var
+    if (path.length === 1) {
+      return { typeStr: topVar.type, doc: topVar.doc };
+    }
+
+    // Navigate through fields
+    let fields = topVar.fields ?? [];
+    for (let i = 1; i < path.length; i++) {
+      const field = fields.find(f => f.name === path[i]);
+      if (!field) return null;
+
+      if (i === path.length - 1) {
+        return { typeStr: field.type, doc: field.doc };
+      }
+
+      fields = field.fields ?? [];
+    }
+
+    return null;
   }
 
   // ── Definition ─────────────────────────────────────────────────────────────
@@ -381,20 +465,250 @@ export class TemplateValidator {
     const hit = this.findNodeAtPosition(nodes, position, ctx.vars, []);
     if (!hit) return null;
 
-    const { node } = hit;
+    const { node, stack } = hit;
     const topVarName = node.path[0] === '.' ? null : node.path[0];
     if (!topVarName) return null;
 
-    // Find the render call that passes this variable
+    // Check for explicitly declared variables first (e.g., $name := .DrugName)
+    if (topVarName.startsWith('$')) {
+      // Search in all nodes but also check if it's accessing a range element
+      const declaredVar = this.findDeclaredVariableDefinition(node, nodes, position, ctx);
+      if (declaredVar) {
+        return declaredVar;
+      }
+      // For $ variables inside ranges, they might be assigned from range elements
+      // Try to resolve through the scope stack
+      const rangeVarResult = this.findRangeAssignedVariable(node, stack, ctx);
+      if (rangeVarResult) {
+        return rangeVarResult;
+      }
+    }
+
+    // Find the variable definition and go to its source location
     for (const rc of ctx.renderCalls) {
-      const passeVar = rc.vars.find(v => v.name === topVarName);
-      if (passeVar && rc.file) {
-        const absGoFile = this.graphBuilder.resolveGoFilePath(rc.file);
+      const passedVar = rc.vars.find(v => v.name === topVarName);
+      if (passedVar) {
+        // Use the definition location if available
+        if (passedVar.defFile && passedVar.defLine) {
+          // defFile may be absolute or relative - handle both
+          let absGoFile: string | null = passedVar.defFile;
+          if (!path.isAbsolute(absGoFile)) {
+            absGoFile = this.graphBuilder.resolveGoFilePath(absGoFile);
+          } else if (!fs.existsSync(absGoFile)) {
+            absGoFile = null;
+          }
+          if (absGoFile) {
+            return new vscode.Location(
+              vscode.Uri.file(absGoFile),
+              new vscode.Position(Math.max(0, passedVar.defLine - 1), (passedVar.defCol ?? 1) - 1)
+            );
+          }
+        }
+        // Fallback to render call location if no definition location available
+        if (rc.file) {
+          const absGoFile = this.graphBuilder.resolveGoFilePath(rc.file);
+          if (absGoFile) {
+            return new vscode.Location(
+              vscode.Uri.file(absGoFile),
+              new vscode.Position(Math.max(0, rc.line - 1), 0)
+            );
+          }
+        }
+      }
+    }
+
+    // Handle variables inside range blocks (where path starts from element type)
+    // e.g., {{ range .prescriptions }} ... {{ .DrugName }}
+    const rangeScopeResult = this.findRangeVariableDefinition(node, stack, ctx);
+    if (rangeScopeResult) {
+      return rangeScopeResult;
+    }
+
+    return null;
+  }
+
+  /**
+   * Find definition for a variable declared inside the template (e.g., $name := .DrugName)
+   */
+  private findDeclaredVariableDefinition(
+    targetNode: TemplateNode,
+    nodes: TemplateNode[],
+    position: vscode.Position,
+    ctx: TemplateContext
+  ): vscode.Location | null {
+    // Search for the assignment that defines this variable
+    const varName = targetNode.path[0];
+    if (!varName?.startsWith('$')) return null;
+
+    for (const node of nodes) {
+      const result = this.findVariableAssignment(node, varName, position, ctx);
+      if (result) return result;
+    }
+
+    return null;
+  }
+
+  /**
+   * Recursively search for a variable assignment (e.g., $name := .DrugName)
+   */
+  private findVariableAssignment(
+    node: TemplateNode,
+    varName: string,
+    position: vscode.Position,
+    ctx: TemplateContext
+  ): vscode.Location | null {
+    // Check if this node is a variable assignment
+    if (node.kind === 'variable' && node.rawText.includes(':=')) {
+      const assignMatch = node.rawText.match(/\{\{\s*\$([\w]+)\s*:=\s*(.+?)\s*\}\}/);
+      if (assignMatch && '$' + assignMatch[1] === varName) {
+        // This is the assignment - go to the right-hand side definition
+        const rhs = assignMatch[2].trim();
+        // Create a temporary node to resolve the RHS
+        const rhsNode: TemplateNode = {
+          kind: 'variable',
+          path: this.parser.parseDotPath(rhs),
+          rawText: rhs,
+          line: node.line,
+          col: node.col,
+        };
+        // Try to find definition for the RHS
+        return this.findVariableDefinition(rhsNode, ctx);
+      }
+    }
+
+    // Recurse into children
+    if (node.children) {
+      for (const child of node.children) {
+        const result = this.findVariableAssignment(child, varName, position, ctx);
+        if (result) return result;
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Find definition for a variable, checking render calls
+   */
+  private findVariableDefinition(
+    node: TemplateNode,
+    ctx: TemplateContext
+  ): vscode.Location | null {
+    const topVarName = node.path[0] === '.' ? null : node.path[0];
+    if (!topVarName) return null;
+
+    for (const rc of ctx.renderCalls) {
+      const passedVar = rc.vars.find(v => v.name === topVarName);
+      if (passedVar?.defFile && passedVar.defLine) {
+        let absGoFile: string | null = passedVar.defFile;
+        if (!path.isAbsolute(absGoFile)) {
+          absGoFile = this.graphBuilder.resolveGoFilePath(absGoFile);
+        } else if (!fs.existsSync(absGoFile)) {
+          absGoFile = null;
+        }
         if (absGoFile) {
           return new vscode.Location(
             vscode.Uri.file(absGoFile),
-            new vscode.Position(Math.max(0, rc.line - 1), 0)
+            new vscode.Position(Math.max(0, passedVar.defLine - 1), (passedVar.defCol ?? 1) - 1)
           );
+        }
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Find definition for a variable assigned from a range element
+   * e.g., {{ $i, $v := range .Items }} ... {{ $v.Name }}
+   */
+  private findRangeAssignedVariable(
+    node: TemplateNode,
+    scopeStack: ScopeFrame[],
+    ctx: TemplateContext
+  ): vscode.Location | null {
+    const varName = node.path[0];
+    if (!varName?.startsWith('$')) return null;
+
+    // Look through the scope stack for range contexts
+    // Check if this $variable is an iteration variable from a range
+    for (const frame of scopeStack) {
+      if (frame.isRange && frame.sourceVar) {
+        // This might be an iteration variable
+        // Go to the slice/array definition
+        if (frame.sourceVar.defFile && frame.sourceVar.defLine) {
+          let absGoFile: string | null = frame.sourceVar.defFile;
+          if (!path.isAbsolute(absGoFile)) {
+            absGoFile = this.graphBuilder.resolveGoFilePath(absGoFile);
+          } else if (!fs.existsSync(absGoFile)) {
+            absGoFile = null;
+          }
+          if (absGoFile) {
+            return new vscode.Location(
+              vscode.Uri.file(absGoFile),
+              new vscode.Position(Math.max(0, frame.sourceVar.defLine - 1), (frame.sourceVar.defCol ?? 1) - 1)
+            );
+          }
+        }
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Find definition for variables accessed inside range blocks
+   * e.g., {{ range .prescriptions }} ... {{ .DrugName }}
+   * When clicking on a field inside a range, goes to the specific struct field definition
+   */
+  private findRangeVariableDefinition(
+    node: TemplateNode,
+    scopeStack: ScopeFrame[],
+    ctx: TemplateContext
+  ): vscode.Location | null {
+    // If path doesn't start with a top-level var, it might be accessing range element
+    if (node.path.length === 0 || node.path[0] === '.') return null;
+
+    const firstFieldName = node.path[0];
+
+    // Look through scope stack for range contexts
+    for (let i = scopeStack.length - 1; i >= 0; i--) {
+      const frame = scopeStack[i];
+      if (frame.isRange && frame.fields) {
+        // Check if the first path element is a field of this range element
+        const field = frame.fields.find(f => f.name === firstFieldName);
+        if (field) {
+          // Try to go to the specific field definition if available
+          if (field.defFile && field.defLine) {
+            let absGoFile: string | null = field.defFile;
+            if (!path.isAbsolute(absGoFile)) {
+              absGoFile = this.graphBuilder.resolveGoFilePath(absGoFile);
+            } else if (!fs.existsSync(absGoFile)) {
+              absGoFile = null;
+            }
+            if (absGoFile) {
+              return new vscode.Location(
+                vscode.Uri.file(absGoFile),
+                new vscode.Position(Math.max(0, field.defLine - 1), (field.defCol ?? 1) - 1)
+              );
+            }
+          }
+
+          // Fallback: go to the slice/array definition
+          if (frame.sourceVar?.defFile && frame.sourceVar.defLine) {
+            let absGoFile: string | null = frame.sourceVar.defFile;
+            if (!path.isAbsolute(absGoFile)) {
+              absGoFile = this.graphBuilder.resolveGoFilePath(absGoFile);
+            } else if (!fs.existsSync(absGoFile)) {
+              absGoFile = null;
+            }
+            if (absGoFile) {
+              return new vscode.Location(
+                vscode.Uri.file(absGoFile),
+                new vscode.Position(Math.max(0, frame.sourceVar.defLine - 1), (frame.sourceVar.defCol ?? 1) - 1)
+              );
+            }
+          }
         }
       }
     }
@@ -509,11 +823,34 @@ export class TemplateValidator {
         if ((node.kind === 'range' || node.kind === 'with') && node.path.length > 0 && node.path[0] !== '.') {
           const result = resolvePath(node.path, vars, scopeStack);
           if (result.found && result.fields) {
+            // Find the source variable for ranges (to enable go-to-definition)
+            let sourceVar: TemplateVar | undefined;
+            if (node.kind === 'range') {
+              // Try to find the source variable from top-level vars or scope
+              sourceVar = vars.get(node.path[0]);
+              if (!sourceVar && scopeStack.length > 0) {
+                // Check scope stack for the variable
+                const dotFrame = scopeStack.slice().reverse().find(f => f.key === '.');
+                if (dotFrame?.fields) {
+                  const field = dotFrame.fields.find(f => f.name === node.path[0]);
+                  if (field) {
+                    // Create a synthetic TemplateVar from field info
+                    sourceVar = {
+                      name: node.path[0],
+                      type: field.type,
+                      fields: field.fields,
+                      isSlice: field.isSlice,
+                    };
+                  }
+                }
+              }
+            }
             const frame: ScopeFrame = {
               key: '.',
               typeStr: result.typeStr,
               fields: result.fields,
               isRange: node.kind === 'range',
+              sourceVar,
             };
             childStack = [...scopeStack, frame];
           }

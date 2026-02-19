@@ -24,8 +24,10 @@
     <h2>Prescriptions</h2>
     {{ range .prescriptions }}
     <div class="prescription">
-        <span>{{ .DrugName }}</span>
+        {{ $name := .DrugName }}
+        <span>{{ $name }}</span>
         <span>{{ .Quantity }}</span>
+        <span>{{ .Dosage }}</span>
     </div>
     {{ end }}
 

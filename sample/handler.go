@@ -46,9 +46,12 @@ type Drug struct {
 
 // Prescription represents a prescription
 type Prescription struct {
+	// Drug name
 	DrugName string
+
+	// Quantity
 	Quantity int
-	Dosage   string
+	Dosage   string // Dosage
 }
 
 // Management represents a management entry
