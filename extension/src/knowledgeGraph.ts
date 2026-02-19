@@ -78,7 +78,17 @@ export class KnowledgeGraphBuilder {
    */
   findContextForFile(absolutePath: string): TemplateContext | undefined {
     // Try to match relative paths
-    const rel = path.relative(this.workspaceRoot, absolutePath).replace(/\\/g, '/');
+    let rel = path.relative(this.workspaceRoot, absolutePath).replace(/\\/g, '/');
+
+    const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+    const templateRoot = config.get<string>('templateRoot') || '';
+    
+    // If templateRoot is set, strip it from start of path to match render call paths
+    if (templateRoot && rel.startsWith(templateRoot + '/')) {
+        rel = rel.slice(templateRoot.length + 1);
+    } else if (templateRoot && rel === templateRoot) {
+        rel = ''; // Should not happen for file
+    }
 
     // Direct match
     if (this.graph.templates.has(rel)) {
@@ -116,11 +126,19 @@ export class KnowledgeGraphBuilder {
     }
 
     // Also try to find the file in the workspace even without a render call
+    const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+    const templateRoot = config.get<string>('templateRoot') || '';
+
     const dir = path.dirname(currentFile);
     const candidates = [
       path.join(dir, partialName),
       path.join(this.workspaceRoot, partialName),
     ];
+    
+    if (templateRoot) {
+        candidates.push(path.join(this.workspaceRoot, templateRoot, partialName));
+    }
+
     for (const c of candidates) {
       if (fs.existsSync(c)) {
         return {

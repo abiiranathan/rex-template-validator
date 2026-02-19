@@ -3,7 +3,7 @@
   "displayName": "Rex Template Validator",
   "description": "Validates Go template variables in .html/.tmpl files used with the rex framework",
   "version": "0.1.0",
-  "publisher": "Dr. Abiira Nathan",
+  "publisher": "Nabiizy",
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -63,6 +63,11 @@
           "type": "array",
           "default": [],
           "description": "Additional directories to scan for Go files. Empty = entire workspace."
+        },
+        "rexTemplateValidator.templateRoot": {
+          "type": "string",
+          "default": "",
+          "description": "Root directory for templates relative to workspace root (e.g. 'templates'). Useful when using embed.FS or subdirectory views."
         },
         "rexTemplateValidator.debounceMs": {
           "type": "number",

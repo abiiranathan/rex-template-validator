@@ -37,7 +37,10 @@ export class GoAnalyzer {
    */
   async analyzeDirectory(dir: string): Promise<AnalysisResult> {
     return new Promise((resolve) => {
-      const args = ['-dir', dir, '-validate'];
+      const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+      const templateRoot = config.get<string>('templateRoot') || '';
+      
+      const args = ['-dir', dir, '-template-root', templateRoot, '-validate'];
       this.outputChannel.appendLine(`[Analyzer] Running: ${this.analyzerPath} ${args.join(' ')}`);
 
       let stdout = '';

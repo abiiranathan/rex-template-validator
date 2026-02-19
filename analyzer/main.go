@@ -10,6 +10,7 @@ import (
 
 func main() {
 	dir := flag.String("dir", ".", "Go source directory to analyze")
+	templateRoot := flag.String("template-root", "", "Root directory for templates (relative to project dir)")
 	validate := flag.Bool("validate", false, "Validate templates against render calls")
 	flag.Parse()
 
@@ -17,7 +18,7 @@ func main() {
 
 	if *validate {
 		// Validate templates
-		validationErrors := validator.ValidateTemplates(result.RenderCalls, *dir)
+		validationErrors := validator.ValidateTemplates(result.RenderCalls, *dir, *templateRoot)
 		output := struct {
 			RenderCalls      []validator.RenderCall       `json:"renderCalls"`
 			ValidationErrors []validator.ValidationResult `json:"validationErrors"`

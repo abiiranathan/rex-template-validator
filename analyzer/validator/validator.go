@@ -9,12 +9,15 @@ import (
 )
 
 // ValidateTemplates validates all templates against their render calls
-func ValidateTemplates(renderCalls []RenderCall, baseDir string) []ValidationResult {
+func ValidateTemplates(renderCalls []RenderCall, baseDir string, templateRoot string) []ValidationResult {
 	var allErrors []ValidationResult
 
 	for _, rc := range renderCalls {
-		templatePath := filepath.Join(baseDir, rc.Template)
-		errors := validateTemplateFile(templatePath, rc.Vars, rc.Template, baseDir)
+		// Construct path using templateRoot
+		// If rc.Template is "views/index.html" and templateRoot is "templates",
+		// path is baseDir/templates/views/index.html
+		templatePath := filepath.Join(baseDir, templateRoot, rc.Template)
+		errors := validateTemplateFile(templatePath, rc.Vars, rc.Template, baseDir, templateRoot)
 		allErrors = append(allErrors, errors...)
 	}
 
@@ -22,7 +25,7 @@ func ValidateTemplates(renderCalls []RenderCall, baseDir string) []ValidationRes
 }
 
 // validateTemplateFile validates a single template file
-func validateTemplateFile(templatePath string, vars []TemplateVar, templateName string, baseDir string) []ValidationResult {
+func validateTemplateFile(templatePath string, vars []TemplateVar, templateName string, baseDir, templateRoot string) []ValidationResult {
 	content, err := os.ReadFile(templatePath)
 	if err != nil {
 		return []ValidationResult{{
@@ -42,11 +45,11 @@ func validateTemplateFile(templatePath string, vars []TemplateVar, templateName 
 	}
 
 	// Parse template and validate
-	return validateTemplateContent(string(content), varMap, templateName, baseDir)
+	return validateTemplateContent(string(content), varMap, templateName, baseDir, templateRoot)
 }
 
 // validateTemplateContent validates template content with proper scope tracking
-func validateTemplateContent(content string, varMap map[string]TemplateVar, templateName string, baseDir string) []ValidationResult {
+func validateTemplateContent(content string, varMap map[string]TemplateVar, templateName string, baseDir, templateRoot string) []ValidationResult {
 	var errors []ValidationResult
 
 	// Build a stack of scopes
@@ -124,10 +127,8 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 				// Check partial existence
 				if len(parts) >= 1 {
 					tmplName := parts[0]
-					// Assuming partials are relative to baseDir (standard in many Go setups, or relative to views)
-					// rex uses "views/..." usually.
-					// We check relative to baseDir.
-					fullPath := filepath.Join(baseDir, tmplName)
+					// Partial paths are usually relative to the template root (or match what is passed to ParseFiles)
+					fullPath := filepath.Join(baseDir, templateRoot, tmplName)
 					if _, err := os.Stat(fullPath); os.IsNotExist(err) {
 						errors = append(errors, ValidationResult{
 							Template: templateName,
