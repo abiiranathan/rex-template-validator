@@ -43,7 +43,6 @@ func validateTemplateFile(templatePath string, vars []TemplateVar, templateName 
 	for _, v := range vars {
 		varMap[v.Name] = v
 	}
-
 	return validateTemplateContent(string(content), varMap, templateName, baseDir, templateRoot)
 }
 
@@ -99,6 +98,14 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 				continue
 			}
 
+			// Validate all variables in the action against the CURRENT scope before modifying it
+			varsInAction := extractVariablesFromAction(action)
+			for _, v := range varsInAction {
+				if err := validateVariableInScope(v, scopeStack, varMap, lineNum+1, col, templateName); err != nil {
+					errors = append(errors, *err)
+				}
+			}
+
 			// Handle range
 			if strings.HasPrefix(action, "range ") {
 				rangeExpr := strings.TrimSpace(action[6:])
@@ -123,11 +130,6 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 				continue
 			}
 
-			// Handle if/else
-			if strings.HasPrefix(action, "if ") || action == "else" || strings.HasPrefix(action, "else if") {
-				continue
-			}
-
 			// Handle template calls
 			if strings.HasPrefix(action, "template ") {
 				parts := parseTemplateAction(action)
@@ -135,23 +137,15 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 				if len(parts) >= 1 {
 					tmplName := parts[0]
 
-					// FIX 1: Only resolve file-based partials, not named blocks
+					// Only resolve file-based partials, not named blocks
 					if !isFileBasedPartial(tmplName) {
 						// It's a named block (defined with {{ define "blockName" }}), skip file resolution
-						// but still validate the context argument if present
-						if len(parts) >= 2 {
-							contextArg := parts[1]
-							if strings.HasPrefix(contextArg, ".") && contextArg != "." {
-								if err := validateVariableInScope(contextArg, scopeStack, varMap, lineNum+1, col, templateName); err != nil {
-									errors = append(errors, *err)
-								}
-							}
-						}
+						// Context argument is already validated by extractVariablesFromAction
 						continue
 					}
 
 					// File-based partial: check existence
-					// FIX 2: Use tmplName (relative) for error reporting, not the full path
+					// Use tmplName (relative) for error reporting, not the full path
 					fullPath := filepath.Join(baseDir, templateRoot, tmplName)
 					if _, err := os.Stat(fullPath); os.IsNotExist(err) {
 						errors = append(errors, ValidationResult{
@@ -165,7 +159,7 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 						continue
 					}
 
-					// FIX 3: Resolve context passed to partial and recursively validate it
+					// Resolve context passed to partial and recursively validate it
 					if len(parts) >= 2 {
 						contextArg := parts[1]
 
@@ -175,15 +169,8 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 						// Build a varMap for the partial based on the resolved scope
 						partialVarMap := buildPartialVarMap(contextArg, partialScope, scopeStack, varMap)
 
-						// Validate the context argument itself in current scope
-						if strings.HasPrefix(contextArg, ".") && contextArg != "." {
-							if err := validateVariableInScope(contextArg, scopeStack, varMap, lineNum+1, col, templateName); err != nil {
-								errors = append(errors, *err)
-							}
-						}
-
 						// Recursively validate the partial with the resolved scope
-						// Use tmplName as the logical name for diagnostics (FIX 2)
+						// Use tmplName as the logical name for diagnostics
 						partialErrors := validateTemplateFile(fullPath, scopeVarsToTemplateVars(partialVarMap), tmplName, baseDir, templateRoot)
 						errors = append(errors, partialErrors...)
 					} else {
@@ -193,24 +180,6 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 					}
 				}
 				continue
-			}
-
-			// Variable access starting with .
-			if strings.HasPrefix(action, ".") && !strings.HasPrefix(action, "..") {
-				if err := validateVariableInScope(action, scopeStack, varMap, lineNum+1, col, templateName); err != nil {
-					errors = append(errors, *err)
-				}
-				continue
-			}
-
-			// Check function call arguments for variable references
-			words := strings.Fields(action)
-			for _, word := range words {
-				if strings.HasPrefix(word, ".") && !strings.HasPrefix(word, "..") {
-					if err := validateVariableInScope(word, scopeStack, varMap, lineNum+1, col, templateName); err != nil {
-						errors = append(errors, *err)
-					}
-				}
 			}
 		}
 	}
@@ -387,7 +356,7 @@ func createScopeFromExpression(expr string, scopeStack []ScopeType, varMap map[s
 func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[string]TemplateVar, line, col int, templateName string) *ValidationResult {
 	varExpr = strings.TrimSpace(varExpr)
 
-	if varExpr == "." {
+	if varExpr == "." || varExpr == "$" {
 		return nil
 	}
 
@@ -398,7 +367,9 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 		return nil
 	}
 
-	if len(scopeStack) > 1 {
+	isRootAccess := parts[0] == "$"
+
+	if !isRootAccess && len(scopeStack) > 1 {
 		currentScope := scopeStack[len(scopeStack)-1]
 		fieldName := parts[1]
 
@@ -546,4 +517,51 @@ func parseTemplateAction(action string) []string {
 	}
 
 	return parts
+}
+
+// extractVariablesFromAction extracts all valid variables from an action string,
+// ignoring string literals and correctly splitting on operators and parentheses.
+func extractVariablesFromAction(action string) []string {
+	var vars []string
+	var current strings.Builder
+	inString := false
+	stringChar := rune(0)
+
+	for _, r := range action {
+		switch {
+		case !inString && (r == '"' || r == '`'):
+			inString = true
+			stringChar = r
+			if current.Len() > 0 {
+				vars = append(vars, current.String())
+				current.Reset()
+			}
+		case inString && r == stringChar:
+			inString = false
+			current.Reset()
+		case !inString && (r == ' ' || r == '(' || r == ')' || r == '|' || r == '=' || r == ',' || r == '+' || r == '-' || r == '*' || r == '/' || r == '!' || r == '<' || r == '>' || r == '%' || r == '&'):
+			if current.Len() > 0 {
+				vars = append(vars, current.String())
+				current.Reset()
+			}
+		default:
+			if !inString {
+				current.WriteRune(r)
+			}
+		}
+	}
+
+	if current.Len() > 0 && !inString {
+		vars = append(vars, current.String())
+	}
+
+	var validVars []string
+	for _, v := range vars {
+		v = strings.TrimSpace(v)
+		if (strings.HasPrefix(v, ".") || strings.HasPrefix(v, "$.")) && v != "." && v != "$" && !strings.HasPrefix(v, "..") {
+			validVars = append(validVars, v)
+		}
+	}
+
+	return validVars
 }
