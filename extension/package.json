@@ -69,6 +69,11 @@
           "default": "",
           "description": "Root directory for templates, relative to sourceDir, passed as the -template-root flag (e.g. 'templates')."
         },
+        "rexTemplateValidator.templateBaseDir": {
+          "type": "string",
+          "default": "",
+          "description": "Base directory for templates, relative to the workspace root, used as the -template-base-dir flag. If empty, defaults to the workspace root."
+        },
         "rexTemplateValidator.debounceMs": {
           "type": "number",
           "default": 1500,

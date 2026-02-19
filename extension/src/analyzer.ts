@@ -44,6 +44,7 @@ export class GoAnalyzer {
     const config = vscode.workspace.getConfiguration('rexTemplateValidator');
     const sourceDir: string = config.get('sourceDir') ?? '.';
     const templateRoot: string = config.get('templateRoot') ?? '';
+    const templateBaseDir: string = config.get('templateBaseDir') ?? '';
 
     // Resolve the Go source directory to an absolute path
     const absSourceDir = path.resolve(workspaceRoot, sourceDir);
@@ -54,6 +55,8 @@ export class GoAnalyzer {
     }
 
     const args = ['-dir', absSourceDir, '-validate'];
+    args.push('-template-base-dir', templateBaseDir || workspaceRoot);
+
     if (templateRoot) {
       args.push('-template-root', templateRoot);
     }

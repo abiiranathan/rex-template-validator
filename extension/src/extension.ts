@@ -235,6 +235,7 @@ async function rebuildIndex(workspaceRoot: string) {
   const config = vscode.workspace.getConfiguration('rexTemplateValidator');
   const sourceDir: string = config.get('sourceDir') ?? '.';
   const templateRoot: string = config.get('templateRoot') ?? '';
+  const templateBaseDir: string = config.get('templateBaseDir') ?? '';
 
   try {
     const result = await analyzer.analyzeWorkspace(workspaceRoot);
@@ -256,7 +257,7 @@ async function rebuildIndex(workspaceRoot: string) {
     statusBarItem.text = `$(check) Rex: ${count} template${count === 1 ? '' : 's'} indexed`;
 
     // Apply diagnostics from Go analyzer
-    applyAnalyzerDiagnostics(result.validationErrors ?? [], workspaceRoot, sourceDir, templateRoot);
+    applyAnalyzerDiagnostics(result.validationErrors ?? [], workspaceRoot, sourceDir, templateRoot, templateBaseDir);
 
     // Re-validate open template docs with fresh graph (editor diagnostics only)
     for (const doc of vscode.workspace.textDocuments) {
@@ -276,14 +277,16 @@ function applyAnalyzerDiagnostics(
   validationErrors: import('./types').GoValidationError[],
   workspaceRoot: string,
   sourceDir: string,
-  templateRoot: string
+  templateRoot: string,
+  templateBaseDir: string
 ) {
   analyzerCollection.clear();
 
   const issuesByFile = new Map<string, vscode.Diagnostic[]>();
 
   for (const err of validationErrors) {
-    const absPath = path.join(workspaceRoot, sourceDir, templateRoot, err.template);
+    const baseDir = templateBaseDir === '' ? workspaceRoot : path.join(workspaceRoot, templateBaseDir);
+    const absPath = path.join(baseDir, templateRoot, err.template);
 
     const startLine = Math.max(0, err.line - 1);
     const startCol = Math.max(0, err.column - 1);

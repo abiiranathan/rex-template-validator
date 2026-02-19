@@ -11,7 +11,7 @@ import (
 
 // ValidateTemplates validates all templates against their render calls
 func ValidateTemplates(renderCalls []RenderCall, baseDir string, templateRoot string) []ValidationResult {
-	var allErrors []ValidationResult
+	var allErrors = []ValidationResult{}
 	for _, rc := range renderCalls {
 		templatePath := filepath.Join(baseDir, templateRoot, rc.Template)
 		errors := validateTemplateFile(templatePath, rc.Vars, rc.Template, baseDir, templateRoot)
