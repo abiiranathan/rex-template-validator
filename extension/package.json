@@ -1,0 +1,93 @@
+{
+  "name": "rex-template-validator",
+  "displayName": "Rex Template Validator",
+  "description": "Validates Go template variables in .html/.tmpl files used with the rex framework",
+  "version": "0.1.0",
+  "publisher": "Dr. Abiira Nathan",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Linters",
+    "Other"
+  ],
+  "keywords": [
+    "go",
+    "golang",
+    "template",
+    "html",
+    "rex",
+    "validation"
+  ],
+  "activationEvents": [
+    "workspaceContains:**/*.go",
+    "onLanguage:html",
+    "onLanguage:go-template"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "rexTemplateValidator.validate",
+        "title": "Rex: Validate Template Variables",
+        "icon": "$(check-all)"
+      },
+      {
+        "command": "rexTemplateValidator.rebuildIndex",
+        "title": "Rex: Rebuild Template Index",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "rexTemplateValidator.showKnowledgeGraph",
+        "title": "Rex: Show Template Knowledge Graph"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "rexTemplateValidator.validate",
+          "when": "resourceExtname == .html || resourceExtname == .tmpl",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Rex Template Validator",
+      "properties": {
+        "rexTemplateValidator.goAnalyzerPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the rex-analyzer binary. Leave empty to use the bundled binary."
+        },
+        "rexTemplateValidator.scanDirectories": {
+          "type": "array",
+          "default": [],
+          "description": "Additional directories to scan for Go files. Empty = entire workspace."
+        },
+        "rexTemplateValidator.debounceMs": {
+          "type": "number",
+          "default": 1500,
+          "description": "Debounce delay in ms before re-validating on file change."
+        },
+        "rexTemplateValidator.enableAutoValidate": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically validate templates on save."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile && npm run build-analyzer",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "build-analyzer": "cd ../analyzer && go build -o ../extension/out/rex-analyzer .",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {}
+}

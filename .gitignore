@@ -1,0 +1,31 @@
+# Binaries
+rex-analyzer
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Node
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# VSCode Extension Build
+extension/out/
+extension/dist/
+*.vsix
+.vscode-test/
+
+# Editor
+.vscode/
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/settings.json
+!.vscode/tasks.json
+.idea/
+*.swp
+.DS_Store
+
+# Go
+analyzer/analyzer
+analyzer/rex-analyzer

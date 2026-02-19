@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>{{ .Title }}</title>
+</head>
+
+<body>
+    <nav>
+        {{ range .breadcrumbs }}
+        <a href="{{ .URL }}">{{ .Label }}</a>
+        {{ if not .IsLast }} / {{ end }}
+        {{ end }}
+    </nav>
+
+    <h1>{{ .Title }}</h1>
+    <p>Patient: {{ .visit.Patient.Name }}</p>
+    <p>Doctor: {{ .doctor }}</p>
+
+    <!-- This variable doesn't exist - should cause an error -->
+    <p>Ward: {{ .visit.Ward.Name }}</p>
+
+    <h2>Management</h2>
+    {{ range .management }}
+    <div>{{ .Name }}: {{ .Dosage }}</div>
+    {{ end }}
+
+    <h2>Prescriptions</h2>
+    {{ range .prescriptions }}
+    <div class="prescription">
+        <span>{{ .DrugName }}</span>
+        <span>{{ .Quantity }}</span>
+        <!-- Undefined field - should error -->
+        <span>{{ .NonExistentField }}</span>
+    </div>
+    {{ end }}
+
+    <h2>Billed Drugs</h2>
+    {{ range .billedDrugs }}
+    <div>{{ .Name }}</div>
+    {{ end }}
+
+    <a href="{{ .PathPrefix }}/new">New Entry</a>
+
+    <!-- Include a partial -->
+    {{ template "views/partials/footer.html" . }}
+</body>
+
+</html>
