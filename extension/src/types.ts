@@ -71,7 +71,7 @@ export interface KnowledgeGraph {
 // ─── Template AST ─────────────────────────────────────────────────────────────
 
 export interface TemplateNode {
-  kind: 'variable' | 'range' | 'if' | 'with' | 'block' | 'partial' | 'call';
+  kind: 'variable' | 'range' | 'if' | 'with' | 'block' | 'partial' | 'call' | 'define';
   path: string[];        // e.g. ["Visit", "Doctor", "DisplayName"]
   rawText: string;
   line: number;

@@ -137,6 +137,22 @@ export class TemplateParser {
         continue;
       }
 
+      if (inner.startsWith('define ')) {
+        const child = this.buildTree(tokens, pos + 1);
+        nodes.push({
+          kind: 'define',
+          path: [],
+          rawText: tok.raw,
+          line: tok.line,
+          col: tok.col,
+          endLine: child.endToken?.line,
+          endCol: child.endToken?.col,
+          children: child.nodes,
+        });
+        pos = child.nextPos;
+        continue;
+      }
+
       // ── Template / partial calls ─────────────────────────────────────────
 
       if (inner.startsWith('template ')) {

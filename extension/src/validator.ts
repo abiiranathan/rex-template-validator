@@ -174,9 +174,13 @@ export class TemplateValidator {
         return; // partial handler recurses children itself
       }
 
-      case 'block': {
-        // block doesn't change scope
-        break;
+      case 'block':
+      case 'define': {
+        // We do NOT validate the default body of a block or define during initial 
+        // per-file pass. They are meant to be executed and evaluated when explicitly 
+        // called via `template`, potentially with a different scope context!
+        // Returning here prevents `this.validateNodes` from recursing into their children.
+        return;
       }
     }
 
