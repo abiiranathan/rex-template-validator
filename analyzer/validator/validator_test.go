@@ -213,7 +213,7 @@ func TestValidateTemplateContent(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := validateTemplateContent(tt.content, sharedVars, "test.html", ".", "")
+			got := validateTemplateContent(tt.content, sharedVars, "test.html", ".", "", 1, nil)
 
 			if len(got) != len(tt.expected) {
 				t.Errorf("expected %d errors, got %d", len(tt.expected), len(got))
@@ -301,7 +301,7 @@ func TestPartialTemplateResolution(t *testing.T) {
 		}
 
 		vars := []TemplateVar{sharedVars["User"]}
-		errs := validateTemplateFile(parentPath, vars, "index.html", tmpDir, templateRoot)
+		errs := validateTemplateFile(parentPath, vars, "index.html", tmpDir, templateRoot, nil)
 
 		// We expect exactly 1 error from the partial (NonExistent field)
 		if len(errs) != 1 {
@@ -332,7 +332,7 @@ func TestPartialTemplateResolution(t *testing.T) {
 		}
 
 		vars := []TemplateVar{sharedVars["User"]}
-		errs := validateTemplateFile(parentPath, vars, "parent.html", tmpDir, templateRoot)
+		errs := validateTemplateFile(parentPath, vars, "parent.html", tmpDir, templateRoot, nil)
 
 		if len(errs) != 0 {
 			t.Errorf("Fix3: expected no errors for valid partial scope, got %d", len(errs))
@@ -355,7 +355,7 @@ func TestPartialTemplateResolution(t *testing.T) {
 		}
 
 		vars := []TemplateVar{sharedVars["User"], sharedVars["Items"]}
-		errs := validateTemplateFile(parentPath, vars, "root_parent.html", tmpDir, templateRoot)
+		errs := validateTemplateFile(parentPath, vars, "root_parent.html", tmpDir, templateRoot, nil)
 
 		if len(errs) != 0 {
 			t.Errorf("Fix3: expected no errors when partial receives full root scope, got %d", len(errs))
@@ -377,7 +377,7 @@ func TestPartialTemplateResolution(t *testing.T) {
 		}
 
 		vars := []TemplateVar{sharedVars["User"]}
-		errs := validateTemplateFile(parentPath, vars, "bad_parent.html", tmpDir, templateRoot)
+		errs := validateTemplateFile(parentPath, vars, "bad_parent.html", tmpDir, templateRoot, nil)
 
 		if len(errs) != 1 {
 			t.Errorf("Fix3: expected 1 error for invalid field in partial, got %d", len(errs))
@@ -398,7 +398,7 @@ func TestPartialTemplateResolution(t *testing.T) {
 		}
 
 		vars := []TemplateVar{sharedVars["User"]}
-		errs := validateTemplateFile(parentPath, vars, "missing_parent.html", tmpDir, templateRoot)
+		errs := validateTemplateFile(parentPath, vars, "missing_parent.html", tmpDir, templateRoot, nil)
 
 		if len(errs) != 1 {
 			t.Errorf("expected 1 error for missing partial, got %d", len(errs))

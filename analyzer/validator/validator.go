@@ -9,12 +9,124 @@ import (
 	"strings"
 )
 
+// NamedTemplate stores information about defined blocks and named templates
+type NamedTemplate struct {
+	Name     string
+	Content  string
+	FilePath string
+	LineNum  int
+}
+
+// countLines counts newlines in a string
+func countLines(s string) int {
+	return strings.Count(s, "\n")
+}
+
+// parseAllNamedTemplates extracts all define and block declarations from template files
+func parseAllNamedTemplates(baseDir, templateRoot string) map[string]NamedTemplate {
+	registry := make(map[string]NamedTemplate)
+	root := filepath.Join(baseDir, templateRoot)
+
+	filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		if !isFileBasedPartial(path) {
+			return nil
+		}
+
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			rel = path
+		}
+
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+
+		extractNamedTemplatesFromContent(string(content), rel, registry)
+		return nil
+	})
+
+	return registry
+}
+
+// extractNamedTemplatesFromContent finds defined templates within content
+func extractNamedTemplatesFromContent(content, templateName string, registry map[string]NamedTemplate) {
+	actionPattern := regexp.MustCompile(`\{\{\s*(.+?)\s*\}\}`)
+	matches := actionPattern.FindAllStringSubmatchIndex(content, -1)
+
+	var activeName string
+	var startIndex int
+	var startLine int
+	depth := 0
+
+	for _, match := range matches {
+		if len(match) < 4 {
+			continue
+		}
+
+		fullActionStart := match[0]
+		fullActionEnd := match[1]
+		actionStart := match[2]
+		actionEnd := match[3]
+
+		action := strings.TrimSpace(content[actionStart:actionEnd])
+		if strings.HasPrefix(action, "/*") || strings.HasPrefix(action, "//") {
+			continue
+		}
+
+		words := strings.Fields(action)
+		if len(words) == 0 {
+			continue
+		}
+
+		first := words[0]
+
+		if first == "if" || first == "with" || first == "range" || first == "block" {
+			if activeName != "" {
+				depth++
+			} else if first == "block" && len(words) >= 2 {
+				activeName = strings.Trim(words[1], `"`)
+				startIndex = fullActionEnd
+				startLine = countLines(content[:fullActionEnd]) + 1
+				depth = 1
+			}
+		} else if first == "define" {
+			if activeName != "" {
+				depth++
+			} else if len(words) >= 2 {
+				activeName = strings.Trim(words[1], `"`)
+				startIndex = fullActionEnd
+				startLine = countLines(content[:fullActionEnd]) + 1
+				depth = 1
+			}
+		} else if first == "end" {
+			if activeName != "" {
+				depth--
+				if depth == 0 {
+					registry[activeName] = NamedTemplate{
+						Name:     activeName,
+						Content:  content[startIndex:fullActionStart],
+						FilePath: templateName,
+						LineNum:  startLine,
+					}
+					activeName = ""
+				}
+			}
+		}
+	}
+}
+
 // ValidateTemplates validates all templates against their render calls
 func ValidateTemplates(renderCalls []RenderCall, baseDir string, templateRoot string) []ValidationResult {
+	namedTemplates := parseAllNamedTemplates(baseDir, templateRoot)
+
 	var allErrors = []ValidationResult{}
 	for _, rc := range renderCalls {
 		templatePath := filepath.Join(baseDir, templateRoot, rc.Template)
-		errors := validateTemplateFile(templatePath, rc.Vars, rc.Template, baseDir, templateRoot)
+		errors := validateTemplateFile(templatePath, rc.Vars, rc.Template, baseDir, templateRoot, namedTemplates)
 		// Stamp each error with the originating Go file/line
 		for i := range errors {
 			errors[i].GoFile = rc.File
@@ -26,7 +138,7 @@ func ValidateTemplates(renderCalls []RenderCall, baseDir string, templateRoot st
 }
 
 // validateTemplateFile validates a single template file
-func validateTemplateFile(templatePath string, vars []TemplateVar, templateName string, baseDir, templateRoot string) []ValidationResult {
+func validateTemplateFile(templatePath string, vars []TemplateVar, templateName string, baseDir, templateRoot string, registry map[string]NamedTemplate) []ValidationResult {
 	content, err := os.ReadFile(templatePath)
 	if err != nil {
 		return []ValidationResult{{
@@ -43,7 +155,7 @@ func validateTemplateFile(templatePath string, vars []TemplateVar, templateName 
 	for _, v := range vars {
 		varMap[v.Name] = v
 	}
-	return validateTemplateContent(string(content), varMap, templateName, baseDir, templateRoot)
+	return validateTemplateContent(string(content), varMap, templateName, baseDir, templateRoot, 1, registry)
 }
 
 // isFileBasedPartial returns true if the template name looks like a file path
@@ -61,7 +173,7 @@ func isFileBasedPartial(name string) bool {
 }
 
 // validateTemplateContent validates template content with proper scope tracking
-func validateTemplateContent(content string, varMap map[string]TemplateVar, templateName string, baseDir, templateRoot string) []ValidationResult {
+func validateTemplateContent(content string, varMap map[string]TemplateVar, templateName string, baseDir, templateRoot string, lineOffset int, registry map[string]NamedTemplate) []ValidationResult {
 	var errors []ValidationResult
 
 	var scopeStack []ScopeType
@@ -83,7 +195,10 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 	actionPattern := regexp.MustCompile(`\{\{\s*(.+?)\s*\}\}`)
 	lines := strings.Split(content, "\n")
 
-	for lineNum, line := range lines {
+	skipDepth := 0
+
+	for i, line := range lines {
+		actualLineNum := i + lineOffset
 		matches := actionPattern.FindAllStringSubmatchIndex(line, -1)
 
 		for _, match := range matches {
@@ -98,16 +213,36 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 				continue
 			}
 
+			words := strings.Fields(action)
+			first := ""
+			if len(words) > 0 {
+				first = words[0]
+			}
+
+			if first == "define" {
+				skipDepth++
+				continue
+			}
+
+			if skipDepth > 0 {
+				if first == "if" || first == "with" || first == "range" || first == "block" {
+					skipDepth++
+				} else if first == "end" {
+					skipDepth--
+				}
+				continue
+			}
+
 			// Validate all variables in the action against the CURRENT scope before modifying it
 			varsInAction := extractVariablesFromAction(action)
 			for _, v := range varsInAction {
-				if err := validateVariableInScope(v, scopeStack, varMap, lineNum+1, col, templateName); err != nil {
+				if err := validateVariableInScope(v, scopeStack, varMap, actualLineNum, col, templateName); err != nil {
 					errors = append(errors, *err)
 				}
 			}
 
 			// Handle range
-			if strings.HasPrefix(action, "range ") {
+			if first == "range" {
 				rangeExpr := strings.TrimSpace(action[6:])
 				newScope := createScopeFromRange(rangeExpr, scopeStack, varMap)
 				scopeStack = append(scopeStack, newScope)
@@ -115,15 +250,38 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 			}
 
 			// Handle with
-			if strings.HasPrefix(action, "with ") {
+			if first == "with" {
 				withExpr := strings.TrimSpace(action[5:])
 				newScope := createScopeFromWith(withExpr, scopeStack, varMap)
 				scopeStack = append(scopeStack, newScope)
 				continue
 			}
 
+			// Handle block (pushes scope like with, validates pipeline)
+			if first == "block" {
+				var blockExpr string
+				if len(words) >= 3 {
+					blockExpr = strings.Join(words[2:], " ")
+				} else {
+					blockExpr = "."
+				}
+				newScope := createScopeFromExpression(blockExpr, scopeStack, varMap)
+				scopeStack = append(scopeStack, newScope)
+				continue
+			}
+
+			// Handle if (pushes copy of current scope since `if` needs an `end`)
+			if first == "if" {
+				if len(scopeStack) > 0 {
+					scopeStack = append(scopeStack, scopeStack[len(scopeStack)-1])
+				} else {
+					scopeStack = append(scopeStack, ScopeType{})
+				}
+				continue
+			}
+
 			// Handle end
-			if action == "end" {
+			if first == "end" {
 				if len(scopeStack) > 1 {
 					scopeStack = scopeStack[:len(scopeStack)-1]
 				}
@@ -131,37 +289,48 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 			}
 
 			// Handle template calls
-			if strings.HasPrefix(action, "template ") {
+			if first == "template" {
 				parts := parseTemplateAction(action)
 
 				if len(parts) >= 1 {
 					tmplName := parts[0]
 
-					// Only resolve file-based partials, not named blocks
-					if !isFileBasedPartial(tmplName) {
-						// It's a named block (defined with {{ define "blockName" }}), skip file resolution
-						// Context argument is already validated by extractVariablesFromAction
-						continue
-					}
+					if nt, ok := registry[tmplName]; ok {
+						// Named template block found in registry
+						var contextArg string
+						if len(parts) >= 2 {
+							contextArg = parts[1]
+						}
 
-					// File-based partial: check existence
-					// Use tmplName (relative) for error reporting, not the full path
-					fullPath := filepath.Join(baseDir, templateRoot, tmplName)
-					if _, err := os.Stat(fullPath); os.IsNotExist(err) {
-						errors = append(errors, ValidationResult{
-							Template: templateName, // caller template name (relative)
-							Line:     lineNum + 1,
-							Column:   col,
-							Variable: tmplName,
-							Message:  fmt.Sprintf(`Partial template "%s" could not be found at %s`, tmplName, fullPath),
-							Severity: "error",
-						})
-						continue
-					}
+						// Resolve the scope that will be passed as "." to the partial
+						partialScope := resolvePartialScope(contextArg, scopeStack, varMap)
 
-					// Resolve context passed to partial and recursively validate it
-					if len(parts) >= 2 {
-						contextArg := parts[1]
+						// Build a varMap for the partial based on the resolved scope
+						partialVarMap := buildPartialVarMap(contextArg, partialScope, scopeStack, varMap)
+
+						// Recursively validate the named template
+						partialErrors := validateTemplateContent(nt.Content, partialVarMap, nt.FilePath, baseDir, templateRoot, nt.LineNum, registry)
+						errors = append(errors, partialErrors...)
+
+					} else if isFileBasedPartial(tmplName) {
+						// File-based partial: check existence
+						fullPath := filepath.Join(baseDir, templateRoot, tmplName)
+						if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+							errors = append(errors, ValidationResult{
+								Template: templateName, // caller template name (relative)
+								Line:     actualLineNum,
+								Column:   col,
+								Variable: tmplName,
+								Message:  fmt.Sprintf(`Partial template "%s" could not be found at %s`, tmplName, fullPath),
+								Severity: "error",
+							})
+							continue
+						}
+
+						var contextArg string
+						if len(parts) >= 2 {
+							contextArg = parts[1]
+						}
 
 						// Resolve the scope that will be passed as "." to the partial
 						partialScope := resolvePartialScope(contextArg, scopeStack, varMap)
@@ -170,12 +339,7 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 						partialVarMap := buildPartialVarMap(contextArg, partialScope, scopeStack, varMap)
 
 						// Recursively validate the partial with the resolved scope
-						// Use tmplName as the logical name for diagnostics
-						partialErrors := validateTemplateFile(fullPath, scopeVarsToTemplateVars(partialVarMap), tmplName, baseDir, templateRoot)
-						errors = append(errors, partialErrors...)
-					} else {
-						// No context passed — validate partial with empty scope
-						partialErrors := validateTemplateFile(fullPath, nil, tmplName, baseDir, templateRoot)
+						partialErrors := validateTemplateFile(fullPath, scopeVarsToTemplateVars(partialVarMap), tmplName, baseDir, templateRoot, registry)
 						errors = append(errors, partialErrors...)
 					}
 				}

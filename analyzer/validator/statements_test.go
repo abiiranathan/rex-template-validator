@@ -46,7 +46,7 @@ func TestStatementsAndFunctions(t *testing.T) {
 		varMap[v.Name] = v
 	}
 
-	errs := validateTemplateContent(content, varMap, "test.html", ".", ".")
+	errs := validateTemplateContent(content, varMap, "test.html", ".", ".", 1, nil)
 	if len(errs) > 0 {
 		for _, e := range errs {
 			t.Errorf("Unexpected error: %s (variable: %s)", e.Message, e.Variable)
@@ -82,7 +82,7 @@ func TestStatementsAndFunctions_Errors(t *testing.T) {
 		varMap[v.Name] = v
 	}
 
-	errs := validateTemplateContent(content, varMap, "test.html", ".", ".")
+	errs := validateTemplateContent(content, varMap, "test.html", ".", ".", 1, nil)
 
 	expectedErrors := []string{
 		"Invalid1", "Invalid2", "Invalid3",
