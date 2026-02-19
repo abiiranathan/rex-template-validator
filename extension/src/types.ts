@@ -59,6 +59,8 @@ export interface TemplateContext {
   absolutePath: string;         // absolute fs path for opening files
   vars: Map<string, TemplateVar>;
   renderCalls: RenderCall[];
+  // For partials: tracks which parent variable was passed as context (e.g., "User" from {{ template "partial" .User }})
+  partialSourceVar?: TemplateVar;
 }
 
 export interface KnowledgeGraph {

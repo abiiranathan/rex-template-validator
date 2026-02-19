@@ -484,6 +484,64 @@ export class TemplateValidator {
       }
     }
 
+    // For partials: check if the variable is a field of the partial source variable
+    // e.g., partial called with {{ template "partial" .User }}, and we're clicking on .Name
+    // or clicking on .Patient.Name - need to navigate through the path
+    if (ctx.partialSourceVar) {
+      // Navigate through the path to find the final field
+      let currentFields = ctx.partialSourceVar.fields;
+      let currentVar: TemplateVar | FieldInfo | undefined = ctx.partialSourceVar;
+
+      for (const pathPart of node.path) {
+        if (pathPart === '.') continue;
+
+        // Find the field matching this path component
+        const field = currentFields?.find(f => f.name === pathPart);
+        if (!field) {
+          currentVar = undefined;
+          break;
+        }
+
+        currentVar = field;
+        currentFields = field.fields;
+      }
+
+      // If we found the final field/variable, go to its definition
+      if (currentVar) {
+        const target = currentVar as FieldInfo;
+        if (target.defFile && target.defLine) {
+          let absGoFile: string | null = target.defFile;
+          if (!path.isAbsolute(absGoFile)) {
+            absGoFile = this.graphBuilder.resolveGoFilePath(absGoFile);
+          } else if (!fs.existsSync(absGoFile)) {
+            absGoFile = null;
+          }
+          if (absGoFile) {
+            return new vscode.Location(
+              vscode.Uri.file(absGoFile),
+              new vscode.Position(Math.max(0, target.defLine - 1), (target.defCol ?? 1) - 1)
+            );
+          }
+        }
+      }
+
+      // Fallback: use the source variable's location
+      if (ctx.partialSourceVar.defFile && ctx.partialSourceVar.defLine) {
+        let absGoFile: string | null = ctx.partialSourceVar.defFile;
+        if (!path.isAbsolute(absGoFile)) {
+          absGoFile = this.graphBuilder.resolveGoFilePath(absGoFile);
+        } else if (!fs.existsSync(absGoFile)) {
+          absGoFile = null;
+        }
+        if (absGoFile) {
+          return new vscode.Location(
+            vscode.Uri.file(absGoFile),
+            new vscode.Position(Math.max(0, ctx.partialSourceVar.defLine - 1), (ctx.partialSourceVar.defCol ?? 1) - 1)
+          );
+        }
+      }
+    }
+
     // Find the variable definition and go to its source location
     for (const rc of ctx.renderCalls) {
       const passedVar = rc.vars.find(v => v.name === topVarName);

@@ -27,8 +27,8 @@ type Visit struct {
 
 // Patient represents a patient
 type Patient struct {
-	Name string
-	ID   uint
+	Name string // Patient Full name
+	ID   uint   // Patient ID
 }
 
 // Doctor represents a doctor

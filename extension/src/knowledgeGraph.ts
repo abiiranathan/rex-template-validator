@@ -215,11 +215,18 @@ export class KnowledgeGraphBuilder {
             `[KnowledgeGraph] Resolved partial vars: ${[...partialVars.keys()].join(', ')}`
           );
 
+          // Track which parent variable was passed to this partial for go-to-definition
+          const partialSourceVar = this.findPartialSourceVar(
+            partialCall.partialContext ?? '.',
+            parentCtx.vars
+          );
+
           return {
             templatePath: partialRelPath,
             absolutePath: absolutePath,
             vars: partialVars,
             renderCalls: parentCtx.renderCalls, // Inherit parent's render calls for go-to-def
+            partialSourceVar, // Track the source variable passed to this partial
           };
         }
       } catch {
@@ -275,7 +282,7 @@ export class KnowledgeGraphBuilder {
   private resolvePartialVars(
     contextArg: string,
     vars: Map<string, TemplateVar>,
-    scopeStack: { key: string; typeStr: string; fields?: { name: string; type: string; fields?: any[]; isSlice: boolean }[] }[],
+    scopeStack: { key: string; typeStr: string; fields?: { name: string; type: string; fields?: any[]; isSlice: boolean; defFile?: string; defLine?: number; defCol?: number; doc?: string }[] }[],
     ctx: TemplateContext
   ): Map<string, TemplateVar> {
     // "." → pass through all current vars + current dot scope
@@ -290,11 +297,15 @@ export class KnowledgeGraphBuilder {
             type: f.type,
             fields: f.fields,
             isSlice: f.isSlice ?? false,
+            defFile: f.defFile,
+            defLine: f.defLine,
+            defCol: f.defCol,
+            doc: f.doc,
           });
         }
         return result;
       }
-      // Root scope: pass through all vars
+      // Root scope: pass through all vars (preserve all metadata)
       return new Map(vars);
     }
 
@@ -314,9 +325,67 @@ export class KnowledgeGraphBuilder {
         type: f.type,
         fields: f.fields,
         isSlice: f.isSlice,
+        defFile: f.defFile,
+        defLine: f.defLine,
+        defCol: f.defCol,
+        doc: f.doc,
       });
     }
     return partialVars;
+  }
+
+  /**
+   * Find the source variable that was passed to a partial.
+   * For {{ template "partial" .User }}, returns the "User" TemplateVar.
+   */
+  private findPartialSourceVar(
+    contextArg: string,
+    vars: Map<string, TemplateVar>
+  ): TemplateVar | undefined {
+    // "." means all vars passed - no single source
+    if (contextArg === '.' || contextArg === '') {
+      return undefined;
+    }
+
+    // Parse path like ".User" or ".User.Address"
+    const parser = new TemplateParser();
+    const path = parser.parseDotPath(contextArg);
+    if (path.length === 0) {
+      return undefined;
+    }
+
+    // Find the top-level variable
+    const topVar = vars.get(path[0]);
+    if (!topVar) {
+      return undefined;
+    }
+
+    // If it's just a single path component, return that var
+    if (path.length === 1) {
+      return topVar;
+    }
+
+    // Navigate through fields to find the nested type
+    let currentVar = topVar;
+    for (let i = 1; i < path.length; i++) {
+      const field = currentVar.fields?.find(f => f.name === path[i]);
+      if (!field) {
+        return undefined;
+      }
+      // Create a synthetic TemplateVar from the field
+      currentVar = {
+        name: field.name,
+        type: field.type,
+        fields: field.fields,
+        isSlice: field.isSlice ?? false,
+        defFile: field.defFile,
+        defLine: field.defLine,
+        defCol: field.defCol,
+        doc: field.doc,
+      };
+    }
+
+    return currentVar;
   }
 
   /**
