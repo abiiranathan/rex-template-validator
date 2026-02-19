@@ -7,7 +7,9 @@ import {
   RenderCall,
   TemplateContext,
   TemplateVar,
+  TemplateNode,
 } from './types';
+import { TemplateParser, resolvePath } from './templateParser';
 
 export class KnowledgeGraphBuilder {
   private graph: KnowledgeGraph = {
@@ -149,6 +151,172 @@ export class KnowledgeGraphBuilder {
     }
 
     return undefined;
+  }
+
+  /**
+   * Find the context for a file when it's being used as a partial.
+   * This walks the graph to find which parent templates include this partial
+   * and what context they pass to it, then resolves the correct vars.
+   */
+  findContextForFileAsPartial(absolutePath: string): TemplateContext | undefined {
+    const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+    const sourceDir: string = config.get('sourceDir') ?? '.';
+    const templateRoot: string = config.get('templateRoot') ?? '';
+
+    // Compute the relative path for the partial file
+    const templateBase = path.join(this.workspaceRoot, sourceDir, templateRoot);
+    let partialRelPath = path.relative(templateBase, absolutePath).replace(/\\/g, '/');
+
+    // Also check basename for matching
+    const partialBasename = path.basename(absolutePath);
+
+    this.outputChannel.appendLine(
+      `[KnowledgeGraph] Looking for partial: ${partialRelPath} (basename: ${partialBasename})`
+    );
+    this.outputChannel.appendLine(
+      `[KnowledgeGraph] Template base: ${templateBase}, Graph has ${this.graph.templates.size} templates`
+    );
+
+    const parser = new TemplateParser();
+
+    // Search through all templates in the graph to find calls to this partial
+    for (const [parentTplPath, parentCtx] of this.graph.templates) {
+      this.outputChannel.appendLine(
+        `[KnowledgeGraph] Checking parent template: ${parentTplPath} at ${parentCtx.absolutePath}`
+      );
+      
+      // Read and parse the parent template
+      if (!parentCtx.absolutePath || !fs.existsSync(parentCtx.absolutePath)) {
+        this.outputChannel.appendLine(
+          `[KnowledgeGraph] Skipping ${parentTplPath}: file not found at ${parentCtx.absolutePath}`
+        );
+        continue;
+      }
+
+      try {
+        const content = fs.readFileSync(parentCtx.absolutePath, 'utf8');
+        const nodes = parser.parse(content);
+
+        // Search for partial nodes that reference this file
+        const partialCall = this.findPartialCall(nodes, partialRelPath, partialBasename);
+        if (partialCall) {
+          this.outputChannel.appendLine(
+            `[KnowledgeGraph] Found partial call in ${parentTplPath}: template "${partialCall.partialName}" ${partialCall.partialContext}`
+          );
+          // Found a call to this partial - resolve the context argument
+          const partialVars = this.resolvePartialVars(
+            partialCall.partialContext ?? '.',
+            parentCtx.vars,
+            [],
+            parentCtx
+          );
+
+          this.outputChannel.appendLine(
+            `[KnowledgeGraph] Resolved partial vars: ${[...partialVars.keys()].join(', ')}`
+          );
+
+          return {
+            templatePath: partialRelPath,
+            absolutePath: absolutePath,
+            vars: partialVars,
+            renderCalls: parentCtx.renderCalls, // Inherit parent's render calls for go-to-def
+          };
+        }
+      } catch {
+        // Ignore read/parse errors
+        continue;
+      }
+    }
+
+    this.outputChannel.appendLine(
+      `[KnowledgeGraph] No partial call found for ${partialRelPath}`
+    );
+    return undefined;
+  }
+
+  /**
+   * Recursively search for a partial call in the AST that matches the given partial path.
+   */
+  private findPartialCall(
+    nodes: TemplateNode[],
+    partialRelPath: string,
+    partialBasename: string
+  ): TemplateNode | undefined {
+    for (const node of nodes) {
+      if (node.kind === 'partial' && node.partialName) {
+        // Check if this partial call matches our target
+        const name = node.partialName;
+        this.outputChannel.appendLine(
+          `[KnowledgeGraph] Found partial call: "${name}" (looking for: ${partialRelPath} or ${partialBasename})`
+        );
+        if (
+          name === partialRelPath ||
+          name === partialBasename ||
+          partialRelPath.endsWith('/' + name) ||
+          partialRelPath.endsWith(name)
+        ) {
+          return node;
+        }
+      }
+
+      // Recurse into children
+      if (node.children) {
+        const found = this.findPartialCall(node.children, partialRelPath, partialBasename);
+        if (found) return found;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Given the context arg passed to a partial (e.g. ".", ".User", ".User.Address"),
+   * build the vars map that the partial will see as its root scope.
+   */
+  private resolvePartialVars(
+    contextArg: string,
+    vars: Map<string, TemplateVar>,
+    scopeStack: { key: string; typeStr: string; fields?: { name: string; type: string; fields?: any[]; isSlice: boolean }[] }[],
+    ctx: TemplateContext
+  ): Map<string, TemplateVar> {
+    // "." → pass through all current vars + current dot scope
+    if (contextArg === '.') {
+      // If we're in a scoped block, expose the dot frame's fields as top-level vars
+      const dotFrame = scopeStack.slice().reverse().find(f => f.key === '.');
+      if (dotFrame?.fields) {
+        const result = new Map<string, TemplateVar>();
+        for (const f of dotFrame.fields) {
+          result.set(f.name, {
+            name: f.name,
+            type: f.type,
+            fields: f.fields,
+            isSlice: f.isSlice ?? false,
+          });
+        }
+        return result;
+      }
+      // Root scope: pass through all vars
+      return new Map(vars);
+    }
+
+    // ".SomePath" → resolve that path and expose its fields
+    const parser = new TemplateParser();
+    const path = parser.parseDotPath(contextArg);
+    const result = resolvePath(path, vars, scopeStack);
+
+    if (!result.found || !result.fields) {
+      return new Map();
+    }
+
+    const partialVars = new Map<string, TemplateVar>();
+    for (const f of result.fields) {
+      partialVars.set(f.name, {
+        name: f.name,
+        type: f.type,
+        fields: f.fields,
+        isSlice: f.isSlice,
+      });
+    }
+    return partialVars;
   }
 
   /**

@@ -79,7 +79,15 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.languages.registerHoverProvider(TEMPLATE_SELECTOR, {
       provideHover(document, position) {
         if (!validator || !graphBuilder) return;
-        const ctx = graphBuilder.findContextForFile(document.uri.fsPath);
+        let ctx = graphBuilder.findContextForFile(document.uri.fsPath);
+        // If this file has no render calls or wasn't found, it might be a partial used by other templates
+        // Try to find the context from a parent template's partial call
+        if (!ctx || ctx.renderCalls.length === 0) {
+          const partialCtx = graphBuilder.findContextForFileAsPartial(document.uri.fsPath);
+          if (partialCtx) {
+            ctx = partialCtx;
+          }
+        }
         if (!ctx) return;
         return validator.getHoverInfo(document, position, ctx);
       },
@@ -93,7 +101,15 @@ export async function activate(context: vscode.ExtensionContext) {
       {
         provideCompletionItems(document, position) {
           if (!validator || !graphBuilder) return;
-          const ctx = graphBuilder.findContextForFile(document.uri.fsPath);
+          let ctx = graphBuilder.findContextForFile(document.uri.fsPath);
+          // If this file has no render calls or wasn't found, it might be a partial used by other templates
+          // Try to find the context from a parent template's partial call
+          if (!ctx || ctx.renderCalls.length === 0) {
+            const partialCtx = graphBuilder.findContextForFileAsPartial(document.uri.fsPath);
+            if (partialCtx) {
+              ctx = partialCtx;
+            }
+          }
           if (!ctx) return [];
           return validator.getCompletions(document, position, ctx);
         },
@@ -107,7 +123,15 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.languages.registerDefinitionProvider(TEMPLATE_SELECTOR, {
       provideDefinition(document, position) {
         if (!validator || !graphBuilder) return;
-        const ctx = graphBuilder.findContextForFile(document.uri.fsPath);
+        let ctx = graphBuilder.findContextForFile(document.uri.fsPath);
+        // If this file has no render calls or wasn't found, it might be a partial used by other templates
+        // Try to find the context from a parent template's partial call
+        if (!ctx || ctx.renderCalls.length === 0) {
+          const partialCtx = graphBuilder.findContextForFileAsPartial(document.uri.fsPath);
+          if (partialCtx) {
+            ctx = partialCtx;
+          }
+        }
         if (!ctx) return;
         return validator.getDefinitionLocation(document, position, ctx);
       },
@@ -292,7 +316,17 @@ function applyAnalyzerDiagnostics(
 async function validateDocument(doc: vscode.TextDocument) {
   if (!validator || !graphBuilder) return;
 
-  const ctx = graphBuilder.findContextForFile(doc.uri.fsPath);
+  let ctx = graphBuilder.findContextForFile(doc.uri.fsPath);
+
+  // If this file has no render calls or wasn't found, it might be a partial used by other templates
+  // Try to find the context from a parent template's partial call
+  if (!ctx || ctx.renderCalls.length === 0) {
+    const partialCtx = graphBuilder.findContextForFileAsPartial(doc.uri.fsPath);
+    if (partialCtx) {
+      ctx = partialCtx;
+    }
+  }
+
   if (!ctx) {
     editorCollection.delete(doc.uri);
     return;

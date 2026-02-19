@@ -24,7 +24,7 @@ export class TemplateValidator {
         new vscode.Diagnostic(
           new vscode.Range(0, 0, 0, 0),
           'No rex.Render() call found for this template. Run "Rex: Rebuild Template Index" if you just added it.',
-          vscode.DiagnosticSeverity.Information
+          vscode.DiagnosticSeverity.Hint
         ),
       ];
     }
