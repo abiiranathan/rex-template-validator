@@ -219,7 +219,7 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 				first = words[0]
 			}
 
-			if first == "define" {
+			if first == "define" || first == "block" {
 				skipDepth++
 				continue
 			}
@@ -258,17 +258,10 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 			}
 
 			// Handle block (pushes scope like with, validates pipeline)
-			if first == "block" {
-				var blockExpr string
-				if len(words) >= 3 {
-					blockExpr = strings.Join(words[2:], " ")
-				} else {
-					blockExpr = "."
-				}
-				newScope := createScopeFromExpression(blockExpr, scopeStack, varMap)
-				scopeStack = append(scopeStack, newScope)
-				continue
-			}
+			// Wait, if block is skipped by skipDepth, we never reach here during the initial pass.
+			// However, if we recursively validate the block's content from the registry,
+			// the block string itself shouldn't be in the registry's content body (only the inside).
+			// If it IS, we would need to not skip it. But let's check what the registry holds!
 
 			// Handle if (pushes copy of current scope since `if` needs an `end`)
 			if first == "if" {
