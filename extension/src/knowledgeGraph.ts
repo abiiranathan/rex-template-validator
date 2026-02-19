@@ -331,6 +331,47 @@ export class KnowledgeGraphBuilder {
     return fs.existsSync(abs) ? abs : null;
   }
 
+  /**
+   * Resolve a template path (e.g., "views/partial.html") to an absolute file path.
+   * Searches the graph and filesystem for the template.
+   */
+  resolveTemplatePath(templatePath: string): string | null {
+    const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+    const sourceDir: string = config.get('sourceDir') ?? '.';
+    const templateRoot: string = config.get('templateRoot') ?? '';
+
+    // 1. Check if it's already in the graph
+    const ctx = this.graph.templates.get(templatePath);
+    if (ctx?.absolutePath && fs.existsSync(ctx.absolutePath)) {
+      return ctx.absolutePath;
+    }
+
+    // 2. Search by suffix match in the graph
+    for (const [tplPath, tplCtx] of this.graph.templates) {
+      if (tplPath.endsWith(templatePath) || templatePath.endsWith(tplPath)) {
+        if (tplCtx.absolutePath && fs.existsSync(tplCtx.absolutePath)) {
+          return tplCtx.absolutePath;
+        }
+      }
+    }
+
+    // 3. Search filesystem at common locations
+    const templateBase = path.join(this.workspaceRoot, sourceDir, templateRoot);
+    const candidates = [
+      path.join(templateBase, templatePath),
+      path.join(this.workspaceRoot, templatePath),
+      path.join(this.workspaceRoot, sourceDir, templatePath),
+    ];
+
+    for (const candidate of candidates) {
+      if (fs.existsSync(candidate)) {
+        return candidate;
+      }
+    }
+
+    return null;
+  }
+
   toJSON(): object {
     const obj: Record<string, unknown> = {};
     for (const [key, ctx] of this.graph.templates) {

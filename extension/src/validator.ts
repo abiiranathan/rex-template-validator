@@ -354,8 +354,10 @@ export class TemplateValidator {
   // ── Definition ─────────────────────────────────────────────────────────────
 
   /**
-   * Returns the Go file location (for go-to-definition) of the variable
-   * at the given position. Points to the c.Render() call that passes it.
+   * Returns the definition location for the symbol at the given position.
+   * Handles:
+   * - Template variables → jumps to c.Render() call in Go code
+   * - Partial template names → jumps to the template file
    */
   getDefinitionLocation(
     document: vscode.TextDocument,
@@ -365,6 +367,17 @@ export class TemplateValidator {
     const content = document.getText();
     const nodes = this.parser.parse(content);
 
+    // First, check if cursor is on a partial/template name
+    const partialLocation = this.findPartialDefinitionAtPosition(
+      nodes,
+      position,
+      ctx
+    );
+    if (partialLocation) {
+      return partialLocation;
+    }
+
+    // Otherwise, handle variable definitions
     const hit = this.findNodeAtPosition(nodes, position, ctx.vars, []);
     if (!hit) return null;
 
@@ -383,6 +396,65 @@ export class TemplateValidator {
             new vscode.Position(Math.max(0, rc.line - 1), 0)
           );
         }
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Check if cursor is on a partial/template name in {{ template "name" . }}
+   * and return the location of the template file.
+   */
+  private findPartialDefinitionAtPosition(
+    nodes: TemplateNode[],
+    position: vscode.Position,
+    ctx: TemplateContext
+  ): vscode.Location | null {
+    for (const node of nodes) {
+      // Check if this is a partial node
+      if (node.kind === 'partial' && node.partialName) {
+        const startLine = node.line - 1;
+        const startCol = node.col - 1;
+
+        // Calculate where the template name appears in the raw text
+        // {{ template "name" . }}
+        // The name is inside quotes after "template "
+        const templateKeywordMatch = node.rawText.match(/\{\{\s*template\s+/);
+        if (!templateKeywordMatch) continue;
+
+        const nameMatch = node.rawText.match(/\{\{\s*template\s+"([^"]+)"/);
+        if (!nameMatch) continue;
+
+        const nameStartOffset = node.rawText.indexOf('"' + nameMatch[1] + '"') + 1;
+        const nameStartCol = startCol + nameStartOffset;
+        const nameEndCol = nameStartCol + nameMatch[1].length;
+
+        // Check if cursor is on the template name
+        if (
+          position.line === startLine &&
+          position.character >= nameStartCol &&
+          position.character <= nameEndCol
+        ) {
+          // Resolve the template name to a file
+          const templatePath = this.graphBuilder.resolveTemplatePath(node.partialName);
+          if (templatePath) {
+            return new vscode.Location(
+              vscode.Uri.file(templatePath),
+              new vscode.Position(0, 0)
+            );
+          }
+        }
+      }
+
+      // Recurse into children
+      if (node.children) {
+        const found = this.findPartialDefinitionAtPosition(
+          node.children,
+          position,
+          ctx
+        );
+        if (found) return found;
       }
     }
 
@@ -450,6 +522,41 @@ export class TemplateValidator {
         if (node.children) {
           const found = this.findNodeAtPosition(node.children, position, vars, childStack);
           if (found) return found;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Get definition location for a template path string in Go code.
+   * Used when clicking on c.Render("template.html", data).
+   */
+  getTemplateDefinitionFromGo(
+    document: vscode.TextDocument,
+    position: vscode.Position
+  ): vscode.Location | null {
+    const line = document.lineAt(position.line).text;
+
+    // Look for c.Render("template-path", ...) pattern
+    // Match the template string literal at cursor position
+    const renderRegex = /\.Render\s*\(\s*"([^"]+)"/g;
+    let match: RegExpExecArray | null;
+
+    while ((match = renderRegex.exec(line)) !== null) {
+      const templatePath = match[1];
+      const matchStart = match.index + '.Render("'.length;
+      const matchEnd = matchStart + templatePath.length;
+
+      // Check if cursor is within the template path string
+      if (position.character >= matchStart && position.character <= matchEnd) {
+        const absPath = this.graphBuilder.resolveTemplatePath(templatePath);
+        if (absPath) {
+          return new vscode.Location(
+            vscode.Uri.file(absPath),
+            new vscode.Position(0, 0)
+          );
         }
       }
     }

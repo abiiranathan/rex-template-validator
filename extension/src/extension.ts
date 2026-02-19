@@ -138,6 +138,17 @@ export async function activate(context: vscode.ExtensionContext) {
     })
   );
 
+  // Go to Definition for Go files — jumps from c.Render("template.html", ...) to the template file
+  const GO_SELECTOR: vscode.DocumentSelector = [{ language: 'go', scheme: 'file' }];
+  context.subscriptions.push(
+    vscode.languages.registerDefinitionProvider(GO_SELECTOR, {
+      provideDefinition(document, position) {
+        if (!validator) return;
+        return validator.getTemplateDefinitionFromGo(document, position);
+      },
+    })
+  );
+
   // ── File watchers ──────────────────────────────────────────────────────────
 
   // Go source changes → full re-analysis
