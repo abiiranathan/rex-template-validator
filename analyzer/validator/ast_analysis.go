@@ -3,13 +3,13 @@ package validator
 import (
 	"fmt"
 	"go/ast"
-	"go/importer"
-	"go/parser"
 	"go/token"
 	"go/types"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"golang.org/x/tools/go/packages"
 )
 
 // AnalyzeDir analyzes a Go source directory for c.Render calls.
@@ -18,44 +18,66 @@ func AnalyzeDir(dir string) AnalysisResult {
 	result := AnalysisResult{}
 
 	fset := token.NewFileSet()
-	pkgs, err := parser.ParseDir(fset, dir, nil, parser.AllErrors|parser.ParseComments)
+
+	cfg := &packages.Config{
+		Mode: packages.NeedName |
+			packages.NeedFiles |
+			packages.NeedSyntax |
+			packages.NeedTypes |
+			packages.NeedTypesInfo |
+			packages.NeedTypesSizes,
+		Dir:       dir,
+		Fset:      fset,
+		ParseFile: nil, // use default (includes comments)
+		Tests:     false,
+	}
+
+	pkgs, err := packages.Load(cfg, ".")
 	if err != nil {
-		result.Errors = append(result.Errors, fmt.Sprintf("parse error: %v", err))
+		result.Errors = append(result.Errors, fmt.Sprintf("load error: %v", err))
 		return result
 	}
 
 	var allFiles []*ast.File
+	var info *types.Info
+
 	for _, pkg := range pkgs {
-		for _, f := range pkg.Files {
-			allFiles = append(allFiles, f)
+		// Surface package-level errors (type errors, missing imports, etc.)
+		for _, e := range pkg.Errors {
+			msg := e.Msg
+			if !isImportRelatedError(strings.ToLower(msg)) {
+				result.Errors = append(result.Errors, fmt.Sprintf("type error: %v", msg))
+			}
+		}
+
+		allFiles = append(allFiles, pkg.Syntax...)
+
+		// Merge type info — typically only one package for a dir, but handle
+		// multiple gracefully (e.g. when build tags produce separate packages).
+		if pkg.TypesInfo != nil {
+			if info == nil {
+				info = pkg.TypesInfo
+			} else {
+				for k, v := range pkg.TypesInfo.Types {
+					info.Types[k] = v
+				}
+				for k, v := range pkg.TypesInfo.Defs {
+					info.Defs[k] = v
+				}
+				for k, v := range pkg.TypesInfo.Uses {
+					info.Uses[k] = v
+				}
+			}
 		}
 	}
 
-	// Type-check with a best-effort importer. Missing third-party packages are
-	// expected when running outside the module cache; we still extract useful
-	// type information for packages that do resolve.
-	info := &types.Info{
-		Types: make(map[ast.Expr]types.TypeAndValue),
-		Defs:  make(map[*ast.Ident]types.Object),
-		Uses:  make(map[*ast.Ident]types.Object),
+	if info == nil {
+		info = &types.Info{
+			Types: make(map[ast.Expr]types.TypeAndValue),
+			Defs:  make(map[*ast.Ident]types.Object),
+			Uses:  make(map[*ast.Ident]types.Object),
+		}
 	}
-
-	cfg := &types.Config{
-		// Use the default gc importer (resolves stdlib + anything in GOPATH/module cache).
-		Importer: importer.ForCompiler(fset, "gc", nil),
-		// Collect type errors but treat them as non-fatal — we fall back to AST
-		// inference for values whose types couldn't be resolved.
-		Error: func(err error) {
-			msg := err.Error()
-			if !isImportRelatedError(msg) {
-				// Only surface genuine, actionable type errors.
-				result.Errors = append(result.Errors, fmt.Sprintf("type error: %v", err))
-			}
-		},
-	}
-
-	// Non-fatal: we still walk the AST even if type-check fails partially.
-	cfg.Check(dir, fset, allFiles, info) //nolint:errcheck
 
 	// Build file map for struct field position lookup
 	filesMap := make(map[string]*ast.File)
@@ -97,8 +119,6 @@ func AnalyzeDir(dir string) AnalysisResult {
 
 			pos := fset.Position(call.Pos())
 
-			// Normalise the file path: make it relative to dir so that it is
-			// stable regardless of where the binary is invoked from.
 			relFile := pos.Filename
 			if abs, err := filepath.Abs(pos.Filename); err == nil {
 				if rel, err := filepath.Rel(dir, abs); err == nil {
@@ -330,11 +350,6 @@ func setPkgCache(fset *token.FileSet, files map[string]*ast.File) {
 	globalPkgCache.files = files
 }
 
-func extractFields(t types.Type) []FieldInfo {
-	fields, _ := extractFieldsWithDocs(t)
-	return fields
-}
-
 func extractFieldsWithDocs(t types.Type) ([]FieldInfo, string) {
 	if t == nil {
 		return nil, ""
@@ -351,8 +366,7 @@ func extractFieldsWithDocs(t types.Type) ([]FieldInfo, string) {
 	strct, ok := named.Underlying().(*types.Struct)
 	if !ok {
 		var fields []FieldInfo
-		for i := 0; i < named.NumMethods(); i++ {
-			m := named.Method(i)
+		for m := range named.Methods() {
 			if m.Exported() {
 				fields = append(fields, FieldInfo{
 					Name:    m.Name(),
@@ -368,11 +382,11 @@ func extractFieldsWithDocs(t types.Type) ([]FieldInfo, string) {
 	pkgPath := named.Obj().Pkg().Path()
 
 	// Try to find struct field positions and docs from AST
-	fieldPositions, typeDoc := findStructFieldPositions(structName, pkgPath)
+	var _ = pkgPath
+	fieldPositions, typeDoc := findStructFieldPositions(structName)
 
 	var fields []FieldInfo
-	for i := 0; i < strct.NumFields(); i++ {
-		f := strct.Field(i)
+	for f := range strct.Fields() {
 		if !f.Exported() {
 			continue
 		}
@@ -406,8 +420,7 @@ func extractFieldsWithDocs(t types.Type) ([]FieldInfo, string) {
 		fields = append(fields, fi)
 	}
 
-	for i := 0; i < named.NumMethods(); i++ {
-		m := named.Method(i)
+	for m := range named.Methods() {
 		if m.Exported() {
 			fields = append(fields, FieldInfo{
 				Name:    m.Name(),
@@ -459,7 +472,7 @@ func getFieldDoc(field *ast.Field) string {
 
 // findStructFieldPositions searches the AST for struct type definitions and extracts docs
 // Returns field positions and the type documentation
-func findStructFieldPositions(structName, pkgPath string) (map[string]fieldInfo, string) {
+func findStructFieldPositions(structName string) (map[string]fieldInfo, string) {
 	positions := make(map[string]fieldInfo)
 	typeDoc := ""
 
