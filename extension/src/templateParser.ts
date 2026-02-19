@@ -1,7 +1,7 @@
-import { TemplateNode } from './types';
+import { FieldInfo, ScopeFrame, TemplateNode, TemplateVar } from './types';
 
 /**
- * Go template parser that produces a proper nested tree.
+ * Go template parser that produces a proper nested AST.
  * range/with/if blocks contain their children so the validator
  * can push/pop scope correctly.
  */
@@ -12,19 +12,22 @@ export class TemplateParser {
     return nodes;
   }
 
-  // ── Tokenizer ────────────────────────────────────────────────────────────
+  // ── Tokenizer ──────────────────────────────────────────────────────────────
 
   private tokenize(content: string): Token[] {
     const tokens: Token[] = [];
-    const actionRe = /\{\{-?\s*(.*?)\s*-?\}\}/gs;
+    // Match {{ ... }} with optional whitespace trimming dashes
+    const actionRe = /\{\{-?\s*([\s\S]*?)\s*-?\}\}/g;
 
-    const lines = content.split('\n');
+    // Pre-compute line start offsets for O(log n) position lookup
     const lineOffsets: number[] = [0];
-    for (const l of lines) {
-      lineOffsets.push(lineOffsets[lineOffsets.length - 1] + l.length + 1);
+    for (let i = 0; i < content.length; i++) {
+      if (content[i] === '\n') {
+        lineOffsets.push(i + 1);
+      }
     }
 
-    const getPos = (offset: number) => {
+    const getPos = (offset: number): { line: number; col: number } => {
       let lo = 0, hi = lineOffsets.length - 1;
       while (lo < hi) {
         const mid = (lo + hi + 1) >> 1;
@@ -36,6 +39,7 @@ export class TemplateParser {
     let m: RegExpExecArray | null;
     while ((m = actionRe.exec(content)) !== null) {
       const inner = m[1].trim();
+      if (!inner) continue;
       const pos = getPos(m.index);
       tokens.push({ inner, line: pos.line, col: pos.col, raw: m[0] });
     }
@@ -43,13 +47,8 @@ export class TemplateParser {
     return tokens;
   }
 
-  // ── Tree builder ─────────────────────────────────────────────────────────
+  // ── Tree builder ───────────────────────────────────────────────────────────
 
-  /**
-   * Recursively consume tokens into a node list.
-   * Returns when it hits {{end}} or runs out of tokens.
-   * `pos` is the current index into `tokens` (mutated via returned nextPos).
-   */
   private buildTree(tokens: Token[], pos: number): { nodes: TemplateNode[]; nextPos: number; endToken?: Token } {
     const nodes: TemplateNode[] = [];
 
@@ -58,20 +57,20 @@ export class TemplateParser {
       const inner = tok.inner;
 
       // end / else → stop this level
-      if (inner === 'end' || inner === 'else') {
+      if (inner === 'end' || inner === 'else' || inner.startsWith('else ')) {
         return { nodes, nextPos: pos + 1, endToken: tok };
       }
 
       // Comments
-      if (inner.startsWith('/*') || inner.startsWith('-/*')) {
+      if (inner.startsWith('/*') || inner.startsWith('-/*') || inner.startsWith('//')) {
         pos++; continue;
       }
 
-      // ── Block openers ──────────────────────────────────────────────────
+      // ── Block openers ────────────────────────────────────────────────────
 
       if (inner.startsWith('range ')) {
         const expr = inner.slice(6).trim();
-        // strip "$_, $v :=" or "$v :=" assignment prefix
+        // Strip "$i, $v :=" or "$v :=" or "$_, $v :=" assignment prefix
         const cleanExpr = expr.replace(/^\$\w+\s*(?:,\s*\$\w+)?\s*:=\s*/, '').trim();
         const child = this.buildTree(tokens, pos + 1);
         nodes.push({
@@ -138,70 +137,98 @@ export class TemplateParser {
         continue;
       }
 
-      // ── Partials ───────────────────────────────────────────────────────
+      // ── Template / partial calls ─────────────────────────────────────────
 
       if (inner.startsWith('template ')) {
-        const tplMatch = inner.match(/template\s+"([^"]+)"\s*(.*)/);
+        const tplMatch = inner.match(/^template\s+"([^"]+)"(?:\s+(.+))?/);
         if (tplMatch) {
+          const contextRaw = tplMatch[2]?.trim() ?? '.';
           nodes.push({
             kind: 'partial',
-            path: tplMatch[2].trim() ? this.parseDotPath(tplMatch[2].trim()) : ['.'],
+            path: this.parseDotPath(contextRaw),
             rawText: tok.raw,
             line: tok.line,
             col: tok.col,
             partialName: tplMatch[1],
+            partialContext: contextRaw,
           });
         }
         pos++; continue;
       }
 
-      // ── Variable / pipeline ────────────────────────────────────────────
+      // ── Variable / pipeline ──────────────────────────────────────────────
 
-      const varNode = this.tryParseVariable(tok);
-      if (varNode) nodes.push(varNode);
-
+      const varNodes = this.tryParseVariables(tok);
+      nodes.push(...varNodes);
       pos++;
     }
 
     return { nodes, nextPos: pos };
   }
 
-  // ── Helpers ──────────────────────────────────────────────────────────────
+  // ── Helpers ────────────────────────────────────────────────────────────────
 
-  private tryParseVariable(tok: Token): TemplateNode | null {
+  /**
+   * Extract all dot-path variable references from a token.
+   * A single action may contain multiple refs: `eq .Name "foo"`, `not .IsLast`
+   */
+  private tryParseVariables(tok: Token): TemplateNode[] {
     const inner = tok.inner;
+    const results: TemplateNode[] = [];
 
+    // Direct dot expression
     if (inner.startsWith('.')) {
-      return { kind: 'variable', path: this.parseDotPath(inner), rawText: tok.raw, line: tok.line, col: tok.col };
+      // Take only the path, stop at pipe or space
+      const pathStr = inner.split(/[\s|]/)[0];
+      results.push({
+        kind: 'variable',
+        path: this.parseDotPath(pathStr),
+        rawText: tok.raw,
+        line: tok.line,
+        col: tok.col,
+      });
+      return results;
     }
 
-    // Pipelines / builtins that reference a dot path: "len .Items", "index .Map key"
-    if (inner.includes('.')) {
-      const dotParts = inner.match(/(\.[A-Za-z_][A-Za-z0-9_.]*)/g);
-      if (dotParts) {
-        return { kind: 'variable', path: this.parseDotPath(dotParts[0]), rawText: tok.raw, line: tok.line, col: tok.col };
+    // Pipelines and builtins that contain dot references
+    // e.g. "not .IsLast", "eq .Name .OtherName", "len .Items"
+    const dotRefs = inner.match(/(\.[A-Za-z_][A-Za-z0-9_.]*)/g);
+    if (dotRefs) {
+      for (const ref of dotRefs) {
+        results.push({
+          kind: 'variable',
+          path: this.parseDotPath(ref),
+          rawText: tok.raw,
+          line: tok.line,
+          col: tok.col,
+        });
       }
     }
 
-    return null;
+    return results;
   }
 
   /**
-   * Parse ".Visit.Doctor.Name" → ["Visit", "Doctor", "Name"]
-   * "."                        → ["."]
+   * Parse a dot-path expression into path segments.
+   *
+   * ".Visit.Doctor.Name" → ["Visit", "Doctor", "Name"]
+   * "."                  → ["."]   (bare dot = current scope)
+   * ".Items"             → ["Items"]
    */
   parseDotPath(expr: string): string[] {
+    // Strip variable assignment prefix "$v := "
     expr = expr.replace(/^\$\w+\s*:=\s*/, '').trim();
 
-    // (call .Method args) → .Method
+    // Extract path from (call .Method args)
     const callMatch = expr.match(/\(call\s+(\.[^\s)]+)/);
     if (callMatch) expr = callMatch[1];
 
-    if (expr === '.' || expr === '') return ['.'];
-    if (!expr.startsWith('.')) return [];
+    // Take only the path part before any space/pipe/paren
+    const pathPart = expr.split(/[\s|(),]/)[0];
 
-    // Take path segment up to first space/pipe/paren
-    const pathPart = expr.split(/[\s|()|,]/)[0];
+    if (pathPart === '.' || pathPart === '') return ['.'];
+    if (!pathPart.startsWith('.')) return [];
+
     return pathPart.split('.').filter(p => p.length > 0);
   }
 }
@@ -213,83 +240,90 @@ interface Token {
   raw: string;
 }
 
+// ── Path resolution ────────────────────────────────────────────────────────────
+
+export interface ResolveResult {
+  typeStr: string;
+  found: boolean;
+  fields?: FieldInfo[];
+  isSlice?: boolean;
+}
+
 /**
- * Resolve a dot-path against the context variables map to find the type.
- * Returns null if resolution fails.
+ * Resolve a dot-path against the current variable context and scope stack.
+ *
+ * Scope stack is innermost-last. The topmost frame with key "." represents
+ * the current implicit dot (inside range/with blocks).
  */
 export function resolvePath(
   path: string[],
-  vars: Map<string, import('./types').TemplateVar>,
+  vars: Map<string, TemplateVar>,
   scopeStack: ScopeFrame[]
-): { typeStr: string; found: boolean; fields?: import('./types').FieldInfo[] } {
-  if (path.length === 0 || (path.length === 1 && path[0] === '.')) {
+): ResolveResult {
+  if (path.length === 0) {
     return { typeStr: 'context', found: true };
   }
 
-  // Check scope stack for "." (range/with element)
-  if (path[0] === '.') {
-    const frame = [...scopeStack].reverse().find(f => f.key === '.');
+  // Bare dot → current scope
+  if (path.length === 1 && path[0] === '.') {
+    const frame = findDotFrame(scopeStack);
     if (frame) return { typeStr: frame.typeStr, found: true, fields: frame.fields };
     return { typeStr: 'context', found: true };
   }
 
-  // Check scope stack for named variables
-  for (let i = scopeStack.length - 1; i >= 0; i--) {
-    const frame = scopeStack[i];
-    if (frame.key === path[0]) {
-      if (path.length === 1) return { typeStr: frame.typeStr, found: true, fields: frame.fields };
-      return resolveFields(path.slice(1), frame.fields ?? []);
+  // Path starts with explicit "$var"
+  if (path[0].startsWith('$')) {
+    for (let i = scopeStack.length - 1; i >= 0; i--) {
+      const frame = scopeStack[i];
+      if (frame.key === path[0]) {
+        if (path.length === 1) return { typeStr: frame.typeStr, found: true, fields: frame.fields };
+        return resolveFields(path.slice(1), frame.fields ?? []);
+      }
     }
+    return { typeStr: 'unknown', found: false };
   }
 
-  // Check innermost dot context (current scope)
-  for (let i = scopeStack.length - 1; i >= 0; i--) {
-    if (scopeStack[i].key === '.') {
-        const frame = scopeStack[i];
-        if (frame.fields) {
-            const res = resolveFields(path, frame.fields);
-            if (res.found) return res;
-        }
-        break; // Only check the innermost dot scope
-    }
+  // Path inside a with/range scope → check dot frame fields first
+  const dotFrame = findDotFrame(scopeStack);
+  if (dotFrame?.fields) {
+    const res = resolveFields(path, dotFrame.fields);
+    if (res.found) return res;
   }
 
-  // Check top-level vars
+  // Fall through to top-level vars
   const topVar = vars.get(path[0]);
   if (!topVar) {
     return { typeStr: 'unknown', found: false };
   }
 
   if (path.length === 1) {
-    return { typeStr: topVar.type, found: true, fields: topVar.fields };
+    return { typeStr: topVar.type, found: true, fields: topVar.fields, isSlice: topVar.isSlice };
   }
 
   return resolveFields(path.slice(1), topVar.fields ?? []);
 }
 
-interface ScopeFrame {
-  key: string;
-  typeStr: string;
-  fields?: import('./types').FieldInfo[];
-  isRange?: boolean;
+function findDotFrame(scopeStack: ScopeFrame[]): ScopeFrame | undefined {
+  for (let i = scopeStack.length - 1; i >= 0; i--) {
+    if (scopeStack[i].key === '.') return scopeStack[i];
+  }
+  return undefined;
 }
 
 function resolveFields(
   parts: string[],
-  fields: import('./types').FieldInfo[]
-): { typeStr: string; found: boolean; fields?: import('./types').FieldInfo[] } {
+  fields: FieldInfo[]
+): ResolveResult {
   let current = fields;
 
   for (let i = 0; i < parts.length; i++) {
     const part = parts[i];
-    const field = current.find(
-      (f) => f.name === part || f.name.toLowerCase() === part.toLowerCase()
-    );
+    const field = current.find(f => f.name === part);
     if (!field) {
       return { typeStr: 'unknown', found: false };
     }
     if (i === parts.length - 1) {
-      return { typeStr: field.type, found: true, fields: field.fields };
+      return { typeStr: field.type, found: true, fields: field.fields, isSlice: field.isSlice };
     }
     current = field.fields ?? [];
   }

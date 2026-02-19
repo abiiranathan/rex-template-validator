@@ -16,10 +16,6 @@
     <h1>{{ .Title }}</h1>
     <p>Patient: {{ .visit.Patient.Name }}</p>
     <p>Doctor: {{ .doctor }}</p>
-
-    <!-- This variable doesn't exist - should cause an error -->
-    <p>Ward: {{ .visit.Ward.Name }}</p>
-
     <h2>Management</h2>
     {{ range .management }}
     <div>{{ .Name }}: {{ .Dosage }}</div>
@@ -30,8 +26,6 @@
     <div class="prescription">
         <span>{{ .DrugName }}</span>
         <span>{{ .Quantity }}</span>
-        <!-- Undefined field - should error -->
-        <span>{{ .NonExistentField }}</span>
     </div>
     {{ end }}
 

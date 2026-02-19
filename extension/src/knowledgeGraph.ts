@@ -9,10 +9,6 @@ import {
   TemplateVar,
 } from './types';
 
-/**
- * Builds and maintains a knowledge graph mapping template paths to their
- * available variables (from Go render calls).
- */
 export class KnowledgeGraphBuilder {
   private graph: KnowledgeGraph = {
     templates: new Map(),
@@ -29,24 +25,29 @@ export class KnowledgeGraphBuilder {
 
   build(analysisResult: AnalysisResult): KnowledgeGraph {
     const templates = new Map<string, TemplateContext>();
+    const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+    const sourceDir: string = config.get('sourceDir') ?? '.';
+    const templateRoot: string = config.get('templateRoot') ?? '';
 
     for (const rc of analysisResult.renderCalls ?? []) {
-      const resolved = this.resolveTemplatePath(rc);
-      if (!resolved) continue;
+      const logicalPath = rc.template.replace(/^\.\//, '');
 
-      let ctx = templates.get(resolved);
+      // Absolute path on disk: workspaceRoot / sourceDir / templateRoot / template
+      const absPath = path.join(this.workspaceRoot, sourceDir, templateRoot, logicalPath);
+
+      let ctx = templates.get(logicalPath);
       if (!ctx) {
         ctx = {
-          templatePath: resolved,
+          templatePath: logicalPath,
+          absolutePath: absPath,
           vars: new Map(),
           renderCalls: [],
         };
-        templates.set(resolved, ctx);
+        templates.set(logicalPath, ctx);
       }
 
       ctx.renderCalls.push(rc);
 
-      // Merge vars (last one wins for type info)
       for (const v of rc.vars ?? []) {
         const existing = ctx.vars.get(v.name);
         if (!existing || (v.fields && v.fields.length > 0)) {
@@ -62,7 +63,7 @@ export class KnowledgeGraphBuilder {
     );
     for (const [tpl, ctx] of templates) {
       this.outputChannel.appendLine(
-        `  ${tpl}: ${[...ctx.vars.keys()].join(', ')} (from ${ctx.renderCalls.length} call(s))`
+        `  ${tpl}: ${[...ctx.vars.keys()].join(', ')} (${ctx.renderCalls.length} call(s))`
       );
     }
 
@@ -74,34 +75,34 @@ export class KnowledgeGraphBuilder {
   }
 
   /**
-   * Find the template context for a given absolute file path.
+   * Find the TemplateContext for a given absolute file path.
+   * Handles templateRoot stripping and fuzzy suffix matching.
    */
   findContextForFile(absolutePath: string): TemplateContext | undefined {
-    // Try to match relative paths
-    let rel = path.relative(this.workspaceRoot, absolutePath).replace(/\\/g, '/');
-
     const config = vscode.workspace.getConfiguration('rexTemplateValidator');
-    const templateRoot = config.get<string>('templateRoot') || '';
-    
-    // If templateRoot is set, strip it from start of path to match render call paths
-    if (templateRoot && rel.startsWith(templateRoot + '/')) {
-        rel = rel.slice(templateRoot.length + 1);
-    } else if (templateRoot && rel === templateRoot) {
-        rel = ''; // Should not happen for file
-    }
+    const sourceDir: string = config.get('sourceDir') ?? '.';
+    const templateRoot: string = config.get('templateRoot') ?? '';
+
+    // Compute path relative to: workspaceRoot / sourceDir / templateRoot
+    const templateBase = path.join(this.workspaceRoot, sourceDir, templateRoot);
+    let rel = path.relative(templateBase, absolutePath).replace(/\\/g, '/');
 
     // Direct match
     if (this.graph.templates.has(rel)) {
       return this.graph.templates.get(rel);
     }
 
-    // Suffix match (template path may be partial)
+    // Suffix match — the render call path may be a suffix of the relative path
     for (const [tplPath, ctx] of this.graph.templates) {
       if (rel.endsWith(tplPath) || tplPath.endsWith(rel)) {
         return ctx;
       }
-      // Match on filename portion
-      if (path.basename(rel) === path.basename(tplPath)) {
+    }
+
+    // Basename match as last resort
+    const base = path.basename(absolutePath);
+    for (const [, ctx] of this.graph.templates) {
+      if (path.basename(ctx.templatePath) === base) {
         return ctx;
       }
     }
@@ -110,39 +111,37 @@ export class KnowledgeGraphBuilder {
   }
 
   /**
-   * Try to find a partial template in the workspace.
+   * Find a partial template context by name, searching the graph and filesystem.
    */
   findPartialContext(partialName: string, currentFile: string): TemplateContext | undefined {
-    // partialName might be relative or just a basename
-    // Try all template contexts
+    // 1. Check graph first
     for (const [tplPath, ctx] of this.graph.templates) {
       if (
-        tplPath.endsWith(partialName) ||
-        path.basename(tplPath) === partialName ||
-        path.basename(tplPath, '.html') === partialName
+        tplPath === partialName ||
+        tplPath.endsWith('/' + partialName) ||
+        path.basename(tplPath) === partialName
       ) {
         return ctx;
       }
     }
 
-    // Also try to find the file in the workspace even without a render call
+    // 2. Search filesystem
     const config = vscode.workspace.getConfiguration('rexTemplateValidator');
-    const templateRoot = config.get<string>('templateRoot') || '';
+    const sourceDir: string = config.get('sourceDir') ?? '.';
+    const templateRoot: string = config.get('templateRoot') ?? '';
 
-    const dir = path.dirname(currentFile);
+    const templateBase = path.join(this.workspaceRoot, sourceDir, templateRoot);
     const candidates = [
-      path.join(dir, partialName),
+      path.join(path.dirname(currentFile), partialName),
+      path.join(templateBase, partialName),
       path.join(this.workspaceRoot, partialName),
     ];
-    
-    if (templateRoot) {
-        candidates.push(path.join(this.workspaceRoot, templateRoot, partialName));
-    }
 
-    for (const c of candidates) {
-      if (fs.existsSync(c)) {
+    for (const candidate of candidates) {
+      if (fs.existsSync(candidate)) {
         return {
-          templatePath: c,
+          templatePath: path.relative(templateBase, candidate).replace(/\\/g, '/'),
+          absolutePath: candidate,
           vars: new Map(),
           renderCalls: [],
         };
@@ -153,16 +152,15 @@ export class KnowledgeGraphBuilder {
   }
 
   /**
-   * Convert render call template path to a workspace-relative path.
+   * Resolve a Go source file path (relative to sourceDir) to an absolute path.
+   * Used for go-to-definition.
    */
-  private resolveTemplatePath(rc: RenderCall): string | null {
-    let tplPath = rc.template;
+  resolveGoFilePath(relativeFile: string): string | null {
+    const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+    const sourceDir: string = config.get('sourceDir') ?? '.';
 
-    // Handle glob/pattern (e.g. "views/*.html") - just use as-is
-    // Remove leading "./"
-    tplPath = tplPath.replace(/^\.\//, '');
-
-    return tplPath;
+    const abs = path.join(this.workspaceRoot, sourceDir, relativeFile);
+    return fs.existsSync(abs) ? abs : null;
   }
 
   toJSON(): object {
@@ -172,10 +170,7 @@ export class KnowledgeGraphBuilder {
         vars: Object.fromEntries(
           [...ctx.vars.entries()].map(([k, v]) => [k, { type: v.type, fields: v.fields }])
         ),
-        renderCalls: ctx.renderCalls.map((r) => ({
-          file: r.file,
-          line: r.line,
-        })),
+        renderCalls: ctx.renderCalls.map(r => ({ file: r.file, line: r.line })),
       };
     }
     return obj;

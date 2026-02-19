@@ -17,9 +17,9 @@ export interface TemplateVar {
 }
 
 export interface RenderCall {
-  file: string;
+  file: string;   // relative to sourceDir, e.g. "handler.go"
   line: number;
-  template: string;
+  template: string; // e.g. "views/inpatient/treatment-chart.html"
   vars: TemplateVar[];
 }
 
@@ -31,7 +31,7 @@ export interface GoValidationError {
   message: string;
   severity: 'error' | 'warning';
   goFile?: string;  // relative path to the .go file with the c.Render() call
-  goLine?: number;
+  goLine?: number;  // line number of the c.Render() call
 }
 
 export interface AnalysisResult {
@@ -40,21 +40,22 @@ export interface AnalysisResult {
   validationErrors?: GoValidationError[];
 }
 
-// Template knowledge graph
+// ─── Knowledge Graph ──────────────────────────────────────────────────────────
+
 export interface TemplateContext {
-  templatePath: string;         // e.g. "views/inpatient/treatment-chart.html"
+  templatePath: string;         // logical path, e.g. "views/inpatient/treatment-chart.html"
+  absolutePath: string;         // absolute fs path for opening files
   vars: Map<string, TemplateVar>;
-  renderCalls: RenderCall[];    // all Go render calls pointing here
+  renderCalls: RenderCall[];
 }
 
 export interface KnowledgeGraph {
-  // template path -> context
-  templates: Map<string, TemplateContext>;
-  // last analysis time
+  templates: Map<string, TemplateContext>; // keyed by logical templatePath
   analyzedAt: Date;
 }
 
-// Template parse results
+// ─── Template AST ─────────────────────────────────────────────────────────────
+
 export interface TemplateNode {
   kind: 'variable' | 'range' | 'if' | 'with' | 'block' | 'partial' | 'call';
   path: string[];        // e.g. ["Visit", "Doctor", "DisplayName"]
@@ -64,7 +65,8 @@ export interface TemplateNode {
   endLine?: number;
   endCol?: number;
   children?: TemplateNode[];
-  partialName?: string;  // for 'partial' kind
+  partialName?: string;   // for 'partial' kind
+  partialContext?: string; // raw context arg, e.g. "." or ".User"
 }
 
 export interface ValidationError {
@@ -73,4 +75,25 @@ export interface ValidationError {
   col: number;
   severity: 'error' | 'warning' | 'info';
   variable?: string;
+}
+
+// ─── Scope ────────────────────────────────────────────────────────────────────
+
+export interface ScopeFrame {
+  /** "." for range/with implicit dot, or "$varName" for explicit assignments */
+  key: string;
+  typeStr: string;
+  fields?: FieldInfo[];
+  isRange?: boolean;
+}
+
+// ─── Definition location ──────────────────────────────────────────────────────
+
+export interface DefinitionLocation {
+  /** Absolute path to the Go file */
+  file: string;
+  /** 0-based line */
+  line: number;
+  /** 0-based column */
+  col: number;
 }

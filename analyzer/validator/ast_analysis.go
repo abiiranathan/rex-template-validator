@@ -83,7 +83,7 @@ func AnalyzeDir(dir string) AnalysisResult {
 				return true
 			}
 
-			vars := extractMapVars(call.Args[1], info, fset)
+			vars := extractMapVars(call.Args[1], info)
 
 			pos := fset.Position(call.Pos())
 
@@ -143,7 +143,7 @@ func extractString(expr ast.Expr) string {
 	return ""
 }
 
-func extractMapVars(expr ast.Expr, info *types.Info, fset *token.FileSet) []TemplateVar {
+func extractMapVars(expr ast.Expr, info *types.Info) []TemplateVar {
 	var vars []TemplateVar
 
 	comp, ok := expr.(*ast.CompositeLit)

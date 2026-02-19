@@ -466,11 +466,8 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 		}
 	}
 
-	if rootVarInfo != nil {
-		return validateNestedFields(parts[2:], rootVarInfo.Fields, rootVarInfo.TypeStr, varExpr, line, col, templateName)
-	}
+	return validateNestedFields(parts[2:], rootVarInfo.Fields, rootVarInfo.TypeStr, varExpr, line, col, templateName)
 
-	return nil
 }
 
 // validateNestedFields validates a field path against available fields

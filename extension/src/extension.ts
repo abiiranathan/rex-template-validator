@@ -13,20 +13,28 @@ const TEMPLATE_SELECTOR: vscode.DocumentSelector = [
   { pattern: '**/*.html' },
 ];
 
-let diagnosticCollection: vscode.DiagnosticCollection;
+// Two separate collections so they never interfere with each other:
+// - analyzerCollection: diagnostics from the Go binary (persists across template edits)
+// - editorCollection:   diagnostics from the in-editor TypeScript validator (per-document)
+let analyzerCollection: vscode.DiagnosticCollection;
+let editorCollection: vscode.DiagnosticCollection;
 let outputChannel: vscode.OutputChannel;
 let graphBuilder: KnowledgeGraphBuilder | undefined;
 let validator: TemplateValidator | undefined;
 let currentGraph: KnowledgeGraph | undefined;
 let analyzer: GoAnalyzer | undefined;
-let debounceTimer: NodeJS.Timeout | undefined;
+
+// Separate timers for rebuild (Go changes) vs validate (template changes)
+// so a template edit doesn't trigger a full Go re-analysis.
+let rebuildTimer: NodeJS.Timeout | undefined;
+let validateTimer: NodeJS.Timeout | undefined;
 
 export async function activate(context: vscode.ExtensionContext) {
   outputChannel = vscode.window.createOutputChannel('Rex Template Validator');
-  diagnosticCollection = vscode.languages.createDiagnosticCollection('rex-templates');
+  analyzerCollection = vscode.languages.createDiagnosticCollection('rex-analyzer');
+  editorCollection = vscode.languages.createDiagnosticCollection('rex-editor');
 
-  context.subscriptions.push(outputChannel, diagnosticCollection);
-
+  context.subscriptions.push(outputChannel, analyzerCollection, editorCollection);
   outputChannel.appendLine('[Rex] Extension activated');
 
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -39,11 +47,12 @@ export async function activate(context: vscode.ExtensionContext) {
   graphBuilder = new KnowledgeGraphBuilder(workspaceRoot, outputChannel);
   validator = new TemplateValidator(outputChannel, graphBuilder);
 
-  // Register commands
+  // ── Commands ───────────────────────────────────────────────────────────────
+
   context.subscriptions.push(
     vscode.commands.registerCommand('rexTemplateValidator.validate', async () => {
       const doc = vscode.window.activeTextEditor?.document;
-      if (doc) {
+      if (doc && isTemplate(doc)) {
         await validateDocument(doc);
       }
     }),
@@ -63,7 +72,9 @@ export async function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // Hover provider
+  // ── Language features ──────────────────────────────────────────────────────
+
+  // Hover
   context.subscriptions.push(
     vscode.languages.registerHoverProvider(TEMPLATE_SELECTOR, {
       provideHover(document, position) {
@@ -75,7 +86,7 @@ export async function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // Completion provider
+  // Completion
   context.subscriptions.push(
     vscode.languages.registerCompletionItemProvider(
       TEMPLATE_SELECTOR,
@@ -91,7 +102,21 @@ export async function activate(context: vscode.ExtensionContext) {
     )
   );
 
-  // File watcher for Go files → rebuild index
+  // Go to Definition — jumps from template variable to the c.Render() call in Go
+  context.subscriptions.push(
+    vscode.languages.registerDefinitionProvider(TEMPLATE_SELECTOR, {
+      provideDefinition(document, position) {
+        if (!validator || !graphBuilder) return;
+        const ctx = graphBuilder.findContextForFile(document.uri.fsPath);
+        if (!ctx) return;
+        return validator.getDefinitionLocation(document, position, ctx);
+      },
+    })
+  );
+
+  // ── File watchers ──────────────────────────────────────────────────────────
+
+  // Go source changes → full re-analysis
   const goWatcher = vscode.workspace.createFileSystemWatcher('**/*.go');
   context.subscriptions.push(
     goWatcher,
@@ -100,34 +125,50 @@ export async function activate(context: vscode.ExtensionContext) {
     goWatcher.onDidDelete(() => scheduleRebuild(workspaceRoot))
   );
 
-  // File watcher for templates → validate
+  // Template changes → re-validate only (no Go analysis needed)
   const tplWatcher = vscode.workspace.createFileSystemWatcher('**/*.{html,tmpl}');
   context.subscriptions.push(
     tplWatcher,
     tplWatcher.onDidChange(async (uri) => {
       const doc = await vscode.workspace.openTextDocument(uri);
-      scheduleValidate(doc);
+      if (isTemplate(doc)) scheduleValidate(doc);
+    }),
+    tplWatcher.onDidCreate(async (uri) => {
+      // New template file — rebuild so it can be indexed
+      scheduleRebuild(workspaceRoot);
     })
   );
 
-  // Validate on open
+  // Validate on open/save
   context.subscriptions.push(
     vscode.workspace.onDidOpenTextDocument((doc) => {
-      if (isTemplate(doc)) {
-        scheduleValidate(doc);
-      }
+      if (isTemplate(doc)) scheduleValidate(doc);
     }),
+
     vscode.workspace.onDidSaveTextDocument((doc) => {
-      if (isTemplate(doc)) {
-        scheduleValidate(doc);
+      if (doc.fileName.endsWith('.go')) {
+        scheduleRebuild(workspaceRoot);      // re-run Go analyzer
+      } else if (isTemplate(doc)) {
+        scheduleValidate(doc);               // re-validate template against existing graph
       }
     })
   );
 
-  // Initial index build
+  // Config changes → rebuild so new sourceDir/templateRoot take effect
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration('rexTemplateValidator')) {
+        outputChannel.appendLine('[Rex] Configuration changed, rebuilding index...');
+        scheduleRebuild(workspaceRoot);
+      }
+    })
+  );
+
+  // ── Initial build ──────────────────────────────────────────────────────────
+
   await rebuildIndex(workspaceRoot);
 
-  // Validate any already-open template docs
+  // Validate already-open templates
   for (const doc of vscode.workspace.textDocuments) {
     if (isTemplate(doc)) {
       await validateDocument(doc);
@@ -138,12 +179,16 @@ export async function activate(context: vscode.ExtensionContext) {
   vscode.window.setStatusBarMessage('$(check) Rex templates indexed', 3000);
 }
 
+// ── Template detection ─────────────────────────────────────────────────────────
+
 function isTemplate(doc: vscode.TextDocument): boolean {
   return (
     doc.uri.scheme === 'file' &&
     (doc.fileName.endsWith('.html') || doc.fileName.endsWith('.tmpl'))
   );
 }
+
+// ── Rebuild (full Go analysis) ─────────────────────────────────────────────────
 
 async function rebuildIndex(workspaceRoot: string) {
   if (!analyzer || !graphBuilder) return;
@@ -152,7 +197,6 @@ async function rebuildIndex(workspaceRoot: string) {
   statusBarItem.text = '$(sync~spin) Rex: Analyzing...';
   statusBarItem.show();
 
-  // Read config — must match the CLI flags -dir and -template-root
   const config = vscode.workspace.getConfiguration('rexTemplateValidator');
   const sourceDir: string = config.get('sourceDir') ?? '.';
   const templateRoot: string = config.get('templateRoot') ?? '';
@@ -163,104 +207,125 @@ async function rebuildIndex(workspaceRoot: string) {
 
     if (result.errors?.length) {
       outputChannel.appendLine('[Rex] Analysis warnings:');
-      result.errors.slice(0, 10).forEach((e) => outputChannel.appendLine(`  ${e}`));
+      result.errors.slice(0, 10).forEach(e => outputChannel.appendLine(`  ${e}`));
     }
 
     const count = currentGraph.templates.size;
-
     if (count === 0) {
-      outputChannel.appendLine('[Rex] No templates found in analysis result.');
-      if (result.renderCalls.length === 0) {
-        outputChannel.appendLine('[Rex] No render calls found. Check if your Go code calls c.Render().');
+      outputChannel.appendLine('[Rex] No templates found.');
+      if (!result.renderCalls.length) {
+        outputChannel.appendLine('[Rex] No render calls found. Check your Go code calls c.Render().');
       }
     }
 
-    statusBarItem.text = `$(check) Rex: ${count} templates indexed`;
+    statusBarItem.text = `$(check) Rex: ${count} template${count === 1 ? '' : 's'} indexed`;
 
     // Apply diagnostics from Go analyzer
-    diagnosticCollection.clear();
+    applyAnalyzerDiagnostics(result.validationErrors ?? [], workspaceRoot, sourceDir, templateRoot);
 
-    if (result.validationErrors) {
-      const issuesByFile = new Map<string, vscode.Diagnostic[]>();
-
-      for (const err of result.validationErrors) {
-        // Full absolute path: workspaceRoot / sourceDir / templateRoot / err.template
-        // err.template is the logical relative path from the analyzer,
-        // e.g. "views/inpatient/treatment-chart.html"
-        const absPath = path.join(workspaceRoot, sourceDir, templateRoot, err.template);
-
-        const range = new vscode.Range(
-          Math.max(0, err.line - 1),
-          Math.max(0, err.column - 1),
-          Math.max(0, err.line - 1),
-          Math.max(0, err.column - 1 + (err.variable?.length || 1))
-        );
-
-        const diag = new vscode.Diagnostic(
-          range,
-          err.message,
-          err.severity === 'warning' ? vscode.DiagnosticSeverity.Warning : vscode.DiagnosticSeverity.Error
-        );
-        diag.source = 'Rex';
-
-        // Attach the Go source file as related information so the user can
-        // jump from the template diagnostic back to the c.Render() call site.
-        if (err.goFile) {
-          const goFileAbs = path.join(workspaceRoot, sourceDir, err.goFile);
-          diag.relatedInformation = [
-            new vscode.DiagnosticRelatedInformation(
-              new vscode.Location(
-                vscode.Uri.file(goFileAbs),
-                new vscode.Position(Math.max(0, (err.goLine ?? 1) - 1), 0)
-              ),
-              'Variable passed from here'
-            ),
-          ];
-        }
-
-        const list = issuesByFile.get(absPath) || [];
-        list.push(diag);
-        issuesByFile.set(absPath, list);
+    // Re-validate open template docs with fresh graph (editor diagnostics only)
+    for (const doc of vscode.workspace.textDocuments) {
+      if (isTemplate(doc)) {
+        await validateDocument(doc);
       }
-
-      for (const [filePath, issues] of issuesByFile) {
-        diagnosticCollection.set(vscode.Uri.file(filePath), issues);
-      }
-
-      outputChannel.appendLine(`[Rex] Applied ${result.validationErrors.length} diagnostics from analyzer`);
     }
   } catch (err) {
     outputChannel.appendLine(`[Rex] Rebuild failed: ${err}`);
-    statusBarItem.text = '$(error) Rex: Index failed';
+    statusBarItem.text = '$(error) Rex: Analysis failed';
   } finally {
-    setTimeout(() => statusBarItem.dispose(), 4000);
+    setTimeout(() => statusBarItem.dispose(), 5000);
   }
 }
 
-async function validateDocument(doc: vscode.TextDocument) {
-  const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-  if (workspaceRoot) {
-    scheduleRebuild(workspaceRoot);
+function applyAnalyzerDiagnostics(
+  validationErrors: import('./types').GoValidationError[],
+  workspaceRoot: string,
+  sourceDir: string,
+  templateRoot: string
+) {
+  analyzerCollection.clear();
+
+  const issuesByFile = new Map<string, vscode.Diagnostic[]>();
+
+  for (const err of validationErrors) {
+    const absPath = path.join(workspaceRoot, sourceDir, templateRoot, err.template);
+
+    const startLine = Math.max(0, err.line - 1);
+    const startCol = Math.max(0, err.column - 1);
+    const endCol = startCol + (err.variable?.length || 1);
+
+    const range = new vscode.Range(startLine, startCol, startLine, endCol);
+    const diag = new vscode.Diagnostic(
+      range,
+      err.message,
+      err.severity === 'warning' ? vscode.DiagnosticSeverity.Warning : vscode.DiagnosticSeverity.Error
+    );
+    diag.source = 'Rex';
+
+    if (err.goFile) {
+      const goFileAbs = path.join(workspaceRoot, sourceDir, err.goFile);
+      diag.relatedInformation = [
+        new vscode.DiagnosticRelatedInformation(
+          new vscode.Location(
+            vscode.Uri.file(goFileAbs),
+            new vscode.Position(Math.max(0, (err.goLine ?? 1) - 1), 0)
+          ),
+          'Variable passed from here'
+        ),
+      ];
+    }
+
+    const list = issuesByFile.get(absPath) ?? [];
+    list.push(diag);
+    issuesByFile.set(absPath, list);
   }
+
+  for (const [filePath, issues] of issuesByFile) {
+    analyzerCollection.set(vscode.Uri.file(filePath), issues);
+  }
+
+  outputChannel.appendLine(`[Rex] Applied ${validationErrors.length} analyzer diagnostics`);
 }
+
+// ── Per-document validation ────────────────────────────────────────────────────
+
+async function validateDocument(doc: vscode.TextDocument) {
+  if (!validator || !graphBuilder) return;
+
+  const ctx = graphBuilder.findContextForFile(doc.uri.fsPath);
+  if (!ctx) {
+    editorCollection.delete(doc.uri);
+    return;
+  }
+
+  const diagnostics = await validator.validateDocument(doc);
+  editorCollection.set(doc.uri, diagnostics);
+}
+
+// ── Debounce helpers ───────────────────────────────────────────────────────────
 
 function scheduleRebuild(workspaceRoot: string) {
   const config = vscode.workspace.getConfiguration('rexTemplateValidator');
   const debounceMs = config.get<number>('debounceMs') ?? 1500;
 
-  if (debounceTimer) clearTimeout(debounceTimer);
-  debounceTimer = setTimeout(() => rebuildIndex(workspaceRoot), debounceMs * 2);
+  if (rebuildTimer) clearTimeout(rebuildTimer);
+  rebuildTimer = setTimeout(() => rebuildIndex(workspaceRoot), debounceMs * 2);
 }
 
 function scheduleValidate(doc: vscode.TextDocument) {
   const config = vscode.workspace.getConfiguration('rexTemplateValidator');
   const debounceMs = config.get<number>('debounceMs') ?? 1500;
 
-  if (debounceTimer) clearTimeout(debounceTimer);
-  debounceTimer = setTimeout(() => validateDocument(doc), debounceMs);
+  if (validateTimer) clearTimeout(validateTimer);
+  validateTimer = setTimeout(() => validateDocument(doc), debounceMs);
 }
 
+// ── Deactivation ───────────────────────────────────────────────────────────────
+
 export function deactivate() {
-  diagnosticCollection?.dispose();
+  if (rebuildTimer) clearTimeout(rebuildTimer);
+  if (validateTimer) clearTimeout(validateTimer);
+  analyzerCollection?.dispose();
+  editorCollection?.dispose();
   outputChannel?.dispose();
 }

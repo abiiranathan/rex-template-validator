@@ -2,7 +2,7 @@
   "name": "rex-template-validator",
   "displayName": "Rex Template Validator",
   "description": "Validates Go template variables in .html/.tmpl files used with the rex framework",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "Nabiizy",
   "engines": {
     "vscode": "^1.85.0"
@@ -59,20 +59,20 @@
           "default": "",
           "description": "Path to the rex-analyzer binary. Leave empty to use the bundled binary."
         },
-        "rexTemplateValidator.scanDirectories": {
-          "type": "array",
-          "default": [],
-          "description": "Additional directories to scan for Go files. Empty = entire workspace."
+        "rexTemplateValidator.sourceDir": {
+          "type": "string",
+          "default": ".",
+          "description": "Go source directory relative to the workspace root, passed as the -dir flag to the CLI (e.g. 'sample' if your Go files live in a subdirectory)."
         },
         "rexTemplateValidator.templateRoot": {
           "type": "string",
           "default": "",
-          "description": "Root directory for templates relative to workspace root (e.g. 'templates'). Useful when using embed.FS or subdirectory views."
+          "description": "Root directory for templates, relative to sourceDir, passed as the -template-root flag (e.g. 'templates')."
         },
         "rexTemplateValidator.debounceMs": {
           "type": "number",
           "default": 1500,
-          "description": "Debounce delay in ms before re-validating on file change."
+          "description": "Debounce delay in milliseconds before re-validating on file change."
         },
         "rexTemplateValidator.enableAutoValidate": {
           "type": "boolean",

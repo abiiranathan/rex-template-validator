@@ -21,43 +21,57 @@ export class GoAnalyzer {
       return configPath;
     }
 
-    // Bundled binary
     const ext = process.platform === 'win32' ? '.exe' : '';
     const bundled = path.join(context.extensionPath, 'out', `rex-analyzer${ext}`);
     if (fs.existsSync(bundled)) {
       return bundled;
     }
 
-    // Try system PATH
     return 'rex-analyzer';
   }
 
   /**
-   * Analyze a Go source directory. Returns parsed render calls with type info.
+   * Analyze the workspace by invoking the Go analyzer once.
+   *
+   * The analyzer is invoked with:
+   *   -dir <workspaceRoot/sourceDir>   (absolute path to Go source)
+   *   -template-root <templateRoot>     (relative to -dir)
+   *   -validate
+   *
+   * cwd is set to workspaceRoot so relative paths in output stay predictable.
    */
-  async analyzeDirectory(dir: string): Promise<AnalysisResult> {
-    return new Promise((resolve) => {
-      const config = vscode.workspace.getConfiguration('rexTemplateValidator');
-      const templateRoot = config.get<string>('templateRoot') || '';
-      
-      const args = ['-dir', dir, '-template-root', templateRoot, '-validate'];
-      this.outputChannel.appendLine(`[Analyzer] Running: ${this.analyzerPath} ${args.join(' ')}`);
+  async analyzeWorkspace(workspaceRoot: string): Promise<AnalysisResult> {
+    const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+    const sourceDir: string = config.get('sourceDir') ?? '.';
+    const templateRoot: string = config.get('templateRoot') ?? '';
 
+    // Resolve the Go source directory to an absolute path
+    const absSourceDir = path.resolve(workspaceRoot, sourceDir);
+
+    if (!fs.existsSync(absSourceDir)) {
+      this.outputChannel.appendLine(`[Analyzer] Source dir does not exist: ${absSourceDir}`);
+      return { renderCalls: [], errors: [`Source directory not found: ${absSourceDir}`] };
+    }
+
+    const args = ['-dir', absSourceDir, '-validate'];
+    if (templateRoot) {
+      args.push('-template-root', templateRoot);
+    }
+
+    this.outputChannel.appendLine(`[Analyzer] Running: ${this.analyzerPath} ${args.join(' ')}`);
+
+    return new Promise((resolve) => {
       let stdout = '';
       let stderr = '';
 
       const proc = cp.spawn(this.analyzerPath, args, {
-        cwd: dir,
+        // cwd is the workspace root so relative file paths in output are stable
+        cwd: workspaceRoot,
         env: process.env,
       });
 
-      proc.stdout.on('data', (data: Buffer) => {
-        stdout += data.toString();
-      });
-
-      proc.stderr.on('data', (data: Buffer) => {
-        stderr += data.toString();
-      });
+      proc.stdout.on('data', (data: Buffer) => { stdout += data.toString(); });
+      proc.stderr.on('data', (data: Buffer) => { stderr += data.toString(); });
 
       proc.on('error', (err) => {
         this.outputChannel.appendLine(`[Analyzer] Failed to spawn: ${err.message}`);
@@ -83,69 +97,19 @@ export class GoAnalyzer {
         try {
           const result: AnalysisResult = JSON.parse(stdout);
           this.outputChannel.appendLine(
-            `[Analyzer] Found ${result.renderCalls?.length ?? 0} render calls`
+            `[Analyzer] Found ${result.renderCalls?.length ?? 0} render calls, ` +
+            `${result.validationErrors?.length ?? 0} validation errors`
           );
           resolve(result);
         } catch (e) {
           this.outputChannel.appendLine(`[Analyzer] JSON parse error: ${e}`);
+          this.outputChannel.appendLine(`[Analyzer] Raw output: ${stdout.slice(0, 500)}`);
           resolve({
             renderCalls: [],
             errors: [`Failed to parse analyzer output: ${e}`],
           });
         }
       });
-    });
-  }
-
-  /**
-   * Run the analyzer across multiple directories (e.g. all packages in workspace)
-   */
-  async analyzeWorkspace(workspaceRoot: string): Promise<AnalysisResult> {
-    const goPackageDirs = await this.findGoPackageDirs(workspaceRoot);
-    this.outputChannel.appendLine(`[Analyzer] Scanning ${goPackageDirs.length} Go package dirs`);
-
-    const results = await Promise.all(goPackageDirs.map((d) => this.analyzeDirectory(d)));
-
-    // Merge
-    const merged: AnalysisResult = { renderCalls: [], errors: [], validationErrors: [] };
-    for (const r of results) {
-      merged.renderCalls.push(...(r.renderCalls ?? []));
-      merged.errors.push(...(r.errors ?? []));
-      merged.validationErrors?.push(...(r.validationErrors ?? []));
-    }
-
-    return merged;
-  }
-
-  private async findGoPackageDirs(root: string): Promise<string[]> {
-    return new Promise((resolve) => {
-      const dirs = new Set<string>();
-
-      const walk = (dir: string) => {
-        try {
-          const entries = fs.readdirSync(dir, { withFileTypes: true });
-          let hasGo = false;
-
-          for (const e of entries) {
-            if (e.isDirectory()) {
-              if (!['vendor', 'node_modules', '.git', 'testdata'].includes(e.name)) {
-                walk(path.join(dir, e.name));
-              }
-            } else if (e.name.endsWith('.go') && !e.name.endsWith('_test.go')) {
-              hasGo = true;
-            }
-          }
-
-          if (hasGo) {
-            dirs.add(dir);
-          }
-        } catch {
-          // Skip unreadable dirs
-        }
-      };
-
-      walk(root);
-      resolve(Array.from(dirs));
     });
   }
 }
