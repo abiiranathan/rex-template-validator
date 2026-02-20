@@ -493,6 +493,21 @@ export class TemplateValidator {
     if (!hit) return null;
 
     const { node, stack, vars: hitVars } = hit;
+
+    // ── Bare dot hover ────────────────────────────────────────────────────────
+    // Handles two cases:
+    //   (a) {{ . }} — variable node with path ["."]
+    //   (b) {{ template "name" . }} — cursor over the "." context arg in the tag
+    //       (partial node, opening tag position)
+    // Bare dot: {{ . }} or {{ template "name" . }} — show current dot's type
+    const isBareVarDot = node.kind === 'variable' && node.path.length === 1 && node.path[0] === '.';
+    const isPartialDotCtx = node.kind === 'partial' && (node.partialContext ?? '.') === '.';
+
+    if (isBareVarDot || isPartialDotCtx) {
+      return this.buildDotHover(stack, hitVars);
+    }
+
+    // ── Normal variable hover ─────────────────────────────────────────────────
     // hitVars and stack are scoped correctly for define/block bodies —
     // use them instead of ctx.vars so single-segment paths like .Name resolve.
     const result = resolvePath(node.path, hitVars, stack);
@@ -531,6 +546,54 @@ export class TemplateValidator {
           md.appendMarkdown(`\n${f.doc}\n`);
         }
 
+        md.appendMarkdown('\n');
+      }
+    }
+
+    return new vscode.Hover(md);
+  }
+
+  /**
+   * Build hover content for bare "." — shows the type and fields of the current dot.
+   * Used for {{ . }}, {{ range .Items }}{{ . }}{{ end }}, {{ template "x" . }}, etc.
+   */
+  private buildDotHover(
+    scopeStack: ScopeFrame[],
+    vars: Map<string, TemplateVar>
+  ): vscode.Hover | null {
+    const dotFrame = scopeStack.slice().reverse().find(f => f.key === '.');
+
+    let typeStr: string;
+    let fields: FieldInfo[] | undefined;
+
+    if (dotFrame) {
+      typeStr = dotFrame.typeStr ?? 'unknown';
+      fields = dotFrame.fields;
+    } else {
+      // Root scope — dot is the render context itself
+      const allVars = [...vars.values()];
+      typeStr = 'RenderContext';
+      fields = allVars.map(v => ({
+        name: v.name,
+        type: v.type,
+        fields: v.fields,
+        isSlice: v.isSlice ?? false,
+        doc: v.doc,
+      } as FieldInfo));
+    }
+
+    const md = new vscode.MarkdownString();
+    md.isTrusted = true;
+    md.appendCodeblock(`. : ${typeStr}`, 'go');
+
+    if (fields && fields.length > 0) {
+      md.appendMarkdown('\n\n---\n\n**Fields:**\n\n');
+      for (const f of fields.slice(0, 30)) {
+        const typeLabel = f.isSlice ? `[]${f.type}` : f.type;
+        md.appendMarkdown(`**${f.name}** \`${typeLabel}\`\n`);
+        if (f.doc) {
+          md.appendMarkdown(`\n${f.doc}\n`);
+        }
         md.appendMarkdown('\n');
       }
     }
@@ -1312,8 +1375,21 @@ export class TemplateValidator {
         continue;
       }
 
+      // ── Single-line nodes (partial / template call) ──────────────────────
+      // These have no endLine — match by tag span on the same line.
+      if (node.endLine === undefined) {
+        const endCol = startCol + (node.rawText?.length ?? 0);
+        if (
+          position.line === startLine &&
+          position.character >= startCol &&
+          position.character <= endCol
+        ) {
+          return { node, stack: scopeStack, vars };
+        }
+        continue;
+      }
+
       // ── Block nodes ────────────────────────────────────────────────────────
-      if (node.endLine === undefined) continue;
 
       const endLine = node.endLine - 1;
       const afterStart = position.line > startLine ||
