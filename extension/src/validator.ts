@@ -202,7 +202,7 @@ export class TemplateValidator {
     if (topVar?.isSlice) {
       return {
         key: '.',
-        typeStr: topVar.elemType ?? topVar.type,
+        typeStr: topVar.elemType ?? (topVar.isSlice && topVar.type.startsWith('[]') ? topVar.type.slice(2) : topVar.type),
         fields: topVar.fields,
         isRange: true,
         sourceVar: topVar,
@@ -223,7 +223,7 @@ export class TemplateValidator {
       }
       return {
         key: '.',
-        typeStr: result.typeStr,
+        typeStr: result.isSlice && result.typeStr.startsWith('[]') ? result.typeStr.slice(2) : result.typeStr,
         fields: result.fields,
         isRange: true,
         sourceVar,
@@ -1422,7 +1422,11 @@ export class TemplateValidator {
                 }
               }
               const childStack: ScopeFrame[] = [...scopeStack, {
-                key: '.', typeStr: result.typeStr, fields: result.fields, isRange: true, sourceVar,
+                key: '.',
+                typeStr: result.isSlice && result.typeStr.startsWith('[]') ? result.typeStr.slice(2) : result.typeStr,
+                fields: result.fields,
+                isRange: true,
+                sourceVar,
               }];
               if (node.children) {
                 const found = this.findNodeAtPosition(node.children, position, vars, childStack);
