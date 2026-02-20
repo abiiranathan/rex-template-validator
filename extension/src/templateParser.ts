@@ -70,8 +70,20 @@ export class TemplateParser {
 
       if (inner.startsWith('range ')) {
         const expr = inner.slice(6).trim();
-        // Strip "$i, $v :=" or "$v :=" or "$_, $v :=" assignment prefix
-        const cleanExpr = expr.replace(/^\$\w+\s*(?:,\s*\$\w+)?\s*:=\s*/, '').trim();
+        let keyVar: string | undefined;
+        let valVar: string | undefined;
+        const assignMatch = expr.match(/^(\$\w+)\s*(?:,\s*(\$\w+))?\s*:=\s*(.*)/);
+        let cleanExpr = expr;
+        if (assignMatch) {
+          if (assignMatch[2]) {
+            keyVar = assignMatch[1];
+            valVar = assignMatch[2];
+          } else {
+            valVar = assignMatch[1];
+          }
+          cleanExpr = assignMatch[3].trim();
+        }
+
         const child = this.buildTree(tokens, pos + 1);
         nodes.push({
           kind: 'range',
@@ -82,23 +94,33 @@ export class TemplateParser {
           endLine: child.endToken?.line,
           endCol: child.endToken?.col,
           children: child.nodes,
+          keyVar,
+          valVar,
         });
         pos = child.nextPos;
         continue;
       }
 
       if (inner.startsWith('with ')) {
-        const expr = inner.slice(5).trim().replace(/^\$\w+\s*:=\s*/, '').trim();
+        const expr = inner.slice(5).trim();
+        let valVar: string | undefined;
+        const assignMatch = expr.match(/^(\$\w+)\s*:=\s*(.*)/);
+        let cleanExpr = expr;
+        if (assignMatch) {
+          valVar = assignMatch[1];
+          cleanExpr = assignMatch[2].trim();
+        }
         const child = this.buildTree(tokens, pos + 1);
         nodes.push({
           kind: 'with',
-          path: this.parseDotPath(expr),
+          path: this.parseDotPath(cleanExpr),
           rawText: tok.raw,
           line: tok.line,
           col: tok.col,
           endLine: child.endToken?.line,
           endCol: child.endToken?.col,
           children: child.nodes,
+          valVar,
         });
         pos = child.nextPos;
         continue;
@@ -211,14 +233,28 @@ export class TemplateParser {
     const results: TemplateNode[] = [];
 
     // 1. Strip assignment LHS: $var := ... or $a, $b := ...
-    const assignMatch = inner.match(/^\s*(?:\$[\w\d_]+(?:\s*,\s*\$[\w\d_]+)?)\s*:=\s*(.*)/);
+    const assignMatch = inner.match(/^\s*(?:\$(\w+)(?:\s*,\s*\$(\w+))?)\s*:=\s*(.*)/);
     if (assignMatch) {
-      inner = assignMatch[1];
+      const assignVars = [];
+      if (assignMatch[1]) assignVars.push('$' + assignMatch[1]);
+      if (assignMatch[2]) assignVars.push('$' + assignMatch[2]);
+      const assignExpr = assignMatch[3].trim();
+
+      results.push({
+        kind: 'assignment',
+        path: this.parseDotPath(assignExpr),
+        rawText: tok.raw,
+        line: tok.line,
+        col: tok.col,
+        assignVars,
+        assignExpr,
+      });
+      inner = assignExpr; // continue parsing the RHS for variables
     }
 
     // 2. Scan for references starting with . or $
-    // Matches: .Field, $Var, $.Field, ., $
-    const refs = inner.match(/((?:\$|\.)[\w\d_.]*)/g);
+    // Matches: .Field, $Var, $.Field, ., $, and index operations like (index .Slice 0).Field
+    const refs = inner.match(/(\(index\s+(?:\$|\.)[\w\d_.]+\s+[^)]+\)(?:\.[\w\d_.]+)*|(?:\$|\.)[\w\d_.[\]]*)/g);
 
     if (refs) {
       for (const ref of refs) {
@@ -256,6 +292,12 @@ export class TemplateParser {
     // Extract path from (call .Method args)
     const callMatch = expr.match(/\(call\s+(\.[^\s)]+)/);
     if (callMatch) expr = callMatch[1];
+
+    // Handle index: (index .Slice 0).Field -> .Slice.[].Field
+    let indexMatch;
+    while ((indexMatch = expr.match(/\(index\s+((?:\$|\.)[\w.]+)[^)]*\)/))) {
+      expr = expr.replace(indexMatch[0], indexMatch[1] + '.[]');
+    }
 
     // Take only the path part before any space/pipe/paren
     const pathPart = expr.split(/[\s|(),]/)[0];
@@ -299,6 +341,7 @@ export interface ResolveResult {
   isSlice?: boolean;
   isMap?: boolean;
   elemType?: string;
+  keyType?: string;
 }
 
 /**
@@ -316,10 +359,39 @@ export interface ResolveResult {
 export function resolvePath(
   path: string[],
   vars: Map<string, TemplateVar>,
-  scopeStack: ScopeFrame[]
+  scopeStack: ScopeFrame[],
+  blockLocals?: Map<string, TemplateVar>
 ): ResolveResult {
   if (path.length === 0) {
     return { typeStr: 'context', found: true };
+  }
+
+  // Check blockLocals first for $ variables
+  if (path[0].startsWith('$') && path[0] !== '$') {
+    let local = blockLocals?.get(path[0]);
+    if (!local) {
+      // check scopeStack for locals
+      for (let i = scopeStack.length - 1; i >= 0; i--) {
+        if (scopeStack[i].locals?.has(path[0])) {
+          local = scopeStack[i].locals!.get(path[0]);
+          break;
+        }
+      }
+    }
+    if (local) {
+      if (path.length === 1) {
+        return {
+          typeStr: local.type,
+          found: true,
+          fields: local.fields,
+          isSlice: local.isSlice,
+          isMap: local.isMap,
+          elemType: local.elemType,
+          keyType: local.keyType,
+        };
+      }
+      return resolveFields(path.slice(1), local.fields ?? [], local.isMap, local.elemType);
+    }
   }
 
   // Bare dot → current scope
@@ -347,6 +419,7 @@ export function resolvePath(
         isSlice: topVar.isSlice,
         isMap: topVar.isMap,
         elemType: topVar.elemType,
+        keyType: topVar.keyType,
       };
     }
     return resolveFields(remaining.slice(1), topVar.fields ?? [], topVar.isMap, topVar.elemType);
@@ -356,37 +429,7 @@ export function resolvePath(
   // Only fall through to top-level vars for explicit "$"-prefixed paths.
   const dotFrame = findDotFrame(scopeStack);
   if (dotFrame) {
-    // If inside a range/with, dotFrame represents the current context.
-    // If dotFrame came from a map iteration (value context), it's just a value. IsMap=false usually.
-    // Unless iterating a map of maps.
-    
-    // We need ScopeFrame to store isMap/elemType if we want to support map iteration.
-    // ScopeFrame interface has `fields`. Does it have `isMap`?
-    // Let's check `types.ts`.
-    
-    // Check types.ts again.
-    /*
-    export interface ScopeFrame {
-      key: string;
-      typeStr: string;
-      fields?: FieldInfo[];
-      isRange?: boolean;
-      sourceVar?: TemplateVar;
-      // Add isMap, elemType here?
-    }
-    */
-    
-    // I should update ScopeFrame too.
-    
     if (dotFrame.fields) {
-      // If dotFrame is a map, we need to pass isMap=true.
-      // But dotFrame doesn't store isMap.
-      // I'll assume for now dotFrame represents resolved value.
-      
-      // If dotFrame is Map, we need to know.
-      // I'll update ScopeFrame later if needed. For now let's use typeStr check?
-      // Or assume dotFrame is result of resolution, so it's unwrapped?
-      
       const res = resolveFieldsDeep(path, dotFrame.fields);
       if (res.found) return res;
     }
@@ -407,6 +450,7 @@ export function resolvePath(
       isSlice: topVar.isSlice,
       isMap: topVar.isMap,
       elemType: topVar.elemType,
+      keyType: topVar.keyType,
     };
   }
 
@@ -428,42 +472,35 @@ function resolveFields(
   parts: string[],
   fields: FieldInfo[],
   isMap: boolean = false,
-  elemType?: string
+  elemType?: string,
+  isSlice: boolean = false
 ): ResolveResult {
   if (parts.length === 0) {
     return { typeStr: 'unknown', found: false };
   }
 
-  if (isMap) {
-    const [_, ...rest] = parts;
-    // Map key access consumes one part.
-    // Result is the value type.
-    
-    // Naive parsing for next level type (similar to Go implementation logic)
-    // We assume `fields` represents the inner struct fields correctly for nested maps too.
-    
+  if (parts[0] === '[]' || isMap) {
+    const rest = parts[0] === '[]' ? parts.slice(1) : parts.slice(1);
+
     let nextTypeStr = elemType || 'unknown';
-    // Remove pointers
     while (nextTypeStr.startsWith('*')) nextTypeStr = nextTypeStr.slice(1);
-    
+
     let nextIsMap = false;
     let nextIsSlice = false;
     let nextElemType = nextTypeStr;
 
     if (nextTypeStr.startsWith('map[')) {
       nextIsMap = true;
-      // Simple parser for value type
       let depth = 0;
       let splitIdx = -1;
-      // map[ starts at 0. First [ at 3.
-      for (let i = 3; i < nextTypeStr.length; i++) {
+      for (let i = 4; i < nextTypeStr.length; i++) {
         if (nextTypeStr[i] === '[') depth++;
         else if (nextTypeStr[i] === ']') {
-          depth--;
           if (depth === 0) {
             splitIdx = i;
             break;
           }
+          depth--;
         }
       }
       if (splitIdx !== -1) {
@@ -484,8 +521,7 @@ function resolveFields(
         elemType: nextElemType,
       };
     }
-    
-    return resolveFields(rest, fields, nextIsMap, nextElemType);
+    return resolveFields(rest, fields, nextIsMap, nextElemType, nextIsSlice);
   }
 
   return resolveFieldsDeep(parts, fields);
@@ -530,5 +566,6 @@ function resolveFieldsDeep(
     isSlice: field.isSlice,
     isMap: field.isMap,
     elemType: field.elemType,
+    keyType: field.keyType,
   };
 }

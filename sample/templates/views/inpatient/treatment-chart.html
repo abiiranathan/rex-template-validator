@@ -42,13 +42,13 @@
     {{ end }}
 
     <!-- Passed through a context-file -->
-    {{ $.currentUser.Name }}
+    {{ $.newuser.Name }}
+    {{ $.currentUser }}
 
     <!-- Map -->
     {{ range $k, $v := .roles }}
     {{ $k }}: {{ $v }}
     {{ end }}
-
 </body>
 
 </html>

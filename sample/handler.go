@@ -82,7 +82,7 @@ func (h *Handler) RenderTreatmentChart(inpatient bool) rex.HandlerFunc {
 		title := "Inpatient Treatment Chart"
 		label := "Inpatient"
 
-		currentUser := &User{}
+		newuser := &User{}
 
 		if !inpatient {
 			pathPrefix = "/outpatient"
@@ -94,7 +94,7 @@ func (h *Handler) RenderTreatmentChart(inpatient bool) rex.HandlerFunc {
 			"management":    management,
 			"visit":         visit,
 			"Title":         title,
-			"newuser":       currentUser,
+			"newuser":       newuser,
 			"PathPrefix":    pathPrefix,
 			"billedDrugs":   billedDrugs,
 			"prescriptions": prescriptions,

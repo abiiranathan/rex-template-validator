@@ -1,5 +1,3 @@
-// Types mirroring the Go analyzer output
-
 export interface FieldInfo {
   name: string;
   type: string;
@@ -80,7 +78,7 @@ export interface KnowledgeGraph {
 // ─── Template AST ─────────────────────────────────────────────────────────────
 
 export interface TemplateNode {
-  kind: 'variable' | 'range' | 'if' | 'with' | 'block' | 'partial' | 'call' | 'define';
+  kind: 'variable' | 'range' | 'if' | 'with' | 'block' | 'partial' | 'call' | 'define' | 'assignment';
   path: string[];        // e.g. ["Visit", "Doctor", "DisplayName"]
   rawText: string;
   line: number;
@@ -91,6 +89,10 @@ export interface TemplateNode {
   partialName?: string;   // for 'partial' kind
   partialContext?: string; // raw context arg, e.g. "." or ".User"
   blockName?: string;     // for 'block' and 'define' kind
+  keyVar?: string;        // for 'range' key variable assignment
+  valVar?: string;        // for 'range' and 'with' value variable assignment
+  assignVars?: string[];  // for 'assignment' kind
+  assignExpr?: string;    // for 'assignment' kind
 }
 
 export interface ValidationError {
@@ -111,6 +113,8 @@ export interface ScopeFrame {
   isRange?: boolean;
   /** For ranges: the source variable being iterated (e.g., "prescriptions" from {{ range .prescriptions }}) */
   sourceVar?: TemplateVar;
+  /** Local variables defined in this scope (e.g. via $name := ...) */
+  locals?: Map<string, TemplateVar>;
 }
 
 // ─── Definition location ──────────────────────────────────────────────────────

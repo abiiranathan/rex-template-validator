@@ -1,3 +1,8 @@
+/**
+ * Package validator provides the core template validation logic for the Rex Template Validator.
+ * It handles AST traversal, scope resolution, and diagnostic generation.
+ */
+
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
@@ -68,8 +73,9 @@ export class TemplateValidator {
     ctx: TemplateContext,
     filePath: string
   ) {
+    const blockLocals = new Map<string, TemplateVar>();
     for (const node of nodes) {
-      this.validateNode(node, vars, scopeStack, errors, ctx, filePath);
+      this.validateNode(node, vars, scopeStack, blockLocals, errors, ctx, filePath);
     }
   }
 
@@ -77,25 +83,75 @@ export class TemplateValidator {
     node: TemplateNode,
     vars: Map<string, TemplateVar>,
     scopeStack: ScopeFrame[],  // never mutated; always copy before pushing
+    blockLocals: Map<string, TemplateVar>,
     errors: ValidationError[],
     ctx: TemplateContext,
     filePath: string
   ) {
     switch (node.kind) {
+      case 'assignment': {
+        const result = resolvePath(node.path, vars, scopeStack, blockLocals);
+        if (!result.found) {
+          errors.push({
+            message: `Expression "${node.assignExpr}" is not defined`,
+            line: node.line,
+            col: node.col,
+            severity: 'warning',
+            variable: node.assignExpr,
+          });
+        } else {
+          if (node.assignVars && node.assignVars.length > 0) {
+            if (node.assignVars.length === 1) {
+              blockLocals.set(node.assignVars[0], {
+                name: node.assignVars[0],
+                type: result.typeStr,
+                fields: result.fields,
+                isSlice: result.isSlice ?? false,
+                isMap: result.isMap,
+                elemType: result.elemType,
+                keyType: result.keyType,
+              });
+            } else if (node.assignVars.length === 2 && result.isMap) {
+              blockLocals.set(node.assignVars[0], {
+                name: node.assignVars[0],
+                type: result.keyType ?? 'unknown',
+                isSlice: false,
+              });
+              blockLocals.set(node.assignVars[1], {
+                name: node.assignVars[1],
+                type: result.elemType ?? 'unknown',
+                fields: result.fields,
+                isSlice: false,
+              });
+            } else if (node.assignVars.length === 2 && result.isSlice) {
+              blockLocals.set(node.assignVars[0], {
+                name: node.assignVars[0],
+                type: 'int',
+                isSlice: false,
+              });
+              blockLocals.set(node.assignVars[1], {
+                name: node.assignVars[1],
+                type: result.elemType ?? 'unknown',
+                fields: result.fields,
+                isSlice: false,
+              });
+            }
+          }
+        }
+        break;
+      }
+
       case 'variable': {
         // Skip bare dot and root context references — always valid
         if (node.path.length === 0) break;
         if (node.path[0] === '.') break; // bare "."
         if (node.path[0] === '$' && node.path.length === 1) break; // bare "$"
 
-        // Skip local template variables ($varName) — we don't track assignments
-        if (node.path[0].startsWith('$') && node.path[0] !== '$') break;
-
-        const result = resolvePath(node.path, vars, scopeStack);
+        const result = resolvePath(node.path, vars, scopeStack, blockLocals);
         if (!result.found) {
           const displayPath = node.path[0] === '$'
             ? '$.' + node.path.slice(1).join('.')
-            : '.' + node.path.join('.');
+            : node.path[0].startsWith('$') ? node.path.join('.') : '.' + node.path.join('.');
           errors.push({
             message: `Template variable "${displayPath}" is not defined in the render context`,
             line: node.line,
@@ -110,7 +166,7 @@ export class TemplateValidator {
       case 'range': {
         // Validate the range expression itself
         if (node.path.length > 0 && node.path[0] !== '.') {
-          const result = resolvePath(node.path, vars, scopeStack);
+          const result = resolvePath(node.path, vars, scopeStack, blockLocals);
           if (!result.found) {
             errors.push({
               message: `Range target ".${node.path.join('.')}" is not defined`,
@@ -121,10 +177,35 @@ export class TemplateValidator {
             });
           } else {
             // Build child scope from element type
-            const elemScope = this.buildRangeScope(node.path, vars, scopeStack, ctx);
-            const childStack = elemScope ? [...scopeStack, elemScope] : scopeStack;
-            if (node.children) {
-              this.validateNodes(node.children, vars, childStack, errors, ctx, filePath);
+            const elemScope = this.buildRangeScope(node.path, vars, scopeStack, ctx, blockLocals);
+            if (elemScope) {
+              if (node.keyVar || node.valVar) {
+                elemScope.locals = new Map();
+                if (node.keyVar && node.valVar) {
+                  elemScope.locals.set(node.keyVar, {
+                    name: node.keyVar,
+                    type: result.isMap ? (result.keyType ?? 'unknown') : 'int',
+                    isSlice: false,
+                  });
+                  elemScope.locals.set(node.valVar, {
+                    name: node.valVar,
+                    type: elemScope.typeStr,
+                    fields: elemScope.fields,
+                    isSlice: false,
+                  });
+                } else if (node.valVar) {
+                  elemScope.locals.set(node.valVar, {
+                    name: node.valVar,
+                    type: elemScope.typeStr,
+                    fields: elemScope.fields,
+                    isSlice: false,
+                  });
+                }
+              }
+              const childStack = [...scopeStack, elemScope];
+              if (node.children) {
+                this.validateNodes(node.children, vars, childStack, errors, ctx, filePath);
+              }
             }
             return; // children already handled
           }
@@ -134,7 +215,7 @@ export class TemplateValidator {
 
       case 'with': {
         if (node.path.length > 0 && node.path[0] !== '.') {
-          const result = resolvePath(node.path, vars, scopeStack);
+          const result = resolvePath(node.path, vars, scopeStack, blockLocals);
           if (!result.found) {
             errors.push({
               message: `".${node.path.join('.')}" is not defined`,
@@ -146,11 +227,24 @@ export class TemplateValidator {
           } else if (result.fields !== undefined) {
             // Push the resolved type as the new dot — even if fields is empty
             // (e.g. a primitive type wrapped in with), the scope still changes.
-            const childStack: ScopeFrame[] = [...scopeStack, {
+            const childScope: ScopeFrame = {
               key: '.',
               typeStr: result.typeStr,
               fields: result.fields,
-            }];
+            };
+            if (node.valVar) {
+              childScope.locals = new Map();
+              childScope.locals.set(node.valVar, {
+                name: node.valVar,
+                type: result.typeStr,
+                fields: result.fields,
+                isSlice: result.isSlice ?? false,
+                isMap: result.isMap,
+                elemType: result.elemType,
+                keyType: result.keyType,
+              });
+            }
+            const childStack: ScopeFrame[] = [...scopeStack, childScope];
             if (node.children) {
               this.validateNodes(node.children, vars, childStack, errors, ctx, filePath);
             }
@@ -163,7 +257,7 @@ export class TemplateValidator {
       case 'if': {
         // if doesn't change scope; just validate condition references then recurse
         if (node.path.length > 0 && node.path[0] !== '.') {
-          const result = resolvePath(node.path, vars, scopeStack);
+          const result = resolvePath(node.path, vars, scopeStack, blockLocals);
           if (!result.found) {
             errors.push({
               message: `".${node.path.join('.')}" is not defined`,
@@ -179,7 +273,7 @@ export class TemplateValidator {
       }
 
       case 'partial': {
-        this.validatePartial(node, vars, scopeStack, errors, ctx, filePath);
+        this.validatePartial(node, vars, scopeStack, blockLocals, errors, ctx, filePath);
         return; // partial handler recurses children itself
       }
 
@@ -205,51 +299,33 @@ export class TemplateValidator {
     path: string[],
     vars: Map<string, TemplateVar>,
     scopeStack: ScopeFrame[],
-    ctx: TemplateContext
+    ctx: TemplateContext,
+    blockLocals?: Map<string, TemplateVar>
   ): ScopeFrame | null {
-    // The range target should be a slice; its element type becomes the new dot
-    const topVar = vars.get(path[0]);
-    if (topVar?.isSlice) {
-      return {
-        key: '.',
-        typeStr: topVar.elemType ?? (topVar.type.startsWith('[]') ? topVar.type.slice(2) : topVar.type),
-        fields: topVar.fields,
-        isRange: true,
-        sourceVar: topVar,
-      };
-    }
-
-    // Try resolving through scope
-    const result = resolvePath(path, vars, scopeStack);
-    if (result.found && result.isSlice && result.fields) {
-      // Find the source variable from render calls to track definition
+    const result = resolvePath(path, vars, scopeStack, blockLocals);
+    if (result.found) {
       let sourceVar: TemplateVar | undefined;
-      for (const rc of ctx.renderCalls) {
-        const v = rc.vars.find(v => v.name === path[0]);
-        if (v?.isSlice) {
-          sourceVar = v;
-          break;
-        }
+      if (path[0].startsWith('$') && path[0] !== '$') {
+        sourceVar = blockLocals?.get(path[0]) || scopeStack.slice().reverse().find(f => f.locals?.has(path[0]))?.locals?.get(path[0]);
+      } else {
+        sourceVar = vars.get(path[0]);
       }
+
+      let typeStr = result.typeStr;
+      if (result.isSlice && typeStr.startsWith('[]')) {
+        typeStr = typeStr.slice(2);
+      } else if (result.isMap && result.elemType) {
+        typeStr = result.elemType;
+      }
+
       return {
         key: '.',
-        typeStr: result.isSlice && result.typeStr.startsWith('[]') ? result.typeStr.slice(2) : result.typeStr,
-        fields: result.fields,
+        typeStr: typeStr,
+        fields: result.fields ?? [],
         isRange: true,
         sourceVar,
       };
     }
-
-    // Try resolving without isSlice check — nested slices in scope frames
-    if (result.found) {
-      return {
-        key: '.',
-        typeStr: result.typeStr.startsWith('[]') ? result.typeStr.slice(2) : result.typeStr,
-        fields: result.fields ?? [],
-        isRange: true,
-      };
-    }
-
     return null;
   }
 
@@ -257,6 +333,7 @@ export class TemplateValidator {
     node: TemplateNode,
     vars: Map<string, TemplateVar>,
     scopeStack: ScopeFrame[],
+    blockLocals: Map<string, TemplateVar>,
     errors: ValidationError[],
     ctx: TemplateContext,
     filePath: string
@@ -268,7 +345,7 @@ export class TemplateValidator {
     if (contextArg !== '.' && contextArg !== '$') {
       const contextPath = this.parser.parseDotPath(contextArg);
       if (contextPath.length > 0 && contextPath[0] !== '.') {
-        const result = resolvePath(contextPath, vars, scopeStack);
+        const result = resolvePath(contextPath, vars, scopeStack, blockLocals);
         if (!result.found) {
           let errCol = node.col;
           if (node.rawText) {
@@ -298,7 +375,7 @@ export class TemplateValidator {
 
     // Named blocks (no file extension) — validate their body with the resolved context scope.
     if (!isFileBasedPartial(node.partialName)) {
-      this.validateNamedBlock(node, vars, scopeStack, errors, ctx, filePath);
+      this.validateNamedBlock(node, vars, scopeStack, blockLocals, errors, ctx, filePath);
       return;
     }
 
@@ -320,6 +397,7 @@ export class TemplateValidator {
       node.partialContext ?? '.',
       vars,
       scopeStack,
+      blockLocals,
       ctx
     );
 
@@ -350,6 +428,7 @@ export class TemplateValidator {
     callNode: TemplateNode,
     vars: Map<string, TemplateVar>,
     scopeStack: ScopeFrame[],
+    blockLocals: Map<string, TemplateVar>,
     errors: ValidationError[],
     ctx: TemplateContext,
     filePath: string
@@ -360,6 +439,7 @@ export class TemplateValidator {
       callNode.partialContext ?? '.',
       vars,
       scopeStack,
+      blockLocals,
       ctx
     );
 
@@ -392,7 +472,8 @@ export class TemplateValidator {
         const result = resolvePath(
           this.parser.parseDotPath(contextArg),
           vars,
-          scopeStack
+          scopeStack,
+          blockLocals
         );
         if (!result.found) {
           return;
@@ -450,6 +531,7 @@ export class TemplateValidator {
     contextArg: string,
     vars: Map<string, TemplateVar>,
     scopeStack: ScopeFrame[],
+    blockLocals: Map<string, TemplateVar>,
     ctx: TemplateContext
   ): Map<string, TemplateVar> {
     // "." → pass through all current vars + current dot scope
@@ -468,7 +550,7 @@ export class TemplateValidator {
 
     // ".SomePath[.Nested...]" → resolve that path and expose its fields
     const parsedPath = this.parser.parseDotPath(contextArg);
-    const result = resolvePath(parsedPath, vars, scopeStack);
+    const result = resolvePath(parsedPath, vars, scopeStack, blockLocals);
 
     if (!result.found || !result.fields) {
       return new Map();
@@ -502,7 +584,7 @@ export class TemplateValidator {
     const hit = this.findNodeAtPosition(nodes, position, ctx.vars, []);
     if (!hit) return null;
 
-    const { node, stack, vars: hitVars } = hit;
+    const { node, stack, vars: hitVars, locals: hitLocals } = hit;
 
     // ── Bare dot hover ────────────────────────────────────────────────────────
     const isBareVarDot = node.kind === 'variable' && node.path.length === 1 && node.path[0] === '.';
@@ -513,8 +595,8 @@ export class TemplateValidator {
     }
 
     // ── Normal variable hover ─────────────────────────────────────────────────
-    const result = resolvePath(node.path, hitVars, stack);
-    const varInfo = this.findVariableInfo(node.path, hitVars, stack);
+    const result = resolvePath(node.path, hitVars, stack, hitLocals);
+    const varInfo = this.findVariableInfo(node.path, hitVars, stack, hitLocals);
 
     if (!result.found) {
       return null;
@@ -522,7 +604,7 @@ export class TemplateValidator {
 
     const varName = node.path[0] === '.' ? '.' :
       node.path[0] === '$' ? '$.' + node.path.slice(1).join('.') :
-        '.' + node.path.join('.');
+        node.path[0].startsWith('$') ? node.path.join('.') : '.' + node.path.join('.');
     const md = new vscode.MarkdownString();
     md.isTrusted = true;
 
@@ -603,38 +685,58 @@ export class TemplateValidator {
   private findVariableInfo(
     path: string[],
     vars: Map<string, TemplateVar>,
-    scopeStack: ScopeFrame[]
+    scopeStack: ScopeFrame[],
+    blockLocals?: Map<string, TemplateVar>
   ): { typeStr: string; doc?: string } | null {
     if (path.length === 0) return null;
 
-    const topVarName = path[0];
-    if (topVarName === '.' || topVarName === '$') return null;
-
-    // Check top-level vars
-    const topVar = vars.get(topVarName);
-    if (!topVar) {
-      // Check scope stack dot frame
-      const dotFrame = scopeStack.slice().reverse().find(f => f.key === '.');
-      if (dotFrame?.fields) {
-        const field = dotFrame.fields.find(f => f.name === topVarName);
-        if (field) {
-          return { typeStr: field.type, doc: field.doc };
-        }
-      }
-      return null;
+    let topVarName = path[0];
+    let searchPath = path;
+    if (topVarName === '$' && path.length > 1) {
+      topVarName = path[1];
+      searchPath = path.slice(1);
     }
 
-    if (path.length === 1) {
+    if (topVarName === '.' || topVarName === '$') return null;
+
+    let topVar: TemplateVar | undefined;
+    if (topVarName.startsWith('$') && topVarName !== '$') {
+      topVar = blockLocals?.get(topVarName);
+      if (!topVar) {
+        for (let i = scopeStack.length - 1; i >= 0; i--) {
+          if (scopeStack[i].locals?.has(topVarName)) {
+            topVar = scopeStack[i].locals!.get(topVarName);
+            break;
+          }
+        }
+      }
+    } else {
+      topVar = vars.get(topVarName);
+      if (!topVar) {
+        const dotFrame = scopeStack.slice().reverse().find(f => f.key === '.');
+        if (dotFrame?.fields) {
+          const field = dotFrame.fields.find(f => f.name === topVarName);
+          if (field) {
+            return { typeStr: field.type, doc: field.doc };
+          }
+        }
+        return null;
+      }
+    }
+
+    if (!topVar) return null;
+
+    if (searchPath.length === 1) {
       return { typeStr: topVar.type, doc: topVar.doc };
     }
 
-    // Navigate through nested fields to find the deepest one's info
     let fields = topVar.fields ?? [];
-    for (let i = 1; i < path.length; i++) {
-      const field = fields.find(f => f.name === path[i]);
+    for (let i = 1; i < searchPath.length; i++) {
+      if (searchPath[i] === '[]') continue; // Skip index unwrapping for doc lookup
+      const field = fields.find(f => f.name === searchPath[i]);
       if (!field) return null;
 
-      if (i === path.length - 1) {
+      if (i === searchPath.length - 1) {
         return { typeStr: field.type, doc: field.doc };
       }
 
@@ -665,12 +767,56 @@ export class TemplateValidator {
     if (!hit) return null;
 
     const { node, stack, vars: hitVars } = hit;
-    const topVarName = node.path[0];
-    if (!topVarName || topVarName === '.') return null;
+
+    // Determine which segment is hovered
+    let hoveredIndex = node.path.length - 1;
+    if (node.rawText) {
+      const cursorOffset = position.character - (node.col - 1);
+      let pathStr = node.path[0] === '$' ? '$.' + node.path.slice(1).join('.') : '.' + node.path.join('.');
+      if (node.path[0].startsWith('$') && node.path[0] !== '$') {
+        pathStr = node.path.join('.');
+      }
+
+      const pathStart = node.rawText.indexOf(pathStr);
+      if (pathStart !== -1) {
+        const offsetInPath = cursorOffset - pathStart;
+        if (offsetInPath >= 0 && offsetInPath <= pathStr.length) {
+          let currentLen = 0;
+          const segments = pathStr.split('.');
+          for (let i = 0; i < segments.length; i++) {
+            currentLen += segments[i].length + 1; // +1 for the dot
+            if (offsetInPath <= currentLen) {
+              if (node.path[0] === '$') {
+                hoveredIndex = i === 0 ? 0 : i;
+              } else if (node.path[0].startsWith('$')) {
+                hoveredIndex = i;
+              } else {
+                hoveredIndex = i === 0 ? 0 : i - 1;
+              }
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    const targetPath = node.path.slice(0, hoveredIndex + 1);
+    let pathForDef = targetPath;
+    let topVarName = pathForDef[0];
+    if (topVarName === '$' && pathForDef.length > 1) {
+      topVarName = pathForDef[1];
+      pathForDef = pathForDef.slice(1);
+    }
+
+    if (!topVarName || topVarName === '.' || topVarName === '$') return null;
 
     // Declared template variables ($name := ...)
     if (topVarName.startsWith('$') && topVarName !== '$') {
-      const declaredVar = this.findDeclaredVariableDefinition(node, nodes, position, ctx);
+      const declaredVar = this.findDeclaredVariableDefinition(
+        node, nodes, position, ctx,
+        hit.stack,   // ← scope stack with range frame
+        hit.locals   // ← block locals
+      );
       if (declaredVar) return declaredVar;
       const rangeVarResult = this.findRangeAssignedVariable(node, stack, ctx);
       if (rangeVarResult) return rangeVarResult;
@@ -678,12 +824,12 @@ export class TemplateValidator {
 
     // For partials: check if the variable is a field of the partial source variable
     if (ctx.partialSourceVar) {
-      const loc = this.findDefinitionInVar(node.path, ctx.partialSourceVar, ctx);
+      const loc = this.findDefinitionInVar(pathForDef, ctx.partialSourceVar, ctx);
       if (loc) return loc;
     }
 
     // Use scope stack for definitions
-    const stackDefLoc = this.findDefinitionInScope(node, hitVars, stack, ctx);
+    const stackDefLoc = this.findDefinitionInScope(pathForDef, hitVars, stack, ctx);
     if (stackDefLoc) return stackDefLoc;
 
     // Find the variable definition from render calls, navigating nested path
@@ -691,7 +837,7 @@ export class TemplateValidator {
       const passedVar = rc.vars.find(v => v.name === topVarName);
       if (passedVar) {
         // Navigate to the specific field if path has more parts
-        const fieldLoc = this.navigateToFieldDefinition(node.path.slice(1), passedVar.fields ?? [], ctx);
+        const fieldLoc = this.navigateToFieldDefinition(pathForDef.slice(1), passedVar.fields ?? [], ctx);
         if (fieldLoc) return fieldLoc;
 
         if (passedVar.defFile && passedVar.defLine) {
@@ -716,7 +862,7 @@ export class TemplateValidator {
     }
 
     // Handle variables inside range blocks
-    return this.findRangeVariableDefinition(node, stack, ctx);
+    return this.findRangeVariableDefinition(pathForDef, stack, ctx);
   }
 
   /**
@@ -732,6 +878,7 @@ export class TemplateValidator {
 
     let current = fields;
     for (let i = 0; i < fieldPath.length; i++) {
+      if (fieldPath[i] === '[]') continue;
       const field = current.find(f => f.name === fieldPath[i]);
       if (!field) return null;
 
@@ -765,7 +912,7 @@ export class TemplateValidator {
     let currentTarget: TemplateVar | FieldInfo = sourceVar;
 
     for (const pathPart of path) {
-      if (pathPart === '.' || pathPart === '$') continue;
+      if (pathPart === '.' || pathPart === '$' || pathPart === '[]') continue;
 
       const field = currentFields.find(f => f.name === pathPart);
       if (!field) {
@@ -799,19 +946,25 @@ export class TemplateValidator {
   }
 
   private findDefinitionInScope(
-    node: TemplateNode,
+    targetPath: string[],
     vars: Map<string, TemplateVar>,
     scopeStack: ScopeFrame[],
     ctx: TemplateContext
   ): vscode.Location | null {
-    const topVarName = node.path[0];
+    let topVarName = targetPath[0];
+    let searchPath = targetPath;
+    if (topVarName === '$' && targetPath.length > 1) {
+      topVarName = targetPath[1];
+      searchPath = targetPath.slice(1);
+    }
+
     if (!topVarName || topVarName === '.' || topVarName === '$') return null;
 
     // Check top-level vars — navigate nested path for definition
     const topVar = vars.get(topVarName);
     if (topVar) {
-      if (node.path.length > 1) {
-        const loc = this.navigateToFieldDefinition(node.path.slice(1), topVar.fields ?? [], ctx);
+      if (searchPath.length > 1) {
+        const loc = this.navigateToFieldDefinition(searchPath.slice(1), topVar.fields ?? [], ctx);
         if (loc) return loc;
       }
       if (topVar.defFile && topVar.defLine) {
@@ -829,7 +982,7 @@ export class TemplateValidator {
     const dotFrame = scopeStack.slice().reverse().find(f => f.key === '.');
     if (dotFrame?.fields) {
       // The entire path (from index 0) should be resolved against the dot frame fields
-      const loc = this.navigateToFieldDefinition(node.path, dotFrame.fields, ctx);
+      const loc = this.navigateToFieldDefinition(searchPath, dotFrame.fields, ctx);
       if (loc) return loc;
     }
 
@@ -840,16 +993,17 @@ export class TemplateValidator {
     targetNode: TemplateNode,
     nodes: TemplateNode[],
     position: vscode.Position,
-    ctx: TemplateContext
+    ctx: TemplateContext,
+    scopeStack: ScopeFrame[],
+    blockLocals: Map<string, TemplateVar>
   ): vscode.Location | null {
     const varName = targetNode.path[0];
     if (!varName?.startsWith('$')) return null;
 
     for (const node of nodes) {
-      const result = this.findVariableAssignment(node, varName, position, ctx);
+      const result = this.findVariableAssignment(node, varName, position, ctx, scopeStack, blockLocals);
       if (result) return result;
     }
-
     return null;
   }
 
@@ -857,16 +1011,27 @@ export class TemplateValidator {
     node: TemplateNode,
     varName: string,
     position: vscode.Position,
-    ctx: TemplateContext
+    ctx: TemplateContext,
+    scopeStack: ScopeFrame[],          // NEW
+    blockLocals: Map<string, TemplateVar> // NEW
   ): vscode.Location | null {
-    if (node.kind === 'variable' && node.rawText.includes(':=')) {
-      const assignMatch = node.rawText.match(/\{\{\s*\$([\w]+)\s*:=\s*(.+?)\s*\}\}/);
-      if (assignMatch && '$' + assignMatch[1] === varName) {
-        const rhs = assignMatch[2].trim();
+    if (node.kind === 'assignment' && node.assignVars?.includes(varName)) {
+      if (node.assignExpr) {
+        const rhsPath = this.parser.parseDotPath(node.assignExpr);
+
+        // Try resolving via scope stack first (handles range-element dot fields)
+        const dotFrame = scopeStack.slice().reverse().find(f => f.key === '.');
+        if (dotFrame?.fields) {
+          const fieldPath = rhsPath[0] === '.' ? rhsPath.slice(1) : rhsPath;
+          const loc = this.navigateToFieldDefinition(fieldPath, dotFrame.fields, ctx);
+          if (loc) return loc;
+        }
+
+        // Fallback: old root-scope resolution
         const rhsNode: TemplateNode = {
           kind: 'variable',
-          path: this.parser.parseDotPath(rhs),
-          rawText: rhs,
+          path: rhsPath,
+          rawText: node.assignExpr,
           line: node.line,
           col: node.col,
         };
@@ -876,11 +1041,10 @@ export class TemplateValidator {
 
     if (node.children) {
       for (const child of node.children) {
-        const result = this.findVariableAssignment(child, varName, position, ctx);
+        const result = this.findVariableAssignment(child, varName, position, ctx, scopeStack, blockLocals);
         if (result) return result;
       }
     }
-
     return null;
   }
 
@@ -933,13 +1097,13 @@ export class TemplateValidator {
   }
 
   private findRangeVariableDefinition(
-    node: TemplateNode,
+    targetPath: string[],
     scopeStack: ScopeFrame[],
     ctx: TemplateContext
   ): vscode.Location | null {
-    if (node.path.length === 0 || node.path[0] === '.' || node.path[0] === '$') return null;
+    if (targetPath.length === 0 || targetPath[0] === '.' || targetPath[0] === '$') return null;
 
-    const firstFieldName = node.path[0];
+    const firstFieldName = targetPath[0];
 
     for (let i = scopeStack.length - 1; i >= 0; i--) {
       const frame = scopeStack[i];
@@ -949,8 +1113,8 @@ export class TemplateValidator {
       if (!field) continue;
 
       // Navigate nested path within range element fields
-      if (node.path.length > 1) {
-        const loc = this.navigateToFieldDefinition(node.path.slice(1), field.fields ?? [], ctx);
+      if (targetPath.length > 1) {
+        const loc = this.navigateToFieldDefinition(targetPath.slice(1), field.fields ?? [], ctx);
         if (loc) return loc;
       }
 
@@ -1228,12 +1392,54 @@ export class TemplateValidator {
     vars: Map<string, TemplateVar>,
     scopeStack: ScopeFrame[],
     rootNodes?: TemplateNode[]
-  ): { node: TemplateNode; stack: ScopeFrame[]; vars: Map<string, TemplateVar> } | null {
+  ): { node: TemplateNode; stack: ScopeFrame[]; vars: Map<string, TemplateVar>; locals: Map<string, TemplateVar> } | null {
     if (!rootNodes) rootNodes = nodes;
+    const blockLocals = new Map<string, TemplateVar>();
 
     for (const node of nodes) {
       const startLine = node.line - 1;
       const startCol = node.col - 1;
+
+      if (node.kind === 'assignment') {
+        const result = resolvePath(node.path, vars, scopeStack, blockLocals);
+        if (result.found && node.assignVars) {
+          if (node.assignVars.length === 1) {
+            blockLocals.set(node.assignVars[0], {
+              name: node.assignVars[0],
+              type: result.typeStr,
+              fields: result.fields,
+              isSlice: result.isSlice ?? false,
+              isMap: result.isMap,
+              elemType: result.elemType,
+              keyType: result.keyType,
+            });
+          } else if (node.assignVars.length === 2 && result.isMap) {
+            blockLocals.set(node.assignVars[0], {
+              name: node.assignVars[0],
+              type: result.keyType ?? 'unknown',
+              isSlice: false,
+            });
+            blockLocals.set(node.assignVars[1], {
+              name: node.assignVars[1],
+              type: result.elemType ?? 'unknown',
+              fields: result.fields,
+              isSlice: false,
+            });
+          } else if (node.assignVars.length === 2 && result.isSlice) {
+            blockLocals.set(node.assignVars[0], {
+              name: node.assignVars[0],
+              type: 'int',
+              isSlice: false,
+            });
+            blockLocals.set(node.assignVars[1], {
+              name: node.assignVars[1],
+              type: result.elemType ?? 'unknown',
+              fields: result.fields,
+              isSlice: false,
+            });
+          }
+        }
+      }
 
       // ── Variable leaf ──────────────────────────────────────────────────────
       if (node.kind === 'variable') {
@@ -1243,7 +1449,7 @@ export class TemplateValidator {
           position.character >= startCol &&
           position.character <= endCol
         ) {
-          return { node, stack: scopeStack, vars };
+          return { node, stack: scopeStack, vars, locals: blockLocals };
         }
         continue;
       }
@@ -1256,7 +1462,7 @@ export class TemplateValidator {
           position.character >= startCol &&
           position.character <= endCol
         ) {
-          return { node, stack: scopeStack, vars };
+          return { node, stack: scopeStack, vars, locals: blockLocals };
         }
         continue;
       }
@@ -1273,7 +1479,7 @@ export class TemplateValidator {
       // Cursor on the opening tag itself → return with current scope
       const openEndCol = startCol + node.rawText.length;
       if (position.line === startLine && position.character <= openEndCol) {
-        return { node, stack: scopeStack, vars };
+        return { node, stack: scopeStack, vars, locals: blockLocals };
       }
 
       // Cursor is inside the body — build child scope mirroring validateNode
@@ -1281,7 +1487,7 @@ export class TemplateValidator {
 
         case 'range': {
           if (node.path.length > 0 && node.path[0] !== '.') {
-            const result = resolvePath(node.path, vars, scopeStack);
+            const result = resolvePath(node.path, vars, scopeStack, blockLocals);
             if (result.found) {
               let sourceVar: TemplateVar | undefined = vars.get(node.path[0]);
               if (!sourceVar) {
@@ -1293,14 +1499,41 @@ export class TemplateValidator {
               }
               const elemTypeStr = result.isSlice && result.typeStr.startsWith('[]')
                 ? result.typeStr.slice(2)
-                : result.typeStr;
-              const childStack: ScopeFrame[] = [...scopeStack, {
+                : result.isMap && result.elemType ? result.elemType : result.typeStr;
+
+              const elemScope: ScopeFrame = {
                 key: '.',
                 typeStr: elemTypeStr,
                 fields: result.fields ?? [],
                 isRange: true,
                 sourceVar,
-              }];
+              };
+
+              if (node.keyVar || node.valVar) {
+                elemScope.locals = new Map();
+                if (node.keyVar && node.valVar) {
+                  elemScope.locals.set(node.keyVar, {
+                    name: node.keyVar,
+                    type: result.isMap ? (result.keyType ?? 'unknown') : 'int',
+                    isSlice: false,
+                  });
+                  elemScope.locals.set(node.valVar, {
+                    name: node.valVar,
+                    type: elemScope.typeStr,
+                    fields: elemScope.fields,
+                    isSlice: false,
+                  });
+                } else if (node.valVar) {
+                  elemScope.locals.set(node.valVar, {
+                    name: node.valVar,
+                    type: elemScope.typeStr,
+                    fields: elemScope.fields,
+                    isSlice: false,
+                  });
+                }
+              }
+
+              const childStack: ScopeFrame[] = [...scopeStack, elemScope];
               if (node.children) {
                 const found = this.findNodeAtPosition(node.children, position, vars, childStack, rootNodes);
                 if (found) return found;
@@ -1312,11 +1545,24 @@ export class TemplateValidator {
 
         case 'with': {
           if (node.path.length > 0 && node.path[0] !== '.') {
-            const result = resolvePath(node.path, vars, scopeStack);
+            const result = resolvePath(node.path, vars, scopeStack, blockLocals);
             if (result.found) {
-              const childStack: ScopeFrame[] = [...scopeStack, {
+              const childScope: ScopeFrame = {
                 key: '.', typeStr: result.typeStr, fields: result.fields ?? [],
-              }];
+              };
+              if (node.valVar) {
+                childScope.locals = new Map();
+                childScope.locals.set(node.valVar, {
+                  name: node.valVar,
+                  type: result.typeStr,
+                  fields: result.fields,
+                  isSlice: result.isSlice ?? false,
+                  isMap: result.isMap,
+                  elemType: result.elemType,
+                  keyType: result.keyType,
+                });
+              }
+              const childStack: ScopeFrame[] = [...scopeStack, childScope];
               if (node.children) {
                 const found = this.findNodeAtPosition(node.children, position, vars, childStack, rootNodes);
                 if (found) return found;
@@ -1337,7 +1583,7 @@ export class TemplateValidator {
         case 'block': {
           // {{ block "name" .Expr }} — body scope is .Expr as the new dot
           if (node.path.length > 0 && node.path[0] !== '.') {
-            const result = resolvePath(node.path, vars, scopeStack);
+            const result = resolvePath(node.path, vars, scopeStack, blockLocals);
             if (result.found) {
               const childStack: ScopeFrame[] = [...scopeStack, {
                 key: '.', typeStr: result.typeStr, fields: result.fields ?? [],
@@ -1380,7 +1626,7 @@ export class TemplateValidator {
                   }
                 } else {
                   const resolvedPath = this.parser.parseDotPath(contextArg);
-                  const callResult = resolvePath(resolvedPath, vars, scopeStack);
+                  const callResult = resolvePath(resolvedPath, vars, scopeStack, blockLocals);
                   if (callResult.found) {
                     const childVars = this.fieldsToVarMap(callResult.fields ?? []);
                     const childStack: ScopeFrame[] = [...scopeStack, {
@@ -1463,7 +1709,7 @@ export class TemplateValidator {
     const content = document.getText();
     const nodes = this.parser.parse(content);
 
-    const { stack } = this.findScopeAtPosition(nodes, position, ctx.vars, [], nodes, ctx) || { stack: [] as ScopeFrame[] };
+    const { stack, locals } = this.findScopeAtPosition(nodes, position, ctx.vars, [], nodes, ctx) || { stack: [] as ScopeFrame[], locals: new Map<string, TemplateVar>() };
 
     const lineText = document.lineAt(position.line).text;
     const linePrefix = lineText.slice(0, position.character);
@@ -1488,7 +1734,7 @@ export class TemplateValidator {
     let fields: FieldInfo[] = [];
 
     if (lookupPath.length === 1 && lookupPath[0] === '.') {
-      const res = resolvePath(['.'], ctx.vars, stack);
+      const res = resolvePath(['.'], ctx.vars, stack, locals);
       if (res.found && res.fields) {
         fields = res.fields;
       } else {
@@ -1497,7 +1743,7 @@ export class TemplateValidator {
     } else if (lookupPath.length === 1 && lookupPath[0] === '$') {
       fields = [...ctx.vars.values()] as any;
     } else {
-      const res = resolvePath(lookupPath, ctx.vars, stack);
+      const res = resolvePath(lookupPath, ctx.vars, stack, locals);
       if (res.found && res.fields) {
         fields = res.fields;
       }
@@ -1525,8 +1771,51 @@ export class TemplateValidator {
     scopeStack: ScopeFrame[],
     rootNodes: TemplateNode[],
     ctx: TemplateContext
-  ): { stack: ScopeFrame[] } | null {
+  ): { stack: ScopeFrame[], locals: Map<string, TemplateVar> } | null {
+    const blockLocals = new Map<string, TemplateVar>();
+
     for (const node of nodes) {
+      if (node.kind === 'assignment') {
+        const result = resolvePath(node.path, vars, scopeStack, blockLocals);
+        if (result.found && node.assignVars) {
+          if (node.assignVars.length === 1) {
+            blockLocals.set(node.assignVars[0], {
+              name: node.assignVars[0],
+              type: result.typeStr,
+              fields: result.fields,
+              isSlice: result.isSlice ?? false,
+              isMap: result.isMap,
+              elemType: result.elemType,
+              keyType: result.keyType,
+            });
+          } else if (node.assignVars.length === 2 && result.isMap) {
+            blockLocals.set(node.assignVars[0], {
+              name: node.assignVars[0],
+              type: result.keyType ?? 'unknown',
+              isSlice: false,
+            });
+            blockLocals.set(node.assignVars[1], {
+              name: node.assignVars[1],
+              type: result.elemType ?? 'unknown',
+              fields: result.fields,
+              isSlice: false,
+            });
+          } else if (node.assignVars.length === 2 && result.isSlice) {
+            blockLocals.set(node.assignVars[0], {
+              name: node.assignVars[0],
+              type: 'int',
+              isSlice: false,
+            });
+            blockLocals.set(node.assignVars[1], {
+              name: node.assignVars[1],
+              type: result.elemType ?? 'unknown',
+              fields: result.fields,
+              isSlice: false,
+            });
+          }
+        }
+      }
+
       if (node.endLine === undefined) continue;
 
       const startLine = node.line - 1;
@@ -1544,26 +1833,63 @@ export class TemplateValidator {
 
         switch (node.kind) {
           case 'range': {
-            const elemScope = this.buildRangeScope(node.path, vars, scopeStack, ctx);
+            const elemScope = this.buildRangeScope(node.path, vars, scopeStack, ctx, blockLocals);
             if (elemScope) {
+              if (node.keyVar || node.valVar) {
+                elemScope.locals = new Map();
+                const result = resolvePath(node.path, vars, scopeStack, blockLocals);
+                if (node.keyVar && node.valVar) {
+                  elemScope.locals.set(node.keyVar, {
+                    name: node.keyVar,
+                    type: result.isMap ? (result.keyType ?? 'unknown') : 'int',
+                    isSlice: false,
+                  });
+                  elemScope.locals.set(node.valVar, {
+                    name: node.valVar,
+                    type: elemScope.typeStr,
+                    fields: elemScope.fields,
+                    isSlice: false,
+                  });
+                } else if (node.valVar) {
+                  elemScope.locals.set(node.valVar, {
+                    name: node.valVar,
+                    type: elemScope.typeStr,
+                    fields: elemScope.fields,
+                    isSlice: false,
+                  });
+                }
+              }
               childStack = [...scopeStack, elemScope];
             }
             break;
           }
           case 'with': {
             if (node.path.length > 0 && node.path[0] !== '.') {
-              const result = resolvePath(node.path, vars, scopeStack);
+              const result = resolvePath(node.path, vars, scopeStack, blockLocals);
               if (result.found) {
-                childStack = [...scopeStack, {
+                const childScope: ScopeFrame = {
                   key: '.', typeStr: result.typeStr, fields: result.fields ?? [],
-                }];
+                };
+                if (node.valVar) {
+                  childScope.locals = new Map();
+                  childScope.locals.set(node.valVar, {
+                    name: node.valVar,
+                    type: result.typeStr,
+                    fields: result.fields,
+                    isSlice: result.isSlice ?? false,
+                    isMap: result.isMap,
+                    elemType: result.elemType,
+                    keyType: result.keyType,
+                  });
+                }
+                childStack = [...scopeStack, childScope];
               }
             }
             break;
           }
           case 'block': {
             if (node.path.length > 0 && node.path[0] !== '.') {
-              const result = resolvePath(node.path, vars, scopeStack);
+              const result = resolvePath(node.path, vars, scopeStack, blockLocals);
               if (result.found) {
                 childStack = [...scopeStack, {
                   key: '.', typeStr: result.typeStr, fields: result.fields ?? [],
@@ -1592,7 +1918,7 @@ export class TemplateValidator {
           if (inner) return inner;
         }
 
-        return { stack: childStack };
+        return { stack: childStack, locals: blockLocals };
       }
     }
 
