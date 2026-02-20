@@ -1,12 +1,13 @@
 {
     "global": {
-        "currentUser": "*models.User",
+        "currentUser": "*handlers.User",
         "csrfToken": "string",
         "appVersion": "string",
         "isAuthenticated": "bool"
     },
     "views/inpatient/treatment-chart.html": {
-        "user": "*models.User",
-        "availableRoles": "[]string"
+        "user": "*handlers.User",
+        "availableRoles": "[]string",
+        "roles": "map[string]*handlers.User"
     }
 }

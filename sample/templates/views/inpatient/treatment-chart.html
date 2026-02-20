@@ -41,6 +41,14 @@
     <div>{{ .Name }}</div>
     {{ end }}
 
+    <!-- Passed through a context-file -->
+    {{ $.currentUser.Name }}
+
+    <!-- Map -->
+    {{ for $k, $v range := $.roles }}
+    {{ $k }}: {{ $v }}
+    {{ end }}
+
 </body>
 
 </html>
