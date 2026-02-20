@@ -39,7 +39,7 @@ type Doctor struct {
 
 // Drug represents a drug
 type Drug struct {
-	Name     string
+	Name     string // Drug Name
 	Quantity int
 	Price    float64
 }

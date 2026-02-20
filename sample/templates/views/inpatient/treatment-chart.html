@@ -37,7 +37,7 @@
     {{ end }}
     <a href="{{ .PathPrefix }}/new">New Entry</a>
     {{ template "views/partials/footer.html" .visit }}
-    {{ define "billed-drug" }}
+    {{ block "billed-drug" }}
     <div>{{ .Name }}</div>
     {{ end }}
 
