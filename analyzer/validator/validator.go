@@ -468,10 +468,13 @@ func createScopeFromExpression(expr string, scopeStack []ScopeType, varMap map[s
 	if currentField == nil {
 		if v, ok := varMap[firstPart]; ok {
 			currentField = &FieldInfo{
-				Name:    v.Name,
-				TypeStr: v.TypeStr,
-				Fields:  v.Fields,
-				IsSlice: v.IsSlice,
+				Name:     v.Name,
+				TypeStr:  v.TypeStr,
+				Fields:   v.Fields,
+				IsSlice:  v.IsSlice,
+				IsMap:    v.IsMap,
+				KeyType:  v.KeyType,
+				ElemType: v.ElemType,
 			}
 		}
 	}
@@ -497,11 +500,14 @@ func createScopeFromExpression(expr string, scopeStack []ScopeType, varMap map[s
 	}
 
 	return ScopeType{
-		IsRoot:  false,
-		VarName: expr,
-		TypeStr: currentField.TypeStr,
-		Fields:  currentField.Fields,
-		IsSlice: currentField.IsSlice,
+		IsRoot:   false,
+		VarName:  expr,
+		TypeStr:  currentField.TypeStr,
+		Fields:   currentField.Fields,
+		IsSlice:  currentField.IsSlice,
+		IsMap:    currentField.IsMap,
+		KeyType:  currentField.KeyType,
+		ElemType: currentField.ElemType,
 	}
 }
 
@@ -539,7 +545,7 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 
 		if foundField != nil {
 			if len(parts) > 2 {
-				return validateNestedFields(parts[2:], foundField.Fields, foundField.TypeStr, varExpr, line, col, templateName)
+				return validateNestedFields(parts[2:], foundField.Fields, foundField.TypeStr, foundField.IsMap, foundField.ElemType, varExpr, line, col, templateName)
 			}
 			return nil
 		}
@@ -578,7 +584,7 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 		rootScope := scopeStack[0]
 		for _, f := range rootScope.Fields {
 			if f.Name == rootVar {
-				return validateNestedFields(parts[2:], f.Fields, f.TypeStr, varExpr, line, col, templateName)
+				return validateNestedFields(parts[2:], f.Fields, f.TypeStr, f.IsMap, f.ElemType, varExpr, line, col, templateName)
 			}
 		}
 
@@ -592,24 +598,85 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 		}
 	}
 
-	return validateNestedFields(parts[2:], rootVarInfo.Fields, rootVarInfo.TypeStr, varExpr, line, col, templateName)
+	return validateNestedFields(parts[2:], rootVarInfo.Fields, rootVarInfo.TypeStr, rootVarInfo.IsMap, rootVarInfo.ElemType, varExpr, line, col, templateName)
 }
 
 // validateNestedFields validates a field path against available fields.
 // Supports unlimited depth by recursing through the FieldInfo tree.
-func validateNestedFields(fieldParts []string, fields []FieldInfo, parentTypeName, fullExpr string, line, col int, templateName string) *ValidationResult {
+func validateNestedFields(fieldParts []string, fields []FieldInfo, parentTypeName string, isMap bool, elemType string, fullExpr string, line, col int, templateName string) *ValidationResult {
 	currentFields := fields
 	parentType := parentTypeName
+	currentIsMap := isMap
+	currentElemType := elemType
 
 	for _, fieldName := range fieldParts {
+		if currentIsMap {
+			// This part is a map key access.
+			// The result is the value type.
+			// We need to parse currentElemType to know if the value is itself a map, slice, or struct.
+
+			// Unwrap pointers from type string first
+			baseType := currentElemType
+			for strings.HasPrefix(baseType, "*") {
+				baseType = baseType[1:]
+			}
+
+			newIsMap := false
+			newElemType := ""
+
+			if strings.HasPrefix(baseType, "map[") {
+				// Parse map[Key]Value with balanced brackets
+				depth := 0
+				splitIdx := -1
+				// baseType starts with "map[", so the first bracket is at index 3
+				for i := 3; i < len(baseType); i++ {
+					if baseType[i] == '[' {
+						depth++
+					} else if baseType[i] == ']' {
+						depth--
+						if depth == 0 {
+							splitIdx = i
+							break
+						}
+					}
+				}
+
+				if splitIdx != -1 {
+					// keyType := baseType[4:splitIdx]
+					valType := baseType[splitIdx+1:]
+					newIsMap = true
+					newElemType = strings.TrimSpace(valType)
+				}
+			} else if strings.HasPrefix(baseType, "[]") {
+				// Slice
+				newElemType = baseType[2:]
+			}
+
+			currentIsMap = newIsMap
+			if newElemType != "" {
+				currentElemType = newElemType
+			} else {
+				// It's a struct or basic type.
+				// Parent type becomes the element type.
+				parentType = currentElemType
+			}
+
+			// Fields remain the same because they represent the struct fields at the bottom
+			continue
+		}
+
 		found := false
 		var nextFields []FieldInfo
+		var nextIsMap bool
+		var nextElemType string
 
 		for _, f := range currentFields {
 			if f.Name == fieldName {
 				found = true
 				nextFields = f.Fields
 				parentType = f.TypeStr
+				nextIsMap = f.IsMap
+				nextElemType = f.ElemType
 				break
 			}
 		}
@@ -629,6 +696,8 @@ func validateNestedFields(fieldParts []string, fields []FieldInfo, parentTypeNam
 		}
 
 		currentFields = nextFields
+		currentIsMap = nextIsMap
+		currentElemType = nextElemType
 	}
 
 	return nil

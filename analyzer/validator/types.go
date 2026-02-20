@@ -6,7 +6,10 @@ type TemplateVar struct {
 	TypeStr  string      `json:"type"`
 	Fields   []FieldInfo `json:"fields,omitempty"`
 	IsSlice  bool        `json:"isSlice"`
+	IsMap    bool        `json:"isMap"`
+	KeyType  string      `json:"keyType,omitempty"`
 	ElemType string      `json:"elemType,omitempty"`
+
 	// Definition location in Go source (for go-to-definition)
 	DefFile string `json:"defFile,omitempty"` // Go file where the variable is defined
 	DefLine int    `json:"defLine,omitempty"` // Line number where the variable is defined
@@ -17,11 +20,14 @@ type TemplateVar struct {
 
 // FieldInfo represents a field in a struct type
 type FieldInfo struct {
-	Name    string      `json:"name"`
-	TypeStr string      `json:"type"`
-	Fields  []FieldInfo `json:"fields,omitempty"`
-	IsSlice bool        `json:"isSlice"`
-	Methods []string    `json:"methods,omitempty"`
+	Name     string      `json:"name"`
+	TypeStr  string      `json:"type"`
+	Fields   []FieldInfo `json:"fields,omitempty"`
+	IsSlice  bool        `json:"isSlice"`
+	IsMap    bool        `json:"isMap"`
+	KeyType  string      `json:"keyType,omitempty"`
+	ElemType string      `json:"elemType,omitempty"`
+	Methods  []string    `json:"methods,omitempty"`
 	// Definition location in Go source (for go-to-definition)
 	DefFile string `json:"defFile,omitempty"` // Go file where the field is defined
 	DefLine int    `json:"defLine,omitempty"` // Line number where the field is defined
@@ -66,6 +72,8 @@ type ScopeType struct {
 	VarName  string // Name of the variable (e.g., "breadcrumbs")
 	TypeStr  string // Type string (e.g., "handlers.Breadcrumbs")
 	ElemType string // For slices: element type (e.g., "handlers.Breadcrumb")
+	KeyType  string // For maps: key type
 	Fields   []FieldInfo
 	IsSlice  bool
+	IsMap    bool
 }

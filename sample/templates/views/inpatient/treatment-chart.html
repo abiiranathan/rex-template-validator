@@ -45,7 +45,7 @@
     {{ $.currentUser.Name }}
 
     <!-- Map -->
-    {{ for $k, $v range := $.roles }}
+    {{ range $k, $v := .roles }}
     {{ $k }}: {{ $v }}
     {{ end }}
 

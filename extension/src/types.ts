@@ -5,6 +5,9 @@ export interface FieldInfo {
   type: string;
   fields?: FieldInfo[];
   isSlice: boolean;
+  isMap?: boolean;
+  keyType?: string;
+  elemType?: string;
   methods?: string[];
   // Definition location in Go source (for go-to-definition)
   defFile?: string;  // Go file where the field is defined
@@ -19,6 +22,8 @@ export interface TemplateVar {
   type: string;
   fields?: FieldInfo[];
   isSlice: boolean;
+  isMap?: boolean;
+  keyType?: string;
   elemType?: string;
   // Definition location in Go source (for go-to-definition)
   defFile?: string;  // Go file where the variable is defined

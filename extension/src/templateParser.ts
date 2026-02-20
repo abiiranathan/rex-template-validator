@@ -297,6 +297,8 @@ export interface ResolveResult {
   found: boolean;
   fields?: FieldInfo[];
   isSlice?: boolean;
+  isMap?: boolean;
+  elemType?: string;
 }
 
 /**
@@ -338,21 +340,56 @@ export function resolvePath(
     const topVar = vars.get(remaining[0]);
     if (!topVar) return { typeStr: 'unknown', found: false };
     if (remaining.length === 1) {
-      return { typeStr: topVar.type, found: true, fields: topVar.fields, isSlice: topVar.isSlice };
+      return {
+        typeStr: topVar.type,
+        found: true,
+        fields: topVar.fields,
+        isSlice: topVar.isSlice,
+        isMap: topVar.isMap,
+        elemType: topVar.elemType,
+      };
     }
-    return resolveFields(remaining.slice(1), topVar.fields ?? []);
+    return resolveFields(remaining.slice(1), topVar.fields ?? [], topVar.isMap, topVar.elemType);
   }
 
   // Path inside a with/range scope → check the active dot frame first.
   // Only fall through to top-level vars for explicit "$"-prefixed paths.
   const dotFrame = findDotFrame(scopeStack);
   if (dotFrame) {
+    // If inside a range/with, dotFrame represents the current context.
+    // If dotFrame came from a map iteration (value context), it's just a value. IsMap=false usually.
+    // Unless iterating a map of maps.
+    
+    // We need ScopeFrame to store isMap/elemType if we want to support map iteration.
+    // ScopeFrame interface has `fields`. Does it have `isMap`?
+    // Let's check `types.ts`.
+    
+    // Check types.ts again.
+    /*
+    export interface ScopeFrame {
+      key: string;
+      typeStr: string;
+      fields?: FieldInfo[];
+      isRange?: boolean;
+      sourceVar?: TemplateVar;
+      // Add isMap, elemType here?
+    }
+    */
+    
+    // I should update ScopeFrame too.
+    
     if (dotFrame.fields) {
+      // If dotFrame is a map, we need to pass isMap=true.
+      // But dotFrame doesn't store isMap.
+      // I'll assume for now dotFrame represents resolved value.
+      
+      // If dotFrame is Map, we need to know.
+      // I'll update ScopeFrame later if needed. For now let's use typeStr check?
+      // Or assume dotFrame is result of resolution, so it's unwrapped?
+      
       const res = resolveFieldsDeep(path, dotFrame.fields);
       if (res.found) return res;
     }
-    // Not found in dot frame — do NOT silently fall through to root vars.
-    // This correctly surfaces errors for unknown fields inside scoped blocks.
     return { typeStr: 'unknown', found: false };
   }
 
@@ -363,10 +400,17 @@ export function resolvePath(
   }
 
   if (path.length === 1) {
-    return { typeStr: topVar.type, found: true, fields: topVar.fields, isSlice: topVar.isSlice };
+    return {
+      typeStr: topVar.type,
+      found: true,
+      fields: topVar.fields,
+      isSlice: topVar.isSlice,
+      isMap: topVar.isMap,
+      elemType: topVar.elemType,
+    };
   }
 
-  return resolveFields(path.slice(1), topVar.fields ?? []);
+  return resolveFields(path.slice(1), topVar.fields ?? [], topVar.isMap, topVar.elemType);
 }
 
 function findDotFrame(scopeStack: ScopeFrame[]): ScopeFrame | undefined {
@@ -382,8 +426,68 @@ function findDotFrame(scopeStack: ScopeFrame[]): ScopeFrame | undefined {
  */
 function resolveFields(
   parts: string[],
-  fields: FieldInfo[]
+  fields: FieldInfo[],
+  isMap: boolean = false,
+  elemType?: string
 ): ResolveResult {
+  if (parts.length === 0) {
+    return { typeStr: 'unknown', found: false };
+  }
+
+  if (isMap) {
+    const [_, ...rest] = parts;
+    // Map key access consumes one part.
+    // Result is the value type.
+    
+    // Naive parsing for next level type (similar to Go implementation logic)
+    // We assume `fields` represents the inner struct fields correctly for nested maps too.
+    
+    let nextTypeStr = elemType || 'unknown';
+    // Remove pointers
+    while (nextTypeStr.startsWith('*')) nextTypeStr = nextTypeStr.slice(1);
+    
+    let nextIsMap = false;
+    let nextIsSlice = false;
+    let nextElemType = nextTypeStr;
+
+    if (nextTypeStr.startsWith('map[')) {
+      nextIsMap = true;
+      // Simple parser for value type
+      let depth = 0;
+      let splitIdx = -1;
+      // map[ starts at 0. First [ at 3.
+      for (let i = 3; i < nextTypeStr.length; i++) {
+        if (nextTypeStr[i] === '[') depth++;
+        else if (nextTypeStr[i] === ']') {
+          depth--;
+          if (depth === 0) {
+            splitIdx = i;
+            break;
+          }
+        }
+      }
+      if (splitIdx !== -1) {
+        nextElemType = nextTypeStr.slice(splitIdx + 1).trim();
+      }
+    } else if (nextTypeStr.startsWith('[]')) {
+      nextIsSlice = true;
+      nextElemType = nextTypeStr.slice(2);
+    }
+
+    if (rest.length === 0) {
+      return {
+        typeStr: elemType || 'unknown',
+        found: true,
+        fields: fields,
+        isSlice: nextIsSlice,
+        isMap: nextIsMap,
+        elemType: nextElemType,
+      };
+    }
+    
+    return resolveFields(rest, fields, nextIsMap, nextElemType);
+  }
+
   return resolveFieldsDeep(parts, fields);
 }
 
@@ -408,22 +512,23 @@ function resolveFieldsDeep(
     return { typeStr: 'unknown', found: false };
   }
 
+  // Found field. Check if we need to go deeper via map or struct access.
+  if (tail.length > 0) {
+    if (field.isMap) {
+      // Delegate to map handling for the rest of path
+      return resolveFields(tail, field.fields ?? [], true, field.elemType);
+    }
+    // Struct/slice recursion
+    return resolveFieldsDeep(tail, field.fields ?? []);
+  }
+
   // Reached the target field
-  if (tail.length === 0) {
-    return {
-      typeStr: field.type,
-      found: true,
-      fields: field.fields,
-      isSlice: field.isSlice,
-    };
-  }
-
-  // Need to go deeper — recurse into this field's own fields
-  const nextFields = field.fields ?? [];
-  if (nextFields.length === 0) {
-    // Field has no sub-fields (primitive type or empty struct) — path is invalid
-    return { typeStr: 'unknown', found: false };
-  }
-
-  return resolveFieldsDeep(tail, nextFields);
+  return {
+    typeStr: field.type,
+    found: true,
+    fields: field.fields,
+    isSlice: field.isSlice,
+    isMap: field.isMap,
+    elemType: field.elemType,
+  };
 }

@@ -286,6 +286,35 @@ func buildTemplateVars(varDefs map[string]string, typeMap map[string]*types.Type
 			}
 		}
 
+		// Check for map type string: map[Key]Value
+		if strings.HasPrefix(baseTypeStr, "map[") {
+			if idx := strings.Index(baseTypeStr, "]"); idx != -1 {
+				keyType := baseTypeStr[4:idx]
+				elemType := baseTypeStr[idx+1:]
+				tv.IsMap = true
+				tv.KeyType = strings.TrimSpace(keyType)
+				tv.ElemType = strings.TrimSpace(elemType)
+
+				// Attempt to resolve the value type's fields
+				valTypeLookup := tv.ElemType
+				for strings.HasPrefix(valTypeLookup, "*") {
+					valTypeLookup = valTypeLookup[1:]
+				}
+
+				if typeNameObj, ok := typeMap[valTypeLookup]; ok {
+					t := typeNameObj.Type()
+					seen := make(map[string]bool)
+					fields, doc := extractFieldsWithDocs(t, structIndex, seen, fset)
+					tv.Fields = fields
+					if doc != "" {
+						tv.Doc = doc
+					}
+				}
+				vars = append(vars, tv)
+				continue
+			}
+		}
+
 		if typeNameObj, ok := typeMap[baseTypeStr]; ok {
 			t := typeNameObj.Type()
 			seen := make(map[string]bool)
@@ -450,6 +479,17 @@ func extractMapVars(expr ast.Expr, info *types.Info, fset *token.FileSet, struct
 				if elemDoc != "" {
 					tv.Doc = elemDoc
 				}
+			} else if keyType, elemType := getMapTypes(typeInfo.Type); keyType != nil && elemType != nil {
+				tv.IsMap = true
+				tv.KeyType = normalizeTypeStr(keyType.String())
+				tv.ElemType = normalizeTypeStr(elemType.String())
+				// Create a fresh seen map for element type extraction
+				elemSeen := make(map[string]bool)
+				elemFields, elemDoc := extractFieldsWithDocs(elemType, structIndex, elemSeen, fset)
+				tv.Fields = elemFields
+				if elemDoc != "" {
+					tv.Doc = elemDoc
+				}
 			}
 		} else {
 			tv.TypeStr = inferTypeFromAST(kv.Value)
@@ -532,6 +572,20 @@ func getElementType(t types.Type) types.Type {
 	return nil
 }
 
+// getMapTypes unwraps maps (and pointer-to-map) to return the key and element
+// types. Returns nil for non-map types.
+func getMapTypes(t types.Type) (types.Type, types.Type) {
+	switch v := t.(type) {
+	case *types.Map:
+		return v.Key(), v.Elem()
+	case *types.Pointer:
+		return getMapTypes(v.Elem())
+	case *types.Named:
+		return getMapTypes(v.Underlying())
+	}
+	return nil, nil
+}
+
 // extractFieldsWithDocs recursively extracts exported fields (and their nested
 // fields) from a named struct type. The seen map prevents infinite loops on
 // self-referential types; callers should pass a fresh map per extraction root.
@@ -541,6 +595,9 @@ func extractFieldsWithDocs(t types.Type, structIndex map[string]structIndexEntry
 	}
 	if ptr, ok := t.(*types.Pointer); ok {
 		return extractFieldsWithDocs(ptr.Elem(), structIndex, seen, fset)
+	}
+	if mapType, ok := t.(*types.Map); ok {
+		return extractFieldsWithDocs(mapType.Elem(), structIndex, seen, fset)
 	}
 
 	named, ok := t.(*types.Named)
@@ -613,6 +670,13 @@ func extractFieldsWithDocs(t types.Type, structIndex map[string]structIndexEntry
 			fi.IsSlice = true
 			elemSeen := copySeenMap(seen)
 			fi.Fields, _ = extractFieldsWithDocs(slice.Elem(), structIndex, elemSeen, fset)
+		} else if keyType, elemType := getMapTypes(ft); keyType != nil && elemType != nil {
+			// Map field - extract element type's fields
+			fi.IsMap = true
+			fi.KeyType = normalizeTypeStr(keyType.String())
+			fi.ElemType = normalizeTypeStr(elemType.String())
+			elemSeen := copySeenMap(seen)
+			fi.Fields, _ = extractFieldsWithDocs(elemType, structIndex, elemSeen, fset)
 		} else {
 			// Non-slice field — recurse into the field's type.
 			// Pass the shared seen map so the cycle guard works across the whole

@@ -99,6 +99,7 @@ func (h *Handler) RenderTreatmentChart(inpatient bool) rex.HandlerFunc {
 			"billedDrugs":   billedDrugs,
 			"prescriptions": prescriptions,
 			"doctor":        visit.Doctor.DisplayName,
+			"roles":         map[string]string{"admin": "Administrator", "user": "Normal User"},
 			"breadcrumbs": Breadcrumbs{
 				{Label: label, URL: pathPrefix},
 				{Label: visit.Patient.Name, URL: fmt.Sprintf("/patients/%d", visit.PatientID)},

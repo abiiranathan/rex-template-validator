@@ -34,6 +34,35 @@ var sharedVars = map[string]TemplateVar{
 			{Name: "Price", TypeStr: "float64"},
 		},
 	},
+	"MyMap": {
+		Name:     "MyMap",
+		TypeStr:  "map[string]User",
+		IsMap:    true,
+		KeyType:  "string",
+		ElemType: "User",
+		Fields: []FieldInfo{
+			{Name: "Name", TypeStr: "string"},
+			{Name: "Age", TypeStr: "int"},
+			{
+				Name:    "Address",
+				TypeStr: "Address",
+				Fields: []FieldInfo{
+					{Name: "City", TypeStr: "string"},
+					{Name: "Zip", TypeStr: "string"},
+				},
+			},
+		},
+	},
+	"NestedMap": {
+		Name:     "NestedMap",
+		TypeStr:  "map[string]map[string]User",
+		IsMap:    true,
+		ElemType: "map[string]User",
+		Fields: []FieldInfo{
+			{Name: "Name", TypeStr: "string"},
+			{Name: "Age", TypeStr: "int"},
+		},
+	},
 }
 
 func TestValidateTemplateContent(t *testing.T) {
@@ -151,7 +180,68 @@ func TestValidateTemplateContent(t *testing.T) {
 			},
 		},
 
-		// --- FIX 1: Named block vs file partial discrimination ---
+		// --- Map support ---
+		{
+			name:     "Valid map key access",
+			content:  "{{ .MyMap.someKey.Name }}",
+			expected: nil,
+		},
+		{
+			name:    "Invalid field on map value",
+			content: "{{ .MyMap.someKey.Invalid }}",
+			expected: []ValidationResult{
+				{
+					Variable: ".MyMap.someKey.Invalid",
+					Message:  `Field "Invalid" does not exist on type User`,
+					Line:     1,
+					Column:   4,
+					Severity: "error",
+				},
+			},
+		},
+		{
+			name:     "Range over map",
+			content:  "{{ range $k, $v := .MyMap }}{{ $k }} {{ $v.Name }}{{ end }}",
+			expected: nil,
+		},
+		{
+			name:    "Invalid range over map value",
+			content: "{{ range .MyMap }}{{ .Invalid }}{{ end }}",
+			expected: []ValidationResult{
+				{
+					Variable: ".Invalid",
+					Message:  `Template variable ".Invalid" is not defined in the render context`,
+					Line:     1,
+					Column:   22,
+					Severity: "error",
+				},
+			},
+		},
+		{
+			name:     "Range over map gives value as dot",
+			content:  "{{ range .MyMap }}{{ .Name }}{{ end }}",
+			expected: nil,
+		},
+		{
+			name:     "Nested map access",
+			content:  "{{ .NestedMap.Key1.Key2.Name }}",
+			expected: nil,
+		},
+		{
+			name:    "Invalid nested map access",
+			content: "{{ .NestedMap.Key1.Key2.Invalid }}",
+			expected: []ValidationResult{
+				{
+					Variable: ".NestedMap.Key1.Key2.Invalid",
+					Message:  `Field "Invalid" does not exist on type User`,
+					Line:     1,
+					Column:   4,
+					Severity: "error",
+				},
+			},
+		},
+
+		// --- Fix 1: Named block vs file partial discrimination ---
 		{
 			name: "Named block template call is not resolved as a file",
 			// "content" is a named block (no extension, no path sep) — must not trigger file-not-found
