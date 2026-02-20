@@ -36,12 +36,8 @@
     {{ range .billedDrugs }}
     {{ template "billed-drug" . }}
     {{ end }}
-
     <a href="{{ .PathPrefix }}/new">New Entry</a>
-
-    <!-- Include a partial -->
     {{ template "views/partials/footer.html" .visit }}
-
     {{ define "billed-drug" }}
     <div>{{ .Name }}</div>
     {{ end }}

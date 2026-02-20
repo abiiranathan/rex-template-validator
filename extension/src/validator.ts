@@ -1697,50 +1697,183 @@ export class TemplateValidator {
     position: vscode.Position,
     ctx: TemplateContext
   ): vscode.CompletionItem[] {
-    const line = document.lineAt(position.line).text.slice(0, position.character);
+    const content = document.getText();
+    const nodes = this.parser.parse(content);
+    
+    // 1. Determine the active scope at the cursor position
+    const { stack } = this.findScopeAtPosition(nodes, position, ctx.vars, [], nodes, ctx) || { stack: [] };
 
-    const dotMatch = line.match(/\{\{.*?\.([\w.]*)$/);
-    if (!dotMatch) return [];
+    // 2. Analyze text to find the partial path being typed
+    const lineText = document.lineAt(position.line).text;
+    const linePrefix = lineText.slice(0, position.character);
 
-    const partial = dotMatch[1];
-    const parts = partial.split('.');
-
-    if (parts.length <= 1) {
-      const prefix = parts[0] ?? '';
-      return [...ctx.vars.values()]
-        .filter(v => v.name.toLowerCase().startsWith(prefix.toLowerCase()))
-        .map(v => {
-          const item = new vscode.CompletionItem(v.name, vscode.CompletionItemKind.Variable);
-          item.detail = v.type;
-          item.documentation = new vscode.MarkdownString(`**Type:** \`${v.type}\``);
-          return item;
-        });
+    // Match a potential variable path ending at cursor
+    // e.g. "{{ .Use", "{{ $v.Nam", "{{ .User.Addr"
+    // We look for a sequence of dots and word chars immediately preceding the cursor
+    const match = linePrefix.match(/(?:\$|\.)[\w.]*$/);
+    
+    if (!match) {
+        // Not typing a variable path?
+        return [];
     }
 
-    const parentPath = parts.slice(0, -1);
-    const prefix = parts[parts.length - 1];
-    const topVar = ctx.vars.get(parentPath[0]);
-    if (!topVar?.fields) return [];
+    const rawPath = match[0]; // e.g. ".Use" or ".User.Ad"
+    const parts = rawPath.split('.');
+    
+    // If ending with dot (e.g. ".User."), we want fields of ".User"
+    // If ending with word (e.g. ".User.Na"), we want fields of ".User" filtered by "Na"
+    
+    let lookupPath: string[] = [];
+    let filterPrefix = '';
 
-    let fields = topVar.fields;
-    for (let i = 1; i < parentPath.length; i++) {
-      const field = fields.find(f => f.name === parentPath[i]);
-      if (!field) return [];
-      fields = field.fields ?? [];
+    if (rawPath.endsWith('.')) {
+        // e.g. "." or ".User."
+        // Resolve the whole path (excluding empty trailing part)
+        lookupPath = this.parser.parseDotPath(rawPath);
+    } else {
+        // e.g. ".User.Na"
+        filterPrefix = parts[parts.length - 1];
+        // Resolve the path minus the last segment
+        const parentPathStr = rawPath.slice(0, rawPath.length - filterPrefix.length);
+        lookupPath = this.parser.parseDotPath(parentPathStr);
     }
 
+    // 3. Resolve the lookup path against the scope
+    let fields: FieldInfo[] = [];
+
+    // Special case: just "." or "$" or empty lookup path -> suggests variables/current dot fields
+    if (lookupPath.length === 1 && lookupPath[0] === '.') {
+         // Resolve "." (current scope)
+         const res = resolvePath(['.'], ctx.vars, stack);
+         if (res.found && res.fields) {
+             fields = res.fields;
+         } else {
+             // Fallback to all top-level vars if "." isn't resolved (shouldn't happen often)
+             fields = [...ctx.vars.values()] as any; 
+         }
+         
+         // Also include "$" vars from scope stack? 
+         // For now, let's stick to fields of dot.
+    } else {
+        const res = resolvePath(lookupPath, ctx.vars, stack);
+        if (res.found && res.fields) {
+            fields = res.fields;
+        }
+    }
+
+    // 4. Map to CompletionItems
     return fields
-      .filter(f => f.name.toLowerCase().startsWith(prefix.toLowerCase()))
+      .filter(f => f.name.toLowerCase().startsWith(filterPrefix.toLowerCase()))
       .map(f => {
         const kind = f.type === 'method'
           ? vscode.CompletionItemKind.Method
           : vscode.CompletionItemKind.Field;
         const item = new vscode.CompletionItem(f.name, kind);
         item.detail = f.isSlice ? `[]${f.type}` : f.type;
+        if (f.doc) {
+            item.documentation = new vscode.MarkdownString(f.doc);
+        }
         return item;
       });
   }
+
+  /**
+   * Find the active scope stack at the given position.
+   * Traverses the AST and returns the stack of the deepest block node containing the position.
+   */
+  private findScopeAtPosition(
+    nodes: TemplateNode[],
+    position: vscode.Position,
+    vars: Map<string, TemplateVar>,
+    scopeStack: ScopeFrame[],
+    rootNodes: TemplateNode[],
+    ctx: TemplateContext
+  ): { stack: ScopeFrame[] } | null {
+    for (const node of nodes) {
+      const startLine = node.line - 1;
+      const startCol = node.col - 1;
+
+      // Check if we are "inside" this node's block structure
+      // For leaf nodes (variable), we don't really "enter" a scope, but for blocks we do.
+      
+      if (node.endLine === undefined) continue; // Not a block
+
+      const endLine = node.endLine - 1;
+      // We consider "inside" to be strictly after start tag and before end tag?
+      // Or just strictly contained in the range?
+      // findNodeAtPosition uses strict containment.
+      
+      const afterStart = position.line > startLine ||
+        (position.line === startLine && position.character >= startCol);
+      const beforeEnd = position.line < endLine ||
+        (position.line === endLine && position.character <= (node.endCol ?? 0));
+
+      if (afterStart && beforeEnd) {
+         // We are inside this block. Calculate its scope.
+         let childStack = scopeStack;
+         let childVars = vars; // Only modified for block calls passing fields-as-vars
+
+         switch (node.kind) {
+            case 'range': {
+                const elemScope = this.buildRangeScope(node.path, vars, scopeStack, ctx);
+                if (elemScope) {
+                     childStack = [...scopeStack, elemScope];
+                }
+                break;
+            }
+            case 'with': {
+                if (node.path.length > 0 && node.path[0] !== '.') {
+                    const result = resolvePath(node.path, vars, scopeStack);
+                    if (result.found && result.fields) {
+                        childStack = [...scopeStack, {
+                            key: '.', typeStr: result.typeStr, fields: result.fields,
+                        }];
+                    }
+                }
+                break;
+            }
+            case 'block': {
+                 // Similar to with/range
+                 if (node.path.length > 0 && node.path[0] !== '.') {
+                    const result = resolvePath(node.path, vars, scopeStack);
+                    if (result.found && result.fields) {
+                        childStack = [...scopeStack, {
+                            key: '.', typeStr: result.typeStr, fields: result.fields,
+                        }];
+                        childVars = this.fieldsToVarMap(result.fields);
+                    }
+                 }
+                 break;
+            }
+            case 'define': {
+                if (node.blockName) {
+                    const callContext = this.findCallSiteContext(rootNodes, node.blockName, vars, []);
+                    if (callContext) {
+                        childVars = this.fieldsToVarMap(callContext.fields ?? []);
+                        childStack = [{
+                            key: '.', typeStr: callContext.typeStr, fields: callContext.fields
+                        }];
+                    }
+                }
+                break;
+            }
+         }
+
+         // Try to recurse deeper
+         if (node.children) {
+             const inner = this.findScopeAtPosition(node.children, position, childVars, childStack, rootNodes, ctx);
+             if (inner) return inner;
+         }
+         
+         // If no child contains the position, we are directly in this block's scope
+         return { stack: childStack };
+      }
+    }
+
+    return null;
+  }
 }
+
 
 /**
  * Returns true if the template name looks like a file path
