@@ -1367,7 +1367,70 @@ export class TemplateValidator {
     return null;
   }
 
-  // ── Node search ────────────────────────────────────────────────────────────
+  /**
+   * Traverse from root to find a specific call site by name and resolve its context
+   */
+  private findCallSiteContext(
+    nodes: TemplateNode[],
+    blockName: string,
+    vars: Map<string, TemplateVar>,
+    scopeStack: ScopeFrame[]
+  ): { typeStr: string, fields?: FieldInfo[] } | null {
+    for (const node of nodes) {
+      if (node.kind === 'partial' && node.partialName === blockName) {
+        // Found call site
+        const contextArg = node.partialContext ?? '.';
+        if (contextArg === '.') {
+            const frame = scopeStack.slice().reverse().find(f => f.key === '.');
+            if (frame) {
+                return { typeStr: frame.typeStr, fields: frame.fields };
+            }
+            // If no dot frame, it's root context
+            return { typeStr: 'context', fields: [...vars.values()] as any };
+        }
+        
+        const path = this.parser.parseDotPath(contextArg);
+        const result = resolvePath(path, vars, scopeStack);
+        if (result.found) {
+            return { typeStr: result.typeStr, fields: result.fields };
+        }
+        return null;
+      }
+
+      // Recurse with scope updates
+      if (node.children) {
+        let childStack = scopeStack;
+
+        if (node.kind === 'range') {
+             const elemScope = this.buildRangeScope(node.path, vars, scopeStack, { vars, renderCalls: [], absolutePath: '', templatePath: '' });
+             if (elemScope) childStack = [...scopeStack, elemScope];
+        } else if (node.kind === 'with') {
+            if (node.path.length > 0 && node.path[0] !== '.') {
+                const result = resolvePath(node.path, vars, scopeStack);
+                if (result.found && result.fields) {
+                    childStack = [...scopeStack, {
+                        key: '.', typeStr: result.typeStr, fields: result.fields,
+                    }];
+                }
+            }
+        } else if (node.kind === 'block') {
+             if (node.path.length > 0 && node.path[0] !== '.') {
+                const result = resolvePath(node.path, vars, scopeStack);
+                if (result.found && result.fields) {
+                    childStack = [...scopeStack, {
+                        key: '.', typeStr: result.typeStr, fields: result.fields,
+                    }];
+                }
+             }
+        }
+
+        const found = this.findCallSiteContext(node.children, blockName, vars, childStack);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
 
   /**
    * Find the AST node at the given cursor position, returning it along with
@@ -1379,8 +1442,11 @@ export class TemplateValidator {
     nodes: TemplateNode[],
     position: vscode.Position,
     vars: Map<string, TemplateVar>,
-    scopeStack: ScopeFrame[]
+    scopeStack: ScopeFrame[],
+    rootNodes?: TemplateNode[] // Pass root nodes to search for define/block call sites
   ): { node: TemplateNode; stack: ScopeFrame[]; vars: Map<string, TemplateVar> } | null {
+    if (!rootNodes) rootNodes = nodes;
+
     for (const node of nodes) {
       const startLine = node.line - 1;
       const startCol = node.col - 1;
@@ -1451,10 +1517,10 @@ export class TemplateValidator {
                 isRange: true,
                 sourceVar,
               }];
-              if (node.children) {
-                const found = this.findNodeAtPosition(node.children, position, vars, childStack);
-                if (found) return found;
-              }
+            if (node.children) {
+              const found = this.findNodeAtPosition(node.children, position, vars, childStack, rootNodes);
+              if (found) return found;
+            }
             }
           }
           break;
@@ -1467,20 +1533,20 @@ export class TemplateValidator {
               const childStack: ScopeFrame[] = [...scopeStack, {
                 key: '.', typeStr: result.typeStr, fields: result.fields,
               }];
-              if (node.children) {
-                const found = this.findNodeAtPosition(node.children, position, vars, childStack);
-                if (found) return found;
-              }
+            if (node.children) {
+              const found = this.findNodeAtPosition(node.children, position, vars, childStack, rootNodes);
+              if (found) return found;
+            }
             }
           }
           break;
         }
 
         case 'if': {
-          if (node.children) {
-            const found = this.findNodeAtPosition(node.children, position, vars, scopeStack);
-            if (found) return found;
-          }
+            if (node.children) {
+              const found = this.findNodeAtPosition(node.children, position, vars, scopeStack, rootNodes);
+              if (found) return found;
+            }
           break;
         }
 
@@ -1494,58 +1560,75 @@ export class TemplateValidator {
                 key: '.', typeStr: result.typeStr, fields: result.fields,
               }];
               const childVars = this.fieldsToVarMap(result.fields);
-              if (node.children) {
-                const found = this.findNodeAtPosition(node.children, position, childVars, childStack);
-                if (found) return found;
-              }
+            if (node.children) {
+              const found = this.findNodeAtPosition(node.children, position, childVars, childStack, rootNodes);
+              if (found) return found;
+            }
               break;
             }
           }
           // "." context — pass through unchanged
-          if (node.children) {
-            const found = this.findNodeAtPosition(node.children, position, vars, scopeStack);
-            if (found) return found;
-          }
+            if (node.children) {
+              const found = this.findNodeAtPosition(node.children, position, vars, scopeStack, rootNodes);
+              if (found) return found;
+            }
           break;
         }
 
         case 'define': {
           // {{ define "name" }} body scope = whatever .Ctx the matching
           // {{ template "name" .Ctx }} call passes. Find that call in the same file.
-          if (node.blockName) {
-            const callSite = this.findTemplateCallSite(nodes, node.blockName);
-            if (callSite) {
-              const contextArg = callSite.partialContext ?? '.';
-              if (contextArg === '.') {
-                // Caller passes root scope — vars and stack are already correct
+        if (node.blockName) {
+            // Find call site context by traversing from root
+            const callContext = this.findCallSiteContext(rootNodes!, node.blockName, vars, []);
+
+            if (callContext) {
+                // If found, use that context
+                const childVars = this.fieldsToVarMap(callContext.fields ?? []);
+                const childStack: ScopeFrame[] = [{
+                    key: '.', typeStr: callContext.typeStr, fields: callContext.fields
+                }];
                 if (node.children) {
-                  const found = this.findNodeAtPosition(node.children, position, vars, scopeStack);
-                  if (found) return found;
-                }
-              } else {
-                const resolvedPath = this.parser.parseDotPath(contextArg);
-                const callResult = resolvePath(resolvedPath, vars, scopeStack);
-                if (callResult.found && callResult.fields) {
-                  const childVars = this.fieldsToVarMap(callResult.fields);
-                  const childStack: ScopeFrame[] = [...scopeStack, {
-                    key: '.', typeStr: callResult.typeStr, fields: callResult.fields,
-                  }];
-                  if (node.children) {
-                    const found = this.findNodeAtPosition(node.children, position, childVars, childStack);
+                    const found = this.findNodeAtPosition(node.children, position, childVars, childStack, rootNodes);
                     if (found) return found;
-                  }
                 }
-              }
+            } else {
+                // Fallback to previous logic if no call site found (or simpler case)
+                const callSite = this.findTemplateCallSite(nodes, node.blockName);
+                if (callSite) {
+                    const contextArg = callSite.partialContext ?? '.';
+                    if (contextArg === '.') {
+                        // Caller passes root scope — vars and stack are already correct
+                        if (node.children) {
+                            const found = this.findNodeAtPosition(node.children, position, vars, scopeStack, rootNodes);
+                            if (found) return found;
+                        }
+                    } else {
+                        const resolvedPath = this.parser.parseDotPath(contextArg);
+                        const callResult = resolvePath(resolvedPath, vars, scopeStack);
+                        if (callResult.found && callResult.fields) {
+                            const childVars = this.fieldsToVarMap(callResult.fields);
+                            const childStack: ScopeFrame[] = [...scopeStack, {
+                                key: '.', typeStr: callResult.typeStr, fields: callResult.fields,
+                            }];
+                            if (node.children) {
+                                const found = this.findNodeAtPosition(node.children, position, childVars, childStack, rootNodes);
+                                if (found) return found;
+                            }
+                        }
+                    }
+                }
             }
-          }
+        }
+
           break;
         }
 
         default: {
-          if (node.children) {
-            const found = this.findNodeAtPosition(node.children, position, vars, scopeStack);
-            if (found) return found;
-          }
+            if (node.children) {
+              const found = this.findNodeAtPosition(node.children, position, vars, scopeStack, rootNodes);
+              if (found) return found;
+            }
         }
       }
     }
