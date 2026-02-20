@@ -252,10 +252,33 @@ export class TemplateValidator {
       if (contextPath.length > 0) {
         const result = resolvePath(contextPath, vars, scopeStack);
         if (!result.found) {
+          let errCol = node.col;
+          if (node.rawText) {
+            // Find start of contextArg in raw text (it comes after the template name)
+            const nameIdx = node.partialName ? node.rawText.indexOf(`"${node.partialName}"`) : -1;
+            const searchStart = nameIdx !== -1 ? nameIdx + node.partialName!.length + 2 : 0;
+            const ctxIdx = node.rawText.indexOf(contextArg, searchStart);
+
+            if (ctxIdx !== -1) {
+              // Now refine to the actual variable path start
+              let varOffset = 0;
+              // If path is just ".", use index of "."
+              if (contextPath.length === 1 && contextPath[0] === '.') {
+                varOffset = contextArg.indexOf('.');
+              } else {
+                // Otherwise find ".Path" inside the context arg
+                const p = '.' + contextPath.join('.');
+                const pIdx = contextArg.indexOf(p);
+                if (pIdx !== -1) varOffset = pIdx;
+              }
+              errCol = node.col + ctxIdx + varOffset;
+            }
+          }
+
           errors.push({
             message: `Template variable "${contextArg}" is not defined in the render context`,
             line: node.line,
-            col: node.col,
+            col: errCol,
             severity: 'error',
             variable: contextArg,
           });
