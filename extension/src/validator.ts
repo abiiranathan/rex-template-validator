@@ -173,47 +173,14 @@ export class TemplateValidator {
         return; // partial handler recurses children itself
       }
 
-      case 'block': {
-        // {{ block "name" .Expr }} executes in-place with .Expr as the new dot scope.
-        // We validate the body with that resolved scope, exactly like `with`.
-        if (node.path.length > 0 && node.path[0] !== '.') {
-          // Context arg is a top-level variable reference (e.g. {{ block "foo" .User }})
-          const result = resolvePath(node.path, vars, scopeStack);
-          if (result.found && result.fields) {
-            const childStack: ScopeFrame[] = [...scopeStack, {
-              key: '.',
-              typeStr: result.typeStr,
-              fields: result.fields,
-            }];
-            if (node.children) {
-              this.validateNodes(node.children, vars, childStack, errors, ctx, filePath);
-            }
-            return;
-          }
-          // If we couldn't resolve the path, still validate children with current scope
-          // so we don't silently skip errors
-        } else {
-          // Context arg is "." (bare dot) — pass the current scope through unchanged
-          // This is the most common case: {{ block "billed-drug" . }}
-          // The dot inside the block body refers to whatever "." is at the call site.
-          // Since block is defined in the same file it's called from, use current scope.
-        }
-        // Fall through: validate children with current scope (covers "." context)
-        if (node.children) {
-          this.validateNodes(node.children, vars, scopeStack, errors, ctx, filePath);
-        }
-        return;
-      }
-
+      case 'block':
       case 'define': {
-        // {{ define "name" }} blocks are only executed when explicitly called via
-        // {{ template "name" .Ctx }}. Their body scope depends entirely on what
-        // context is passed at the call site, which we don't know at definition time.
-        //
-        // However: if a matching {{ template "name" . }} call exists in the same
-        // file's AST, we can infer the scope and validate. For now we skip validation
-        // here to avoid false positives — the call-site validation in validatePartial
-        // covers named block bodies when called via {{ template }}.
+        // Both block and define declare a named template body. The actual execution
+        // context is determined by the {{ template "name" .Ctx }} call site, not by
+        // the declaration. We skip direct body validation here to avoid false positives
+        // from using the wrong scope. validateNamedBlock (called from validatePartial
+        // when the {{ template }} call is encountered) handles body validation with
+        // the correct call-site scope.
         return;
       }
     }
@@ -275,6 +242,27 @@ export class TemplateValidator {
     filePath: string
   ) {
     if (!node.partialName) return;
+
+    // Always validate the context argument against the current scope first.
+    // e.g. {{ template "foo" .NotExist }} should error if .NotExist is undefined.
+    // "." means "pass the current dot through" — always valid, skip check.
+    const contextArg = node.partialContext ?? '.';
+    if (contextArg !== '.') {
+      const contextPath = this.parser.parseDotPath(contextArg);
+      if (contextPath.length > 0) {
+        const result = resolvePath(contextPath, vars, scopeStack);
+        if (!result.found) {
+          errors.push({
+            message: `Template variable "${contextArg}" is not defined in the render context`,
+            line: node.line,
+            col: node.col,
+            severity: 'error',
+            variable: contextArg,
+          });
+          return;
+        }
+      }
+    }
 
     // Named blocks (no file extension) — validate their body with the resolved context scope.
     // We look up the define/block node in the current file's AST and re-validate it.
@@ -366,32 +354,40 @@ export class TemplateValidator {
       const blockNode = this.findDefineNodeInAST(nodes, callNode.partialName);
       if (!blockNode || !blockNode.children) return;
 
-      // Build scope frame from partialVars
-      // For "." context: partialVars mirrors current scope vars, validate children directly
-      // For ".Expr" context: push a dot frame with the resolved fields
       const contextArg = callNode.partialContext ?? '.';
-      let childStack = scopeStack;
 
-      if (contextArg !== '.') {
+      let blockVars: Map<string, TemplateVar>;
+      let childStack: ScopeFrame[];
+
+      if (contextArg === '.') {
+        // "." — pass the current scope through unchanged
+        blockVars = partialVars;
+        childStack = scopeStack;
+      } else {
+        // ".Expr" — the block's dot IS the resolved value of .Expr.
+        // Build a completely fresh scope so the outer scope doesn't leak in.
         const result = resolvePath(
           this.parser.parseDotPath(contextArg),
           vars,
           scopeStack
         );
-        if (result.found && result.fields) {
-          childStack = [...scopeStack, {
-            key: '.',
-            typeStr: result.typeStr,
-            fields: result.fields,
-          }];
+        if (!result.found) {
+          // Context arg already validated above; this shouldn't happen
+          return;
         }
+        // New dot frame with the resolved type (may have no fields for scalar types)
+        childStack = [{
+          key: '.',
+          typeStr: result.typeStr,
+          fields: result.fields ?? [],
+        }];
+        blockVars = partialVars; // already built from result.fields by resolvePartialVars
       }
-      // For "." context, use partialVars as the vars map (mirrors current scope)
 
       const blockErrors = this.validateBlockChildren(
         blockNode.children,
-        partialVars,
-        contextArg === '.' ? scopeStack : childStack,
+        blockVars,
+        childStack,
         ctx,
         filePath
       );
@@ -496,21 +492,14 @@ export class TemplateValidator {
     const hit = this.findNodeAtPosition(nodes, position, ctx.vars, []);
     if (!hit) return null;
 
-    const { node, stack } = hit;
-    let result = resolvePath(node.path, ctx.vars, stack);
-    let resolvedStack = stack;
-    let varInfo = this.findVariableInfo(node.path, ctx.vars, stack);
+    const { node, stack, vars: hitVars } = hit;
+    // hitVars and stack are scoped correctly for define/block bodies —
+    // use them instead of ctx.vars so single-segment paths like .Name resolve.
+    const result = resolvePath(node.path, hitVars, stack);
+    const varInfo = this.findVariableInfo(node.path, hitVars, stack);
 
     if (!result.found) {
-      // Try to resolve from template call context (for define/block bodies)
-      const fallback = this.tryResolveFromTemplateCalls(node, nodes, position, ctx);
-      if (fallback) {
-        result = fallback.result;
-        resolvedStack = fallback.stack;
-        varInfo = this.findVariableInfo(node.path, ctx.vars, resolvedStack);
-      } else {
-        return null;
-      }
+      return null;
     }
 
     const varName = node.path[0] === '.' ? '.' : '.' + node.path.join('.');
@@ -627,7 +616,7 @@ export class TemplateValidator {
     const hit = this.findNodeAtPosition(nodes, position, ctx.vars, []);
     if (!hit) return null;
 
-    const { node, stack } = hit;
+    const { node, stack, vars: hitVars } = hit;
     const topVarName = node.path[0] === '.' ? null : node.path[0];
     if (!topVarName) return null;
 
@@ -699,13 +688,11 @@ export class TemplateValidator {
       }
     }
 
-    // Check if we're inside a block/define body — resolve via call-site scope
-    const blockCtx = this.resolveBlockCallSiteContext(node, nodes, position, ctx);
-    if (blockCtx) {
-      // Try to find definition using the inferred scope
-      const defLoc = this.findDefinitionInScope(node, blockCtx.vars, blockCtx.scopeStack, ctx);
-      if (defLoc) return defLoc;
-    }
+    // Use the scope stack returned by findNodeAtPosition — for define/block bodies
+    // it now carries the inferred dot frame from the call site, so field definitions
+    // can be resolved directly from the stack without a separate fallback.
+    const stackDefLoc = this.findDefinitionInScope(node, hitVars, stack, ctx);
+    if (stackDefLoc) return stackDefLoc;
 
     // Find the variable definition and go to its source location
     for (const rc of ctx.renderCalls) {
@@ -1296,17 +1283,23 @@ export class TemplateValidator {
 
   // ── Node search ────────────────────────────────────────────────────────────
 
+  /**
+   * Find the AST node at the given cursor position, returning it along with
+   * the scope stack active at that point. The scope-building logic mirrors
+   * validateNode exactly — this is intentional so hover and go-to-def see
+   * the same types as validation.
+   */
   private findNodeAtPosition(
     nodes: TemplateNode[],
     position: vscode.Position,
     vars: Map<string, TemplateVar>,
     scopeStack: ScopeFrame[]
-  ): { node: TemplateNode; stack: ScopeFrame[] } | null {
+  ): { node: TemplateNode; stack: ScopeFrame[]; vars: Map<string, TemplateVar> } | null {
     for (const node of nodes) {
       const startLine = node.line - 1;
       const startCol = node.col - 1;
 
-      // Variable node — check if cursor is over it
+      // ── Variable leaf ──────────────────────────────────────────────────────
       if (node.kind === 'variable') {
         const endCol = startCol + node.rawText.length;
         if (
@@ -1314,84 +1307,170 @@ export class TemplateValidator {
           position.character >= startCol &&
           position.character <= endCol
         ) {
-          return { node, stack: scopeStack };
+          return { node, stack: scopeStack, vars };
         }
         continue;
       }
 
-      // Block node — check if cursor is inside
-      if (node.endLine !== undefined) {
-        const endLine = node.endLine - 1;
+      // ── Block nodes ────────────────────────────────────────────────────────
+      if (node.endLine === undefined) continue;
 
-        const afterStart = position.line > startLine ||
-          (position.line === startLine && position.character >= startCol);
-        const beforeEnd = position.line < endLine ||
-          (position.line === endLine && position.character <= (node.endCol ?? 0) - 1);
+      const endLine = node.endLine - 1;
+      const afterStart = position.line > startLine ||
+        (position.line === startLine && position.character >= startCol);
+      const beforeEnd = position.line < endLine ||
+        (position.line === endLine && position.character <= (node.endCol ?? 0) - 1);
 
-        if (!afterStart || !beforeEnd) continue;
+      if (!afterStart || !beforeEnd) continue;
 
-        // Cursor on opening tag → hover the condition variable
-        const openEndCol = startCol + node.rawText.length;
-        if (position.line === startLine && position.character <= openEndCol) {
-          return { node, stack: scopeStack };
+      // Cursor on the opening tag itself → return with current scope
+      const openEndCol = startCol + node.rawText.length;
+      if (position.line === startLine && position.character <= openEndCol) {
+        return { node, stack: scopeStack, vars };
+      }
+
+      // Cursor is inside the body — build child scope mirroring validateNode ─
+
+      switch (node.kind) {
+
+        case 'range': {
+          if (node.path.length > 0 && node.path[0] !== '.') {
+            const result = resolvePath(node.path, vars, scopeStack);
+            if (result.found && result.fields) {
+              let sourceVar: TemplateVar | undefined = vars.get(node.path[0]);
+              if (!sourceVar) {
+                const df = scopeStack.slice().reverse().find(f => f.key === '.');
+                const field = df?.fields?.find(f => f.name === node.path[0]);
+                if (field) {
+                  sourceVar = { name: field.name, type: field.type, fields: field.fields, isSlice: field.isSlice };
+                }
+              }
+              const childStack: ScopeFrame[] = [...scopeStack, {
+                key: '.', typeStr: result.typeStr, fields: result.fields, isRange: true, sourceVar,
+              }];
+              if (node.children) {
+                const found = this.findNodeAtPosition(node.children, position, vars, childStack);
+                if (found) return found;
+              }
+            }
+          }
+          break;
         }
 
-        // Inside block body → push scope and recurse
-        let childStack = scopeStack;
+        case 'with': {
+          if (node.path.length > 0 && node.path[0] !== '.') {
+            const result = resolvePath(node.path, vars, scopeStack);
+            if (result.found && result.fields) {
+              const childStack: ScopeFrame[] = [...scopeStack, {
+                key: '.', typeStr: result.typeStr, fields: result.fields,
+              }];
+              if (node.children) {
+                const found = this.findNodeAtPosition(node.children, position, vars, childStack);
+                if (found) return found;
+              }
+            }
+          }
+          break;
+        }
 
-        if ((node.kind === 'range' || node.kind === 'with') && node.path.length > 0 && node.path[0] !== '.') {
-          const result = resolvePath(node.path, vars, scopeStack);
-          if (result.found && result.fields) {
-            let sourceVar: TemplateVar | undefined;
-            if (node.kind === 'range') {
-              sourceVar = vars.get(node.path[0]);
-              if (!sourceVar && scopeStack.length > 0) {
-                const dotFrame = scopeStack.slice().reverse().find(f => f.key === '.');
-                if (dotFrame?.fields) {
-                  const field = dotFrame.fields.find(f => f.name === node.path[0]);
-                  if (field) {
-                    sourceVar = {
-                      name: node.path[0],
-                      type: field.type,
-                      fields: field.fields,
-                      isSlice: field.isSlice,
-                    };
+        case 'if': {
+          if (node.children) {
+            const found = this.findNodeAtPosition(node.children, position, vars, scopeStack);
+            if (found) return found;
+          }
+          break;
+        }
+
+        case 'block': {
+          // {{ block "name" .Expr }} — body scope is .Expr as the new dot, like `with`.
+          // Pass fields-as-vars so single-segment paths like .Name resolve correctly.
+          if (node.path.length > 0 && node.path[0] !== '.') {
+            const result = resolvePath(node.path, vars, scopeStack);
+            if (result.found && result.fields) {
+              const childStack: ScopeFrame[] = [...scopeStack, {
+                key: '.', typeStr: result.typeStr, fields: result.fields,
+              }];
+              const childVars = this.fieldsToVarMap(result.fields);
+              if (node.children) {
+                const found = this.findNodeAtPosition(node.children, position, childVars, childStack);
+                if (found) return found;
+              }
+              break;
+            }
+          }
+          // "." context — pass through unchanged
+          if (node.children) {
+            const found = this.findNodeAtPosition(node.children, position, vars, scopeStack);
+            if (found) return found;
+          }
+          break;
+        }
+
+        case 'define': {
+          // {{ define "name" }} body scope = whatever .Ctx the matching
+          // {{ template "name" .Ctx }} call passes. Find that call in the same file.
+          if (node.blockName) {
+            const callSite = this.findTemplateCallSite(nodes, node.blockName);
+            if (callSite) {
+              const contextArg = callSite.partialContext ?? '.';
+              if (contextArg === '.') {
+                // Caller passes root scope — vars and stack are already correct
+                if (node.children) {
+                  const found = this.findNodeAtPosition(node.children, position, vars, scopeStack);
+                  if (found) return found;
+                }
+              } else {
+                const resolvedPath = this.parser.parseDotPath(contextArg);
+                const callResult = resolvePath(resolvedPath, vars, scopeStack);
+                if (callResult.found && callResult.fields) {
+                  const childVars = this.fieldsToVarMap(callResult.fields);
+                  const childStack: ScopeFrame[] = [...scopeStack, {
+                    key: '.', typeStr: callResult.typeStr, fields: callResult.fields,
+                  }];
+                  if (node.children) {
+                    const found = this.findNodeAtPosition(node.children, position, childVars, childStack);
+                    if (found) return found;
                   }
                 }
               }
             }
-            const frame: ScopeFrame = {
-              key: '.',
-              typeStr: result.typeStr,
-              fields: result.fields,
-              isRange: node.kind === 'range',
-              sourceVar,
-            };
-            childStack = [...scopeStack, frame];
           }
-        } else if (node.kind === 'block' && node.path.length > 0 && node.path[0] !== '.') {
-          // {{ block "name" .Expr }} — push scope for the expr
-          const result = resolvePath(node.path, vars, scopeStack);
-          if (result.found && result.fields) {
-            childStack = [...scopeStack, {
-              key: '.',
-              typeStr: result.typeStr,
-              fields: result.fields,
-            }];
-          }
+          break;
         }
-        // For define nodes: scope is unknown at definition time; leave childStack as-is.
-        // tryResolveFromTemplateCalls handles hover inside define bodies.
 
-        if (node.children) {
-          const found = this.findNodeAtPosition(node.children, position, vars, childStack);
-          if (found) return found;
+        default: {
+          if (node.children) {
+            const found = this.findNodeAtPosition(node.children, position, vars, scopeStack);
+            if (found) return found;
+          }
         }
       }
     }
 
     return null;
   }
+
+  /**
+   * Convert a FieldInfo array into a TemplateVar map so that single-segment dot
+   * paths like .Name can be resolved by resolvePath when inside a scoped block.
+   */
+  private fieldsToVarMap(fields: FieldInfo[]): Map<string, TemplateVar> {
+    const m = new Map<string, TemplateVar>();
+    for (const f of fields) {
+      m.set(f.name, {
+        name: f.name,
+        type: f.type,
+        fields: f.fields,
+        isSlice: f.isSlice,
+        defFile: f.defFile,
+        defLine: f.defLine,
+        defCol: f.defCol,
+        doc: f.doc,
+      });
+    }
+    return m;
+  }
+
 
   /**
    * Get definition location for a template path string in Go code.

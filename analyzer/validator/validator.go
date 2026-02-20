@@ -242,40 +242,14 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 				continue
 			}
 
-			// ── block handling ─────────────────────────────────────────────────
-			// {{ block "name" .Ctx }} executes its body in-place with .Ctx as the
-			// new dot scope, exactly like {{ with .Ctx }}. We validate it now.
+			// ── block handling ─────────────────────────────────────────────────────
+			// {{ block "name" .Ctx }} declares a named template body just like
+			// {{ define }}. Its execution context comes from the {{ template "name" .Ctx }}
+			// call site, not from the declaration. Skip the body here — the template
+			// call handler will re-validate it with the correct call-site scope.
 
 			if first == "block" {
-				// Extract block name and context expression
-				blockCtxExpr := ""
-				if len(words) >= 3 {
-					// words[1] is the name (quoted), words[2:] is the context expression
-					blockCtxExpr = strings.Join(words[2:], " ")
-				} else if len(words) == 2 {
-					blockCtxExpr = "."
-				}
-
-				// Validate any variable references in the block context expression
-				varsInAction := extractVariablesFromAction(action)
-				for _, v := range varsInAction {
-					if err := validateVariableInScope(v, scopeStack, varMap, actualLineNum, col, templateName); err != nil {
-						errors = append(errors, *err)
-					}
-				}
-
-				// Push scope for the block body (like with)
-				if blockCtxExpr != "" && blockCtxExpr != "." {
-					newScope := createScopeFromWith(blockCtxExpr, scopeStack, varMap)
-					scopeStack = append(scopeStack, newScope)
-				} else {
-					// "." context — push a copy of the current scope so "end" can pop it
-					if len(scopeStack) > 0 {
-						scopeStack = append(scopeStack, scopeStack[len(scopeStack)-1])
-					} else {
-						scopeStack = append(scopeStack, ScopeType{})
-					}
-				}
+				defineSkipDepth++
 				continue
 			}
 
@@ -328,13 +302,31 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 				if len(parts) >= 1 {
 					tmplName := parts[0]
 
+					var contextArg string
+					if len(parts) >= 2 {
+						contextArg = parts[1]
+					}
+
+					// Validate the context argument against the current scope.
+					// "." means pass the current dot — always valid.
+					// Anything else (e.g. ".Name", ".NotExist") must resolve.
+					if contextArg != "" && contextArg != "." {
+						if !validateContextArg(contextArg, scopeStack, varMap) {
+							errors = append(errors, ValidationResult{
+								Template: templateName,
+								Line:     actualLineNum,
+								Column:   col,
+								Variable: contextArg,
+								Message:  fmt.Sprintf(`Template variable "%s" is not defined in the render context`, contextArg),
+								Severity: "error",
+							})
+							continue
+						}
+					}
+
 					if nt, ok := registry[tmplName]; ok {
 						// Named template block found in registry — validate its body
 						// with the context argument resolved against the current scope.
-						var contextArg string
-						if len(parts) >= 2 {
-							contextArg = parts[1]
-						}
 
 						// Resolve the scope that will be passed as "." to the partial
 						partialScope := resolvePartialScope(contextArg, scopeStack, varMap)
@@ -359,11 +351,6 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 								Severity: "error",
 							})
 							continue
-						}
-
-						var contextArg string
-						if len(parts) >= 2 {
-							contextArg = parts[1]
 						}
 
 						// Resolve the scope that will be passed as "." to the partial
@@ -761,6 +748,16 @@ func extractVariablesFromAction(action string) []string {
 	}
 
 	return validVars
+}
+
+// validateContextArg checks whether a template call context expression (e.g. ".Name", ".User")
+// resolves in the current scope. Returns true if valid, false if the variable is undefined.
+func validateContextArg(contextArg string, scopeStack []ScopeType, varMap map[string]TemplateVar) bool {
+	if contextArg == "" || contextArg == "." || contextArg == "$" {
+		return true
+	}
+	result := validateVariableInScope(contextArg, scopeStack, varMap, 0, 0, "")
+	return result == nil
 }
 
 // ValidateTemplateFileStr exposes internal method for testing
