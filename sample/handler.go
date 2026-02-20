@@ -83,7 +83,9 @@ func (h *Handler) RenderTreatmentChart(inpatient bool) rex.HandlerFunc {
 			label = "OPD"
 		}
 
-		return c.Render("views/inpatient/treatment-chart.html", rex.Map{
+		c.ExecuteTemplate("missing.html", nil)
+
+		return c.Render("views/inpatient/treatment-charts.html", rex.Map{
 			"management":    management,
 			"visit":         visit,
 			"Title":         title,

@@ -4,7 +4,8 @@ import { GoAnalyzer } from './analyzer';
 import { KnowledgeGraphBuilder } from './knowledgeGraph';
 import { TemplateValidator } from './validator';
 import { KnowledgeGraphPanel } from './graphPanel';
-import { KnowledgeGraph } from './types';
+import { AnalysisResult, KnowledgeGraph, GoValidationError } from './types';
+import * as fs from 'fs';
 
 const TEMPLATE_SELECTOR: vscode.DocumentSelector = [
   { language: 'html', scheme: 'file' },
@@ -263,7 +264,27 @@ async function rebuildIndex(workspaceRoot: string) {
     statusBarItem.text = `$(check) Rex: ${count} template${count === 1 ? '' : 's'} indexed`;
 
     // Apply diagnostics from Go analyzer
-    applyAnalyzerDiagnostics(result.validationErrors ?? [], workspaceRoot, sourceDir, templateRoot, templateBaseDir);
+    const validationErrors = result.validationErrors ?? [];
+
+    // Check for missing templates
+    for (const [logicalPath, ctx] of currentGraph.templates) {
+        if (!fs.existsSync(ctx.absolutePath)) {
+            for (const rc of ctx.renderCalls) {
+                validationErrors.push({
+                    template: logicalPath,
+                    line: 0,
+                    column: 0,
+                    variable: '',
+                    message: `Template file not found: ${logicalPath}`,
+                    severity: 'error',
+                    goFile: rc.file,
+                    goLine: rc.line,
+                });
+            }
+        }
+    }
+
+    await applyAnalyzerDiagnostics(validationErrors, workspaceRoot, sourceDir, templateRoot, templateBaseDir);
 
     // Re-validate open template docs with fresh graph (editor diagnostics only)
     for (const doc of vscode.workspace.textDocuments) {
@@ -279,7 +300,7 @@ async function rebuildIndex(workspaceRoot: string) {
   }
 }
 
-function applyAnalyzerDiagnostics(
+async function applyAnalyzerDiagnostics(
   validationErrors: import('./types').GoValidationError[],
   workspaceRoot: string,
   sourceDir: string,
@@ -291,37 +312,76 @@ function applyAnalyzerDiagnostics(
   const issuesByFile = new Map<string, vscode.Diagnostic[]>();
 
   for (const err of validationErrors) {
-    const baseDir = templateBaseDir === '' ? workspaceRoot : path.join(workspaceRoot, templateBaseDir);
-    const absPath = path.join(baseDir, templateRoot, err.template);
+    let diagnosticFilePath: string;
+    let diagnosticLine: number;
+    let diagnosticCol: number;
+    let diagnosticEndCol: number;
+    let relatedInfo: vscode.DiagnosticRelatedInformation[] | undefined;
 
-    const startLine = Math.max(0, err.line - 1);
-    const startCol = Math.max(0, err.column - 1);
-    const endCol = startCol + (err.variable?.length || 1);
+    // If it's a template not found error, point to the Go call site
+    if (err.message.includes('Template file not found') && err.goFile && err.goLine !== undefined) {
+      diagnosticFilePath = path.join(workspaceRoot, sourceDir, err.goFile);
+      diagnosticLine = Math.max(0, err.goLine - 1);
 
-    const range = new vscode.Range(startLine, startCol, startLine, endCol);
+      // Attempt to find the column of the template name within the Go line
+      try {
+        const goDoc = await vscode.workspace.openTextDocument(diagnosticFilePath);
+        const goLineText = goDoc.lineAt(diagnosticLine).text;
+        const templateNameRegex = new RegExp(`("|')?${err.template.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}("|')?`);
+        const match = goLineText.match(templateNameRegex);
+
+        if (match && match.index !== undefined) {
+          diagnosticCol = match.index;
+          diagnosticEndCol = match.index + match[0].length;
+        } else {
+          // Fallback to start of line if not found
+          diagnosticCol = 0;
+          diagnosticEndCol = goLineText.length;
+        }
+      } catch (readErr) {
+        outputChannel.appendLine(`[Rex] Error reading Go file for diagnostic: ${readErr}`);
+        diagnosticCol = 0;
+        diagnosticEndCol = 1;
+      }
+      // No related info needed as the diagnostic itself is on the Go file
+      relatedInfo = undefined;
+
+    } else {
+      // For other validation errors, point to the template file itself
+      const baseDir = templateBaseDir === '' ? workspaceRoot : path.join(workspaceRoot, templateBaseDir);
+      diagnosticFilePath = path.join(baseDir, templateRoot, err.template);
+      diagnosticLine = Math.max(0, err.line - 1);
+      diagnosticCol = Math.max(0, err.column - 1);
+      diagnosticEndCol = diagnosticCol + (err.variable?.length || 1);
+
+      if (err.goFile) {
+        const goFileAbs = path.join(workspaceRoot, sourceDir, err.goFile);
+        relatedInfo = [
+          new vscode.DiagnosticRelatedInformation(
+            new vscode.Location(
+              vscode.Uri.file(goFileAbs),
+              new vscode.Position(Math.max(0, (err.goLine ?? 1) - 1), 0)
+            ),
+            'Variable passed from here'
+          ),
+        ];
+      }
+    }
+
+    const range = new vscode.Range(diagnosticLine, diagnosticCol, diagnosticLine, diagnosticEndCol);
     const diag = new vscode.Diagnostic(
       range,
       err.message,
       err.severity === 'warning' ? vscode.DiagnosticSeverity.Warning : vscode.DiagnosticSeverity.Error
     );
     diag.source = 'Rex';
-
-    if (err.goFile) {
-      const goFileAbs = path.join(workspaceRoot, sourceDir, err.goFile);
-      diag.relatedInformation = [
-        new vscode.DiagnosticRelatedInformation(
-          new vscode.Location(
-            vscode.Uri.file(goFileAbs),
-            new vscode.Position(Math.max(0, (err.goLine ?? 1) - 1), 0)
-          ),
-          'Variable passed from here'
-        ),
-      ];
+    if (relatedInfo) {
+      diag.relatedInformation = relatedInfo;
     }
 
-    const list = issuesByFile.get(absPath) ?? [];
+    const list = issuesByFile.get(diagnosticFilePath) ?? [];
     list.push(diag);
-    issuesByFile.set(absPath, list);
+    issuesByFile.set(diagnosticFilePath, list);
   }
 
   for (const [filePath, issues] of issuesByFile) {

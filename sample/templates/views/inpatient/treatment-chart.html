@@ -19,6 +19,7 @@
     <h2>Management</h2>
     {{ range .management }}
     <div>{{ .Name }}: {{ .Dosage }}</div>
+    {{ $.Title }}
     {{ end }}
 
     <h2>Prescriptions</h2>

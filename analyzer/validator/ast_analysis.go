@@ -87,7 +87,7 @@ func AnalyzeDir(dir string) AnalysisResult {
 				return true
 			}
 
-			if sel.Sel.Name != "Render" || len(call.Args) < 2 {
+			if (sel.Sel.Name != "Render" && sel.Sel.Name != "ExecuteTemplate") || len(call.Args) < 2 {
 				return true
 			}
 			templatePath := extractString(call.Args[0])
