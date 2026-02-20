@@ -274,13 +274,15 @@ async function rebuildIndex(workspaceRoot: string) {
         for (const rc of ctx.renderCalls) {
           extensionGeneratedErrors.push({
             template: logicalPath,
-            line: 0,
-            column: 0,
-            variable: '',
+            line: rc.line,
+            column: rc.templateNameStartCol,
+            variable: logicalPath,
             message: `Template file not found: ${logicalPath}`,
             severity: 'error',
             goFile: rc.file,
             goLine: rc.line,
+            templateNameStartCol: rc.templateNameStartCol,
+            templateNameEndCol: rc.templateNameEndCol,
           });
           extensionMissingTemplateLogicalPaths.add(logicalPath);
         }
@@ -343,26 +345,10 @@ async function applyAnalyzerDiagnostics(
       diagnosticFilePath = path.join(workspaceRoot, sourceDir, err.goFile);
       diagnosticLine = Math.max(0, err.goLine - 1);
 
-      // Attempt to find the column of the template name within the Go line
-      try {
-        const goDoc = await vscode.workspace.openTextDocument(diagnosticFilePath);
-        const goLineText = goDoc.lineAt(diagnosticLine).text;
-        const templateNameRegex = new RegExp(`("|')?${err.template.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}("|')?`);
-        const match = goLineText.match(templateNameRegex);
+      // Use the precise column info from the error object
+      diagnosticCol = Math.max(0, (err.templateNameStartCol ?? 1) - 1);
+      diagnosticEndCol = Math.max(0, (err.templateNameEndCol ?? (err.templateNameStartCol ?? 1) + err.template.length) - 1); // Fallback if end col is missing
 
-        if (match && match.index !== undefined) {
-          diagnosticCol = match.index;
-          diagnosticEndCol = match.index + match[0].length;
-        } else {
-          // Fallback to start of line if not found
-          diagnosticCol = 0;
-          diagnosticEndCol = goLineText.length;
-        }
-      } catch (readErr) {
-        outputChannel.appendLine(`[Rex] Error reading Go file for diagnostic: ${readErr}`);
-        diagnosticCol = 0;
-        diagnosticEndCol = 1;
-      }
       // No related info needed as the diagnostic itself is on the Go file
       relatedInfo = undefined;
 

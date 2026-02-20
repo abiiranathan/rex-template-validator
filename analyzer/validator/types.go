@@ -32,22 +32,26 @@ type FieldInfo struct {
 
 // RenderCall represents a c.Render() call found in Go source
 type RenderCall struct {
-	File     string        `json:"file"`
-	Line     int           `json:"line"`
-	Template string        `json:"template"`
-	Vars     []TemplateVar `json:"vars"`
+	File                 string        `json:"file"`
+	Line                 int           `json:"line"`
+	Template             string        `json:"template"`
+	TemplateNameStartCol int           `json:"templateNameStartCol,omitempty"`
+	TemplateNameEndCol   int           `json:"templateNameEndCol,omitempty"`
+	Vars                 []TemplateVar `json:"vars"`
 }
 
 // ValidationResult represents a validation error
 type ValidationResult struct {
-	Template string `json:"template"`
-	Line     int    `json:"line"`
-	Column   int    `json:"column"`
-	Variable string `json:"variable"`
-	Message  string `json:"message"`
-	Severity string `json:"severity"`         // "error" or "warning"
-	GoFile   string `json:"goFile,omitempty"` // source .go file containing the c.Render() call
-	GoLine   int    `json:"goLine,omitempty"` // line of the c.Render() call
+	Template             string `json:"template"`
+	Line                 int    `json:"line"`
+	Column               int    `json:"column"`
+	Variable             string `json:"variable"`
+	Message              string `json:"message"`
+	Severity             string `json:"severity"`
+	GoFile               string `json:"goFile,omitempty"`
+	GoLine               int    `json:"goLine,omitempty"`
+	TemplateNameStartCol int    `json:"templateNameStartCol,omitempty"`
+	TemplateNameEndCol   int    `json:"templateNameEndCol,omitempty"`
 }
 
 // AnalysisResult is the top-level output

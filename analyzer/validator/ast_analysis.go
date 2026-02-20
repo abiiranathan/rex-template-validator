@@ -13,6 +13,12 @@ import (
 	"golang.org/x/tools/go/packages"
 )
 
+func getExprColumnRange(fset *token.FileSet, expr ast.Expr) (startCol, endCol int) {
+	pos := fset.Position(expr.Pos())
+	endPos := fset.Position(expr.End())
+	return pos.Column, endPos.Column
+}
+
 func AnalyzeDir(dir string) AnalysisResult {
 	result := AnalysisResult{}
 	fset := token.NewFileSet()
@@ -90,7 +96,15 @@ func AnalyzeDir(dir string) AnalysisResult {
 			if (sel.Sel.Name != "Render" && sel.Sel.Name != "ExecuteTemplate") || len(call.Args) < 2 {
 				return true
 			}
-			templatePath := extractString(call.Args[0])
+			templatePathExpr := call.Args[0]
+			templatePath := extractString(templatePathExpr)
+
+			tplNameStartCol, tplNameEndCol := getExprColumnRange(fset, templatePathExpr)
+			if lit, ok := templatePathExpr.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+				tplNameStartCol += 1
+				tplNameEndCol -= 1
+			}
+
 			if templatePath == "" {
 				return true
 			}
@@ -106,10 +120,12 @@ func AnalyzeDir(dir string) AnalysisResult {
 			}
 
 			result.RenderCalls = append(result.RenderCalls, RenderCall{
-				File:     relFile,
-				Line:     pos.Line,
-				Template: templatePath,
-				Vars:     vars,
+				File:                 relFile,
+				Line:                 pos.Line,
+				Template:             templatePath,
+				TemplateNameStartCol: tplNameStartCol,
+				TemplateNameEndCol:   tplNameEndCol,
+				Vars:                 vars,
 			})
 			return true
 		})

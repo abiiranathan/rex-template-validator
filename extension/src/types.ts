@@ -32,6 +32,8 @@ export interface RenderCall {
   file: string;   // relative to sourceDir, e.g. "handler.go"
   line: number;
   template: string; // e.g. "views/inpatient/treatment-chart.html"
+  templateNameStartCol: number;
+  templateNameEndCol: number;
   vars: TemplateVar[];
 }
 
@@ -44,6 +46,8 @@ export interface GoValidationError {
   severity: 'error' | 'warning';
   goFile?: string;  // relative path to the .go file with the c.Render() call
   goLine?: number;  // line number of the c.Render() call
+  templateNameStartCol?: number;
+  templateNameEndCol?: number;
 }
 
 export interface AnalysisResult {
