@@ -264,27 +264,47 @@ async function rebuildIndex(workspaceRoot: string) {
     statusBarItem.text = `$(check) Rex: ${count} template${count === 1 ? '' : 's'} indexed`;
 
     // Apply diagnostics from Go analyzer
-    const validationErrors = result.validationErrors ?? [];
+    const initialValidationErrors = result.validationErrors ?? [];
+    const extensionMissingTemplateLogicalPaths = new Set<string>();
+    const extensionGeneratedErrors: GoValidationError[] = [];
 
     // Check for missing templates
     for (const [logicalPath, ctx] of currentGraph.templates) {
-        if (!fs.existsSync(ctx.absolutePath)) {
-            for (const rc of ctx.renderCalls) {
-                validationErrors.push({
-                    template: logicalPath,
-                    line: 0,
-                    column: 0,
-                    variable: '',
-                    message: `Template file not found: ${logicalPath}`,
-                    severity: 'error',
-                    goFile: rc.file,
-                    goLine: rc.line,
-                });
-            }
+      if (!fs.existsSync(ctx.absolutePath)) {
+        for (const rc of ctx.renderCalls) {
+          extensionGeneratedErrors.push({
+            template: logicalPath,
+            line: 0,
+            column: 0,
+            variable: '',
+            message: `Template file not found: ${logicalPath}`,
+            severity: 'error',
+            goFile: rc.file,
+            goLine: rc.line,
+          });
+          extensionMissingTemplateLogicalPaths.add(logicalPath);
         }
+      }
     }
 
-    await applyAnalyzerDiagnostics(validationErrors, workspaceRoot, sourceDir, templateRoot, templateBaseDir);
+    const finalValidationErrors: GoValidationError[] = [];
+
+    // Filter out analyzer errors if a more precise extension error exists
+    for (const analyzerErr of initialValidationErrors) {
+      if (
+        analyzerErr.message.includes('Could not read template file:') &&
+        extensionMissingTemplateLogicalPaths.has(analyzerErr.template)
+      ) {
+        // Skip this analyzer error as the extension provides a better one
+        continue;
+      }
+      finalValidationErrors.push(analyzerErr);
+    }
+
+    // Add all extension-generated errors
+    finalValidationErrors.push(...extensionGeneratedErrors);
+
+    await applyAnalyzerDiagnostics(finalValidationErrors, workspaceRoot, sourceDir, templateRoot, templateBaseDir);
 
     // Re-validate open template docs with fresh graph (editor diagnostics only)
     for (const doc of vscode.workspace.textDocuments) {

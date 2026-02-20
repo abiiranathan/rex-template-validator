@@ -13,7 +13,7 @@
         {{ end }}
     </nav>
 
-    <h1>{{ .Title }}</h1>
+    <h1>{{ upper .Title }}</h1>
     <p>Patient: {{ .visit.Patient.Name }}</p>
     <p>Doctor: {{ .doctor }}</p>
     <h2>Management</h2>
