@@ -41,7 +41,7 @@
     <!-- Include a partial -->
     {{ template "views/partials/footer.html" .visit }}
 
-    {{ block "billed-drug" }}
+    {{ define "billed-drug" }}
     <div>{{ .Name }}</div>
     {{ end }}
 </body>

@@ -1,0 +1,5985 @@
+================================================================
+  PROJECT: /home/nabiizy/Code/go/rex-template-validator
+  Generated: 2026-02-20 07:56:31 UTC
+================================================================
+
+################################################################
+# FILE: analyzer/main.go
+################################################################
+package main
+
+import (
+	"encoding/json"
+	"flag"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/rex-template-analyzer/validator"
+)
+
+func main() {
+	dir := flag.String("dir", ".", "Go source directory to analyze")
+	templateRoot := flag.String("template-root", "", "Root directory for templates (relative to template-base-dir)")
+	templateBaseDir := flag.String("template-base-dir", "", "Base directory for template-root (defaults to -dir if not set)")
+	validate := flag.Bool("validate", false, "Validate templates against render calls")
+	flag.Parse()
+
+	absDir := mustAbs(*dir)
+
+	// If no explicit template base dir is given, fall back to the source dir.
+	templateBase := absDir
+	if *templateBaseDir != "" {
+		templateBase = mustAbs(*templateBaseDir)
+	}
+
+	result := validator.AnalyzeDir(absDir)
+	result.Errors = filterImportErrors(result.Errors)
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+
+	if *validate {
+		enc.Encode(struct {
+			RenderCalls      []validator.RenderCall       `json:"renderCalls"`
+			ValidationErrors []validator.ValidationResult `json:"validationErrors"`
+			Errors           []string                     `json:"errors,omitempty"`
+		}{
+			RenderCalls:      result.RenderCalls,
+			ValidationErrors: validator.ValidateTemplates(result.RenderCalls, templateBase, *templateRoot),
+			Errors:           result.Errors,
+		})
+	} else {
+		enc.Encode(result)
+	}
+}
+
+// mustAbs returns the absolute form of path, panicking if it cannot be resolved.
+// filepath.Abs only fails when os.Getwd fails, which indicates a broken
+// working directory — not a condition worth recovering from gracefully.
+func mustAbs(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		panic("could not resolve absolute path for " + path + ": " + err.Error())
+	}
+	return abs
+}
+
+// filterImportErrors removes type-check errors caused by missing third-party
+// dependencies. These are expected when the analyzer runs outside the module's
+// full dependency tree and do not affect template variable extraction, which
+// uses AST fallback paths.
+func filterImportErrors(errs []string) []string {
+	filtered := make([]string, 0, len(errs))
+	for _, e := range errs {
+		if !isImportError(e) {
+			filtered = append(filtered, e)
+		}
+	}
+	return filtered
+}
+
+func isImportError(e string) bool {
+	lower := strings.ToLower(e)
+	for _, phrase := range []string{
+		"could not import",
+		"can't find import",
+		"cannot find package",
+		"no required module provides",
+		"build constraints exclude all Go files",
+	} {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+
+################################################################
+# FILE: analyzer/validator/ast_analysis.go
+################################################################
+package validator
+
+import (
+	"fmt"
+	"go/ast"
+	"go/token"
+	"go/types"
+	"maps"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"golang.org/x/tools/go/packages"
+)
+
+func AnalyzeDir(dir string) AnalysisResult {
+	result := AnalysisResult{}
+	fset := token.NewFileSet()
+
+	cfg := &packages.Config{
+		Mode: packages.NeedName |
+			packages.NeedFiles |
+			packages.NeedSyntax |
+			packages.NeedTypes |
+			packages.NeedTypesInfo |
+			packages.NeedTypesSizes,
+		Dir:   dir,
+		Fset:  fset,
+		Tests: false,
+	}
+
+	pkgs, err := packages.Load(cfg, ".")
+	if err != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf("load error: %v", err))
+		return result
+	}
+
+	var allFiles []*ast.File
+	var info *types.Info
+
+	for _, pkg := range pkgs {
+		for _, e := range pkg.Errors {
+			if !isImportRelatedError(e.Msg) {
+				result.Errors = append(result.Errors, fmt.Sprintf("type error: %v", e.Msg))
+			}
+		}
+		allFiles = append(allFiles, pkg.Syntax...)
+		if pkg.TypesInfo != nil {
+			if info == nil {
+				info = pkg.TypesInfo
+			} else {
+				maps.Copy(info.Types, pkg.TypesInfo.Types)
+				maps.Copy(info.Defs, pkg.TypesInfo.Defs)
+				maps.Copy(info.Uses, pkg.TypesInfo.Uses)
+			}
+		}
+	}
+
+	if info == nil {
+		info = &types.Info{
+			Types: make(map[ast.Expr]types.TypeAndValue),
+			Defs:  make(map[*ast.Ident]types.Object),
+			Uses:  make(map[*ast.Ident]types.Object),
+		}
+	}
+
+	// Build file map and pre-compute all struct positions once — not per call.
+	filesMap := make(map[string]*ast.File)
+	for _, f := range allFiles {
+		if pos := fset.File(f.Pos()); pos != nil {
+			filesMap[pos.Name()] = f
+		}
+	}
+
+	// structIndex is built once and shared for the lifetime of this analysis.
+	// Key: "pkgName.TypeName" to avoid cross-package name collisions.
+	structIndex := buildStructIndex(fset, filesMap)
+
+	for _, f := range allFiles {
+		ast.Inspect(f, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+
+			if sel.Sel.Name != "Render" || len(call.Args) < 2 {
+				return true
+			}
+			templatePath := extractString(call.Args[0])
+			if templatePath == "" {
+				return true
+			}
+
+			vars := extractMapVars(call.Args[1], info, fset, structIndex)
+
+			pos := fset.Position(call.Pos())
+			relFile := pos.Filename
+			if abs, err := filepath.Abs(pos.Filename); err == nil {
+				if rel, err := filepath.Rel(dir, abs); err == nil {
+					relFile = rel
+				}
+			}
+
+			result.RenderCalls = append(result.RenderCalls, RenderCall{
+				File:     relFile,
+				Line:     pos.Line,
+				Template: templatePath,
+				Vars:     vars,
+			})
+			return true
+		})
+	}
+
+	return result
+}
+
+// structKey returns a stable map key for a named type, qualified by package
+// name to prevent collisions between same-named types in different packages.
+func structKey(named *types.Named) string {
+	obj := named.Obj()
+	if obj.Pkg() != nil {
+		return obj.Pkg().Name() + "." + obj.Name()
+	}
+	return obj.Name()
+}
+
+// structIndexEntry holds the pre-computed documentation and field positions
+// for a single struct type.
+type structIndexEntry struct {
+	doc    string
+	fields map[string]fieldInfo
+}
+
+// buildStructIndex walks all AST files once and indexes every struct type by
+// "pkgName.TypeName". Call this once per analysis run.
+func buildStructIndex(fset *token.FileSet, files map[string]*ast.File) map[string]structIndexEntry {
+	index := make(map[string]structIndexEntry)
+
+	for _, f := range files {
+		// Derive a package name prefix from the file's package declaration.
+		pkgName := f.Name.Name
+
+		ast.Inspect(f, func(n ast.Node) bool {
+			genDecl, ok := n.(*ast.GenDecl)
+			if !ok || genDecl.Tok != token.TYPE {
+				return true
+			}
+			for _, spec := range genDecl.Specs {
+				typeSpec, ok := spec.(*ast.TypeSpec)
+				if !ok {
+					continue
+				}
+				structType, ok := typeSpec.Type.(*ast.StructType)
+				if !ok {
+					continue
+				}
+
+				entry := structIndexEntry{
+					doc:    getTypeDoc(genDecl, typeSpec),
+					fields: make(map[string]fieldInfo),
+				}
+
+				for _, field := range structType.Fields.List {
+					pos := fset.Position(field.Pos())
+					doc := getFieldDoc(field)
+					for _, name := range field.Names {
+						entry.fields[name.Name] = fieldInfo{
+							file: pos.Filename,
+							line: pos.Line,
+							col:  pos.Column,
+							doc:  doc,
+						}
+					}
+				}
+
+				key := pkgName + "." + typeSpec.Name.Name
+				index[key] = entry
+			}
+			return true
+		})
+	}
+
+	return index
+}
+
+func isImportRelatedError(msg string) bool {
+	lower := strings.ToLower(msg)
+	for _, phrase := range []string{
+		"could not import",
+		"can't find import",
+		"cannot find package",
+		"no required module provides",
+	} {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+func extractString(expr ast.Expr) string {
+	lit, ok := expr.(*ast.BasicLit)
+	if !ok || lit.Kind != token.STRING || len(lit.Value) < 2 {
+		return ""
+	}
+	return lit.Value[1 : len(lit.Value)-1]
+}
+
+func extractMapVars(expr ast.Expr, info *types.Info, fset *token.FileSet, structIndex map[string]structIndexEntry) []TemplateVar {
+	comp, ok := expr.(*ast.CompositeLit)
+	if !ok {
+		return nil
+	}
+
+	var vars []TemplateVar
+	for _, elt := range comp.Elts {
+		kv, ok := elt.(*ast.KeyValueExpr)
+		if !ok {
+			continue
+		}
+		keyLit, ok := kv.Key.(*ast.BasicLit)
+		if !ok {
+			continue
+		}
+
+		name := strings.Trim(keyLit.Value, `"`)
+		tv := TemplateVar{Name: name}
+
+		if typeInfo, ok := info.Types[kv.Value]; ok {
+			tv.TypeStr = normalizeTypeStr(typeInfo.Type.String())
+			// seen guards against infinite recursion on self-referential types.
+			seen := make(map[string]bool)
+			tv.Fields, tv.Doc = extractFieldsWithDocs(typeInfo.Type, structIndex, seen)
+
+			if elemType := getElementType(typeInfo.Type); elemType != nil {
+				tv.IsSlice = true
+				tv.ElemType = normalizeTypeStr(elemType.String())
+				elemFields, elemDoc := extractFieldsWithDocs(elemType, structIndex, seen)
+				tv.Fields = elemFields
+				if elemDoc != "" {
+					tv.Doc = elemDoc
+				}
+			}
+		} else {
+			tv.TypeStr = inferTypeFromAST(kv.Value)
+		}
+
+		tv.DefFile, tv.DefLine, tv.DefCol = findDefinitionLocation(kv.Value, info, fset)
+		vars = append(vars, tv)
+	}
+	return vars
+}
+
+func findDefinitionLocation(expr ast.Expr, info *types.Info, fset *token.FileSet) (string, int, int) {
+	var ident *ast.Ident
+	switch e := expr.(type) {
+	case *ast.Ident:
+		ident = e
+	case *ast.UnaryExpr:
+		if id, ok := e.X.(*ast.Ident); ok {
+			ident = id
+		}
+	case *ast.CallExpr:
+		pos := fset.Position(e.Pos())
+		return pos.Filename, pos.Line, pos.Column
+	case *ast.CompositeLit:
+		pos := fset.Position(e.Pos())
+		return pos.Filename, pos.Line, pos.Column
+	case *ast.SelectorExpr:
+		pos := fset.Position(e.Sel.Pos())
+		return pos.Filename, pos.Line, pos.Column
+	}
+
+	if ident != nil {
+		if obj, ok := info.Defs[ident]; ok && obj != nil {
+			pos := fset.Position(obj.Pos())
+			return pos.Filename, pos.Line, pos.Column
+		}
+		if obj, ok := info.Uses[ident]; ok && obj != nil {
+			pos := fset.Position(obj.Pos())
+			return pos.Filename, pos.Line, pos.Column
+		}
+		pos := fset.Position(ident.Pos())
+		return pos.Filename, pos.Line, pos.Column
+	}
+
+	pos := fset.Position(expr.Pos())
+	return pos.Filename, pos.Line, pos.Column
+}
+
+func normalizeTypeStr(s string) string {
+	prefix := ""
+	base := s
+	for {
+		switch {
+		case strings.HasPrefix(base, "[]"):
+			prefix += "[]"
+			base = base[2:]
+		case strings.HasPrefix(base, "*"):
+			prefix += "*"
+			base = base[1:]
+		default:
+			if idx := strings.LastIndex(base, "/"); idx >= 0 {
+				base = base[idx+1:]
+			}
+			return prefix + base
+		}
+	}
+}
+
+func getElementType(t types.Type) types.Type {
+	switch v := t.(type) {
+	case *types.Slice:
+		return v.Elem()
+	case *types.Pointer:
+		return getElementType(v.Elem())
+	case *types.Named:
+		return getElementType(v.Underlying())
+	}
+	return nil
+}
+
+func extractFieldsWithDocs(t types.Type, structIndex map[string]structIndexEntry, seen map[string]bool) ([]FieldInfo, string) {
+	if t == nil {
+		return nil, ""
+	}
+	if ptr, ok := t.(*types.Pointer); ok {
+		return extractFieldsWithDocs(ptr.Elem(), structIndex, seen)
+	}
+
+	named, ok := t.(*types.Named)
+	if !ok {
+		return nil, ""
+	}
+
+	// Cycle guard: if we've already started processing this type, stop.
+	key := structKey(named)
+	if seen[key] {
+		return nil, ""
+	}
+	seen[key] = true
+
+	strct, ok := named.Underlying().(*types.Struct)
+	if !ok {
+		// Interface or other named type: expose exported methods only.
+		var fields []FieldInfo
+		for i := 0; i < named.NumMethods(); i++ {
+			m := named.Method(i)
+			if m.Exported() {
+				fields = append(fields, FieldInfo{
+					Name:    m.Name(),
+					TypeStr: normalizeTypeStr(m.Type().String()),
+				})
+			}
+		}
+		return fields, ""
+	}
+
+	entry := structIndex[key]
+
+	var fields []FieldInfo
+	for i := 0; i < strct.NumFields(); i++ {
+		f := strct.Field(i)
+		if !f.Exported() {
+			continue
+		}
+
+		fi := FieldInfo{
+			Name:    f.Name(),
+			TypeStr: normalizeTypeStr(f.Type().String()),
+		}
+
+		ft := f.Type()
+		if ptr, ok := ft.(*types.Pointer); ok {
+			ft = ptr.Elem()
+		}
+		if slice, ok := ft.(*types.Slice); ok {
+			fi.IsSlice = true
+			fi.Fields, _ = extractFieldsWithDocs(slice.Elem(), structIndex, seen)
+		} else {
+			fi.Fields, _ = extractFieldsWithDocs(ft, structIndex, seen)
+		}
+
+		if pos, ok := entry.fields[f.Name()]; ok {
+			fi.DefFile = pos.file
+			fi.DefLine = pos.line
+			fi.DefCol = pos.col
+			fi.Doc = pos.doc
+		}
+
+		fields = append(fields, fi)
+	}
+
+	// Append exported methods after fields.
+	for i := 0; i < named.NumMethods(); i++ {
+		m := named.Method(i)
+		if m.Exported() {
+			fields = append(fields, FieldInfo{Name: m.Name(), TypeStr: "method"})
+		}
+	}
+
+	return fields, entry.doc
+}
+
+type fieldInfo struct {
+	file string
+	line int
+	col  int
+	doc  string
+}
+
+func getTypeDoc(genDecl *ast.GenDecl, typeSpec *ast.TypeSpec) string {
+	if genDecl.Doc != nil {
+		return genDecl.Doc.Text()
+	}
+	if typeSpec.Doc != nil {
+		return typeSpec.Doc.Text()
+	}
+	if typeSpec.Comment != nil {
+		return typeSpec.Comment.Text()
+	}
+	return ""
+}
+
+func getFieldDoc(field *ast.Field) string {
+	if field.Doc != nil {
+		return field.Doc.Text()
+	}
+	if field.Comment != nil {
+		return field.Comment.Text()
+	}
+	return ""
+}
+
+func inferTypeFromAST(expr ast.Expr) string {
+	switch e := expr.(type) {
+	case *ast.BasicLit:
+		switch e.Kind {
+		case token.STRING:
+			return "string"
+		case token.INT:
+			return "int"
+		case token.FLOAT:
+			return "float64"
+		}
+	case *ast.Ident:
+		return e.Name
+	case *ast.SelectorExpr:
+		return fmt.Sprintf("%v.%s", e.X, e.Sel.Name)
+	case *ast.CallExpr:
+		if sel, ok := e.Fun.(*ast.SelectorExpr); ok {
+			return fmt.Sprintf("call:%s", sel.Sel.Name)
+		}
+	case *ast.CompositeLit:
+		if e.Type != nil {
+			return fmt.Sprintf("%v", e.Type)
+		}
+	case *ast.UnaryExpr:
+		return "unary"
+	}
+	return "unknown"
+}
+
+func FindGoFiles(root string) ([]string, error) {
+	var files []string
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !info.IsDir() && strings.HasSuffix(path, ".go") {
+			files = append(files, path)
+		}
+		return nil
+	})
+	return files, err
+}
+
+
+################################################################
+# FILE: analyzer/validator/named_blocks_test.go
+################################################################
+package validator
+
+import (
+	"testing"
+)
+
+func TestDefineBlockPoppingScope(t *testing.T) {
+	content := `
+		{{ with .User }}
+			{{ define "header" }}
+				{{ .Age }}
+			{{ end }}
+			{{ .Name }}
+		{{ end }}
+	`
+	vars := []TemplateVar{
+		{
+			Name: "User",
+			TypeStr: "User",
+			Fields: []FieldInfo{
+				{Name: "Name", TypeStr: "string"},
+				{Name: "Age", TypeStr: "int"},
+			},
+		},
+	}
+	varMap := make(map[string]TemplateVar)
+	for _, v := range vars {
+		varMap[v.Name] = v
+	}
+
+	errs := validateTemplateContent(content, varMap, "test.html", ".", ".", 1, nil)
+	for _, e := range errs {
+		t.Logf("Error: %s (variable: %s)", e.Message, e.Variable)
+	}
+	if len(errs) != 0 {
+		t.Errorf("Expected 0 errors after fixing scope pop bug, but got %d", len(errs))
+	}
+}
+
+
+################################################################
+# FILE: analyzer/validator/statements_test.go
+################################################################
+package validator
+
+import (
+	"testing"
+)
+
+func TestStatementsAndFunctions(t *testing.T) {
+	content := `
+		{{ if (eq .User.Status "active") }}
+			{{ and (eq .User.Role "admin") (.Feature.Enabled) }}
+			{{ .User.Name | upper }}
+			{{ $.User.Age }}
+		{{ end }}
+		{{ range $i, $v := .User.Items }}
+		    {{ $.User.Age }}
+            {{ .Name }}
+		{{ end }}
+	`
+	vars := []TemplateVar{
+		{
+			Name:    "User",
+			TypeStr: "User",
+			Fields: []FieldInfo{
+				{Name: "Status", TypeStr: "string"},
+				{Name: "Role", TypeStr: "string"},
+				{Name: "Name", TypeStr: "string"},
+				{Name: "Age", TypeStr: "int"},
+				{
+					Name: "Items", TypeStr: "[]Item",
+					Fields: []FieldInfo{
+						{Name: "Name", TypeStr: "string"},
+					},
+				},
+			},
+		},
+		{
+			Name:    "Feature",
+			TypeStr: "Feature",
+			Fields: []FieldInfo{
+				{Name: "Enabled", TypeStr: "bool"},
+			},
+		},
+	}
+	varMap := make(map[string]TemplateVar)
+	for _, v := range vars {
+		varMap[v.Name] = v
+	}
+
+	errs := validateTemplateContent(content, varMap, "test.html", ".", ".", 1, nil)
+	if len(errs) > 0 {
+		for _, e := range errs {
+			t.Errorf("Unexpected error: %s (variable: %s)", e.Message, e.Variable)
+		}
+	}
+}
+
+func TestStatementsAndFunctions_Errors(t *testing.T) {
+	content := `
+		{{ if (eq .User.Invalid1 "active") }}
+		{{ end }}
+		{{ range .User.Items }}
+		    {{ $.User.Invalid2 }}
+            {{ .Invalid3 }}
+		{{ end }}
+	`
+	vars := []TemplateVar{
+		{
+			Name:    "User",
+			TypeStr: "User",
+			Fields: []FieldInfo{
+				{
+					Name: "Items", TypeStr: "[]Item",
+					Fields: []FieldInfo{
+						{Name: "Name", TypeStr: "string"},
+					},
+				},
+			},
+		},
+	}
+	varMap := make(map[string]TemplateVar)
+	for _, v := range vars {
+		varMap[v.Name] = v
+	}
+
+	errs := validateTemplateContent(content, varMap, "test.html", ".", ".", 1, nil)
+
+	expectedErrors := []string{
+		"Invalid1", "Invalid2", "Invalid3",
+	}
+
+	if len(errs) != len(expectedErrors) {
+		t.Errorf("Expected %d errors, got %d", len(expectedErrors), len(errs))
+	}
+
+	for _, e := range errs {
+		t.Logf("Error: %s (variable: %s)", e.Message, e.Variable)
+	}
+}
+
+
+################################################################
+# FILE: analyzer/validator/test_block_scoping2_test.go
+################################################################
+package validator
+
+import "testing"
+
+func TestBlockScoping2(t *testing.T) {
+	content := `
+	{{ range .billedDrugs }}
+        {{ template "billed-drug" . }}
+    {{ end }}
+    {{ block "billed-drug" . }}
+        <div>{{ capitalize or (.Name) | upper }}</div>
+    {{ end }}
+	`
+	vars := []TemplateVar{
+		{
+			Name: "billedDrugs",
+			TypeStr: "[]Drug",
+			Fields: []FieldInfo{
+				{Name: "Name", TypeStr: "string"},
+			},
+		},
+	}
+	varMap := make(map[string]TemplateVar)
+	varMap["billedDrugs"] = vars[0]
+	// intentionally DO NOT add .Name to root scope, because . is the root, not the Drug!
+	
+	errs := validateTemplateContent(content, varMap, "test.html", ".", ".", 1, nil)
+	for _, e := range errs {
+		t.Logf("Error: %s (variable: %s)", e.Message, e.Variable)
+	}
+	if len(errs) > 0 {
+		t.Errorf("Expected some errors or no errors? Let's see")
+	}
+}
+
+
+################################################################
+# FILE: analyzer/validator/test_block_scoping_test.go
+################################################################
+package validator
+
+import "testing"
+
+func TestBlockScoping(t *testing.T) {
+	content := `
+		{{ block "billed-drug" .Drug }}
+		    <div>{{ capitalize or (.Name) | upper }}</div>
+		{{ end }}
+	`
+	vars := []TemplateVar{
+		{
+			Name: "Drug",
+			TypeStr: "Drug",
+			Fields: []FieldInfo{
+				{Name: "Name", TypeStr: "string"},
+			},
+		},
+	}
+	varMap := make(map[string]TemplateVar)
+	varMap["Drug"] = vars[0]
+	
+	errs := validateTemplateContent(content, varMap, "test.html", ".", ".", 1, nil)
+	for _, e := range errs {
+		t.Logf("Error: %s (variable: %s)", e.Message, e.Variable)
+	}
+	if len(errs) > 0 {
+		t.Errorf("Expected 0 errors, got %d", len(errs))
+	}
+}
+
+
+################################################################
+# FILE: analyzer/validator/test_else_scope_test.go
+################################################################
+package validator
+
+import "testing"
+
+func TestElseScopePop(t *testing.T) {
+	content := `
+		{{ with .User }}
+			{{ if .Age }}
+				<p>Age is set</p>
+			{{ else if .Name }}
+			    <p>Name is set</p>
+			{{ else }}
+			    <p>Nothing is set</p>
+			{{ end }}
+			{{ .Name }}
+		{{ end }}
+	`
+	vars := []TemplateVar{
+		{
+			Name: "User",
+			TypeStr: "User",
+			Fields: []FieldInfo{
+				{Name: "Name", TypeStr: "string"},
+				{Name: "Age", TypeStr: "int"},
+			},
+		},
+	}
+	varMap := make(map[string]TemplateVar)
+	for _, v := range vars {
+		varMap[v.Name] = v
+	}
+
+	errs := validateTemplateContent(content, varMap, "test.html", ".", ".", 1, nil)
+	for _, e := range errs {
+		t.Logf("Error: %s (variable: %s)", e.Message, e.Variable)
+	}
+	if len(errs) > 0 {
+		t.Errorf("Expected 0 errors, got %d", len(errs))
+	}
+}
+
+
+################################################################
+# FILE: analyzer/validator/test_if_scope_test.go
+################################################################
+package validator
+
+import "testing"
+
+func TestIfScopePop(t *testing.T) {
+	content := `
+		{{ with .User }}
+			{{ if .Age }}
+				<p>Age is set</p>
+			{{ end }}
+			{{ .Name }}
+		{{ end }}
+	`
+	vars := []TemplateVar{
+		{
+			Name: "User",
+			TypeStr: "User",
+			Fields: []FieldInfo{
+				{Name: "Name", TypeStr: "string"},
+				{Name: "Age", TypeStr: "int"},
+			},
+		},
+	}
+	varMap := make(map[string]TemplateVar)
+	for _, v := range vars {
+		varMap[v.Name] = v
+	}
+
+	errs := validateTemplateContent(content, varMap, "test.html", ".", ".", 1, nil)
+	for _, e := range errs {
+		t.Logf("Error: %s (variable: %s)", e.Message, e.Variable)
+	}
+	if len(errs) > 0 {
+		t.Errorf("Expected 0 errors, got %d", len(errs))
+	}
+}
+
+
+################################################################
+# FILE: analyzer/validator/test_registry_test.go
+################################################################
+package validator
+
+import (
+	"testing"
+)
+
+func TestExtractNamedTemplates(t *testing.T) {
+	content := `
+		{{ define "header" }}
+			<h1>{{ .Title }}</h1>
+			{{ if .Subtitle }}
+				<h2>{{ .Subtitle }}</h2>
+			{{ end }}
+		{{ end }}
+		
+		{{ block "footer" .Data }}<footer>{{ .Copyright }}</footer>{{ end }}
+	`
+	reg := make(map[string]NamedTemplate)
+	extractNamedTemplatesFromContent(content, "test.html", reg)
+	for k, v := range reg {
+		t.Logf("Found %s at line %d:\n%q", k, v.LineNum, v.Content)
+	}
+	if len(reg) != 2 {
+		t.Errorf("Expected 2 templates, got %d", len(reg))
+	}
+}
+
+
+################################################################
+# FILE: analyzer/validator/types.go
+################################################################
+package validator
+
+// TemplateVar represents a variable available in a template context
+type TemplateVar struct {
+	Name     string      `json:"name"`
+	TypeStr  string      `json:"type"`
+	Fields   []FieldInfo `json:"fields,omitempty"`
+	IsSlice  bool        `json:"isSlice"`
+	ElemType string      `json:"elemType,omitempty"`
+	// Definition location in Go source (for go-to-definition)
+	DefFile string `json:"defFile,omitempty"` // Go file where the variable is defined
+	DefLine int    `json:"defLine,omitempty"` // Line number where the variable is defined
+	DefCol  int    `json:"defCol,omitempty"`  // Column number where the variable is defined
+	// Documentation
+	Doc string `json:"doc,omitempty"` // Documentation comment for the type
+}
+
+// FieldInfo represents a field in a struct type
+type FieldInfo struct {
+	Name    string      `json:"name"`
+	TypeStr string      `json:"type"`
+	Fields  []FieldInfo `json:"fields,omitempty"`
+	IsSlice bool        `json:"isSlice"`
+	Methods []string    `json:"methods,omitempty"`
+	// Definition location in Go source (for go-to-definition)
+	DefFile string `json:"defFile,omitempty"` // Go file where the field is defined
+	DefLine int    `json:"defLine,omitempty"` // Line number where the field is defined
+	DefCol  int    `json:"defCol,omitempty"`  // Column number where the field is defined
+	// Documentation
+	Doc string `json:"doc,omitempty"` // Documentation comment for the field
+}
+
+// RenderCall represents a c.Render() call found in Go source
+type RenderCall struct {
+	File     string        `json:"file"`
+	Line     int           `json:"line"`
+	Template string        `json:"template"`
+	Vars     []TemplateVar `json:"vars"`
+}
+
+// ValidationResult represents a validation error
+type ValidationResult struct {
+	Template string `json:"template"`
+	Line     int    `json:"line"`
+	Column   int    `json:"column"`
+	Variable string `json:"variable"`
+	Message  string `json:"message"`
+	Severity string `json:"severity"`         // "error" or "warning"
+	GoFile   string `json:"goFile,omitempty"` // source .go file containing the c.Render() call
+	GoLine   int    `json:"goLine,omitempty"` // line of the c.Render() call
+}
+
+// AnalysisResult is the top-level output
+type AnalysisResult struct {
+	RenderCalls []RenderCall `json:"renderCalls"`
+	Errors      []string     `json:"errors"`
+}
+
+// ScopeType represents the type of a scope (root or element type in a range)
+type ScopeType struct {
+	IsRoot   bool
+	VarName  string // Name of the variable (e.g., "breadcrumbs")
+	TypeStr  string // Type string (e.g., "handlers.Breadcrumbs")
+	ElemType string // For slices: element type (e.g., "handlers.Breadcrumb")
+	Fields   []FieldInfo
+	IsSlice  bool
+}
+
+
+################################################################
+# FILE: analyzer/validator/validator.go
+################################################################
+// Package validator
+package validator
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+)
+
+// NamedTemplate stores information about defined blocks and named templates
+type NamedTemplate struct {
+	Name     string
+	Content  string
+	FilePath string
+	LineNum  int
+}
+
+// countLines counts newlines in a string
+func countLines(s string) int {
+	return strings.Count(s, "\n")
+}
+
+// parseAllNamedTemplates extracts all define and block declarations from template files
+func parseAllNamedTemplates(baseDir, templateRoot string) map[string]NamedTemplate {
+	registry := make(map[string]NamedTemplate)
+	root := filepath.Join(baseDir, templateRoot)
+
+	filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		if !isFileBasedPartial(path) {
+			return nil
+		}
+
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			rel = path
+		}
+
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+
+		extractNamedTemplatesFromContent(string(content), rel, registry)
+		return nil
+	})
+
+	return registry
+}
+
+// extractNamedTemplatesFromContent finds defined templates within content
+func extractNamedTemplatesFromContent(content, templateName string, registry map[string]NamedTemplate) {
+	actionPattern := regexp.MustCompile(`\{\{\s*(.+?)\s*\}\}`)
+	matches := actionPattern.FindAllStringSubmatchIndex(content, -1)
+
+	var activeName string
+	var startIndex int
+	var startLine int
+	depth := 0
+
+	for _, match := range matches {
+		if len(match) < 4 {
+			continue
+		}
+
+		fullActionStart := match[0]
+		fullActionEnd := match[1]
+		actionStart := match[2]
+		actionEnd := match[3]
+
+		action := strings.TrimSpace(content[actionStart:actionEnd])
+		if strings.HasPrefix(action, "/*") || strings.HasPrefix(action, "//") {
+			continue
+		}
+
+		words := strings.Fields(action)
+		if len(words) == 0 {
+			continue
+		}
+
+		first := words[0]
+
+		switch first {
+		case "if", "with", "range", "block":
+			if activeName != "" {
+				depth++
+			} else if first == "block" && len(words) >= 2 {
+				activeName = strings.Trim(words[1], `"`)
+				startIndex = fullActionEnd
+				startLine = countLines(content[:fullActionEnd]) + 1
+				depth = 1
+			}
+		case "define":
+			if activeName != "" {
+				depth++
+			} else if len(words) >= 2 {
+				activeName = strings.Trim(words[1], `"`)
+				startIndex = fullActionEnd
+				startLine = countLines(content[:fullActionEnd]) + 1
+				depth = 1
+			}
+		case "end":
+			if activeName != "" {
+				depth--
+				if depth == 0 {
+					registry[activeName] = NamedTemplate{
+						Name:     activeName,
+						Content:  content[startIndex:fullActionStart],
+						FilePath: templateName,
+						LineNum:  startLine,
+					}
+					activeName = ""
+				}
+			}
+		}
+	}
+}
+
+// ValidateTemplates validates all templates against their render calls
+func ValidateTemplates(renderCalls []RenderCall, baseDir string, templateRoot string) []ValidationResult {
+	namedTemplates := parseAllNamedTemplates(baseDir, templateRoot)
+
+	var allErrors = []ValidationResult{}
+	for _, rc := range renderCalls {
+		templatePath := filepath.Join(baseDir, templateRoot, rc.Template)
+		errors := validateTemplateFile(templatePath, rc.Vars, rc.Template, baseDir, templateRoot, namedTemplates)
+		// Stamp each error with the originating Go file/line
+		for i := range errors {
+			errors[i].GoFile = rc.File
+			errors[i].GoLine = rc.Line
+		}
+		allErrors = append(allErrors, errors...)
+	}
+	return allErrors
+}
+
+// validateTemplateFile validates a single template file
+func validateTemplateFile(templatePath string, vars []TemplateVar, templateName string, baseDir, templateRoot string, registry map[string]NamedTemplate) []ValidationResult {
+	content, err := os.ReadFile(templatePath)
+	if err != nil {
+		return []ValidationResult{{
+			Template: templateName,
+			Line:     0,
+			Column:   0,
+			Variable: "",
+			Message:  fmt.Sprintf("Could not read template file: %v", err),
+			Severity: "error",
+		}}
+	}
+
+	varMap := make(map[string]TemplateVar)
+	for _, v := range vars {
+		varMap[v.Name] = v
+	}
+	return validateTemplateContent(string(content), varMap, templateName, baseDir, templateRoot, 1, registry)
+}
+
+// isFileBasedPartial returns true if the template name looks like a file path
+// (contains a path separator or has a file extension like .html, .tmpl, .gohtml)
+func isFileBasedPartial(name string) bool {
+	if strings.ContainsAny(name, "/\\") {
+		return true
+	}
+	ext := strings.ToLower(filepath.Ext(name))
+	switch ext {
+	case ".html", ".tmpl", ".gohtml", ".tpl", ".htm":
+		return true
+	}
+	return false
+}
+
+// validateTemplateContent validates template content with proper scope tracking
+func validateTemplateContent(content string, varMap map[string]TemplateVar, templateName string, baseDir, templateRoot string, lineOffset int, registry map[string]NamedTemplate) []ValidationResult {
+	var errors []ValidationResult
+
+	var scopeStack []ScopeType
+
+	rootScope := ScopeType{
+		IsRoot: true,
+		Fields: make([]FieldInfo, 0),
+	}
+	for name, v := range varMap {
+		rootScope.Fields = append(rootScope.Fields, FieldInfo{
+			Name:    name,
+			TypeStr: v.TypeStr,
+			IsSlice: v.IsSlice,
+			Fields:  v.Fields,
+		})
+	}
+	scopeStack = append(scopeStack, rootScope)
+
+	actionPattern := regexp.MustCompile(`\{\{\s*(.+?)\s*\}\}`)
+	lines := strings.Split(content, "\n")
+
+	skipDepth := 0
+
+	for i, line := range lines {
+		actualLineNum := i + lineOffset
+		matches := actionPattern.FindAllStringSubmatchIndex(line, -1)
+
+		for _, match := range matches {
+			if len(match) < 4 {
+				continue
+			}
+
+			action := strings.TrimSpace(line[match[2]:match[3]])
+			col := match[2] + 1
+
+			if strings.HasPrefix(action, "/*") || strings.HasPrefix(action, "//") {
+				continue
+			}
+
+			words := strings.Fields(action)
+			first := ""
+			if len(words) > 0 {
+				first = words[0]
+			}
+
+			if first == "define" || first == "block" {
+				skipDepth++
+				continue
+			}
+
+			if skipDepth > 0 {
+				switch first {
+				case "if", "with", "range", "block":
+					skipDepth++
+				case "end":
+					skipDepth--
+				}
+				continue
+			}
+
+			// Validate all variables in the action against the CURRENT scope before modifying it
+			varsInAction := extractVariablesFromAction(action)
+			for _, v := range varsInAction {
+				if err := validateVariableInScope(v, scopeStack, varMap, actualLineNum, col, templateName); err != nil {
+					errors = append(errors, *err)
+				}
+			}
+
+			// Handle range
+			if first == "range" {
+				rangeExpr := strings.TrimSpace(action[6:])
+				newScope := createScopeFromRange(rangeExpr, scopeStack, varMap)
+				scopeStack = append(scopeStack, newScope)
+				continue
+			}
+
+			// Handle with
+			if first == "with" {
+				withExpr := strings.TrimSpace(action[5:])
+				newScope := createScopeFromWith(withExpr, scopeStack, varMap)
+				scopeStack = append(scopeStack, newScope)
+				continue
+			}
+
+			// Handle block (pushes scope like with, validates pipeline)
+			// Wait, if block is skipped by skipDepth, we never reach here during the initial pass.
+			// However, if we recursively validate the block's content from the registry,
+			// the block string itself shouldn't be in the registry's content body (only the inside).
+			// If it IS, we would need to not skip it. But let's check what the registry holds!
+
+			// Handle if (pushes copy of current scope since `if` needs an `end`)
+			if first == "if" {
+				if len(scopeStack) > 0 {
+					scopeStack = append(scopeStack, scopeStack[len(scopeStack)-1])
+				} else {
+					scopeStack = append(scopeStack, ScopeType{})
+				}
+				continue
+			}
+
+			// Handle end
+			if first == "end" {
+				if len(scopeStack) > 1 {
+					scopeStack = scopeStack[:len(scopeStack)-1]
+				}
+				continue
+			}
+
+			// Handle template calls
+			if first == "template" {
+				parts := parseTemplateAction(action)
+
+				if len(parts) >= 1 {
+					tmplName := parts[0]
+
+					if nt, ok := registry[tmplName]; ok {
+						// Named template block found in registry
+						var contextArg string
+						if len(parts) >= 2 {
+							contextArg = parts[1]
+						}
+
+						// Resolve the scope that will be passed as "." to the partial
+						partialScope := resolvePartialScope(contextArg, scopeStack, varMap)
+
+						// Build a varMap for the partial based on the resolved scope
+						partialVarMap := buildPartialVarMap(contextArg, partialScope, scopeStack, varMap)
+
+						// Recursively validate the named template
+						partialErrors := validateTemplateContent(nt.Content, partialVarMap, nt.FilePath, baseDir, templateRoot, nt.LineNum, registry)
+						errors = append(errors, partialErrors...)
+
+					} else if isFileBasedPartial(tmplName) {
+						// File-based partial: check existence
+						fullPath := filepath.Join(baseDir, templateRoot, tmplName)
+						if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+							errors = append(errors, ValidationResult{
+								Template: templateName, // caller template name (relative)
+								Line:     actualLineNum,
+								Column:   col,
+								Variable: tmplName,
+								Message:  fmt.Sprintf(`Partial template "%s" could not be found at %s`, tmplName, fullPath),
+								Severity: "error",
+							})
+							continue
+						}
+
+						var contextArg string
+						if len(parts) >= 2 {
+							contextArg = parts[1]
+						}
+
+						// Resolve the scope that will be passed as "." to the partial
+						partialScope := resolvePartialScope(contextArg, scopeStack, varMap)
+
+						// Build a varMap for the partial based on the resolved scope
+						partialVarMap := buildPartialVarMap(contextArg, partialScope, scopeStack, varMap)
+
+						// Recursively validate the partial with the resolved scope
+						partialErrors := validateTemplateFile(fullPath, scopeVarsToTemplateVars(partialVarMap), tmplName, baseDir, templateRoot, registry)
+						errors = append(errors, partialErrors...)
+					}
+				}
+				continue
+			}
+		}
+	}
+
+	return errors
+}
+
+// resolvePartialScope resolves what scope/type the context argument refers to
+func resolvePartialScope(contextArg string, scopeStack []ScopeType, varMap map[string]TemplateVar) ScopeType {
+	if contextArg == "." {
+		// Pass current scope as-is
+		if len(scopeStack) > 0 {
+			return scopeStack[len(scopeStack)-1]
+		}
+		return ScopeType{IsRoot: true}
+	}
+	if strings.HasPrefix(contextArg, ".") {
+		return createScopeFromExpression(contextArg, scopeStack, varMap)
+	}
+	return ScopeType{Fields: []FieldInfo{}}
+}
+
+// buildPartialVarMap builds a varMap for a partial based on the context argument and resolved scope.
+// When "." is passed, the partial sees all fields of the current scope as top-level vars.
+// When ".SomeVar" is passed, the partial sees SomeVar's fields as top-level vars.
+func buildPartialVarMap(contextArg string, partialScope ScopeType, scopeStack []ScopeType, varMap map[string]TemplateVar) map[string]TemplateVar {
+	result := make(map[string]TemplateVar)
+
+	if contextArg == "." {
+		// The partial receives the current dot — expose all fields of current scope
+		// If we're in root scope, that means all top-level vars are available
+		if len(scopeStack) > 0 {
+			currentScope := scopeStack[len(scopeStack)-1]
+			if currentScope.IsRoot {
+				// Pass through all root variables
+				for k, v := range varMap {
+					result[k] = v
+				}
+			} else {
+				// Pass scope fields as top-level vars accessible via .FieldName
+				for _, f := range currentScope.Fields {
+					result[f.Name] = TemplateVar{
+						Name:    f.Name,
+						TypeStr: f.TypeStr,
+						Fields:  f.Fields,
+						IsSlice: f.IsSlice,
+					}
+				}
+			}
+		}
+		return result
+	}
+
+	// ".SomeVar" — the partial's dot IS SomeVar, so its fields become top-level
+	for _, f := range partialScope.Fields {
+		result[f.Name] = TemplateVar{
+			Name:    f.Name,
+			TypeStr: f.TypeStr,
+			Fields:  f.Fields,
+			IsSlice: f.IsSlice,
+		}
+	}
+
+	return result
+}
+
+// scopeVarsToTemplateVars converts a varMap back to a []TemplateVar slice
+func scopeVarsToTemplateVars(varMap map[string]TemplateVar) []TemplateVar {
+	var vars []TemplateVar
+	for _, v := range varMap {
+		vars = append(vars, v)
+	}
+	return vars
+}
+
+// createScopeFromRange creates a new scope for a range block
+func createScopeFromRange(expr string, scopeStack []ScopeType, varMap map[string]TemplateVar) ScopeType {
+	expr = strings.TrimSpace(expr)
+
+	if strings.Contains(expr, ":=") {
+		parts := strings.SplitN(expr, ":=", 2)
+		if len(parts) == 2 {
+			varExpr := strings.TrimSpace(parts[1])
+			return createScopeFromExpression(varExpr, scopeStack, varMap)
+		}
+	}
+
+	return createScopeFromExpression(expr, scopeStack, varMap)
+}
+
+// createScopeFromWith creates a new scope for a with block
+func createScopeFromWith(expr string, scopeStack []ScopeType, varMap map[string]TemplateVar) ScopeType {
+	return createScopeFromExpression(expr, scopeStack, varMap)
+}
+
+// createScopeFromExpression creates a scope from a variable expression with path traversal
+func createScopeFromExpression(expr string, scopeStack []ScopeType, varMap map[string]TemplateVar) ScopeType {
+	expr = strings.TrimSpace(expr)
+
+	if expr == "." {
+		if len(scopeStack) > 0 {
+			return scopeStack[len(scopeStack)-1]
+		}
+		return ScopeType{IsRoot: true}
+	}
+
+	if !strings.HasPrefix(expr, ".") {
+		return ScopeType{Fields: []FieldInfo{}}
+	}
+
+	parts := strings.Split(expr, ".")
+	if len(parts) < 2 {
+		return ScopeType{Fields: []FieldInfo{}}
+	}
+
+	var currentField *FieldInfo
+	var remainingParts []string
+
+	firstPart := parts[1]
+
+	if len(scopeStack) > 0 {
+		currentScope := scopeStack[len(scopeStack)-1]
+		for _, f := range currentScope.Fields {
+			if f.Name == firstPart {
+				fCopy := f
+				currentField = &fCopy
+				remainingParts = parts[2:]
+				break
+			}
+		}
+	}
+
+	if currentField == nil {
+		if v, ok := varMap[firstPart]; ok {
+			currentField = &FieldInfo{
+				Name:    v.Name,
+				TypeStr: v.TypeStr,
+				Fields:  v.Fields,
+				IsSlice: v.IsSlice,
+			}
+			remainingParts = parts[2:]
+		}
+	}
+
+	if currentField == nil {
+		return ScopeType{Fields: []FieldInfo{}}
+	}
+
+	for _, part := range remainingParts {
+		found := false
+		for _, f := range currentField.Fields {
+			if f.Name == part {
+				fCopy := f
+				currentField = &fCopy
+				found = true
+				break
+			}
+		}
+		if !found {
+			return ScopeType{Fields: []FieldInfo{}}
+		}
+	}
+
+	return ScopeType{
+		IsRoot:  false,
+		VarName: expr,
+		TypeStr: currentField.TypeStr,
+		Fields:  currentField.Fields,
+		IsSlice: currentField.IsSlice,
+	}
+}
+
+// validateVariableInScope validates a variable access in the current scope
+func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[string]TemplateVar, line, col int, templateName string) *ValidationResult {
+	varExpr = strings.TrimSpace(varExpr)
+
+	if varExpr == "." || varExpr == "$" {
+		return nil
+	}
+
+	varExpr = strings.TrimRight(varExpr, ".")
+
+	parts := strings.Split(varExpr, ".")
+	if len(parts) < 2 {
+		return nil
+	}
+
+	isRootAccess := parts[0] == "$"
+
+	if !isRootAccess && len(scopeStack) > 1 {
+		currentScope := scopeStack[len(scopeStack)-1]
+		fieldName := parts[1]
+
+		var foundField *FieldInfo
+		for _, f := range currentScope.Fields {
+			if f.Name == fieldName {
+				fCopy := f
+				foundField = &fCopy
+				break
+			}
+		}
+
+		if foundField != nil {
+			if len(parts) > 2 {
+				return validateNestedFields(parts[2:], foundField.Fields, foundField.TypeStr, varExpr, line, col, templateName)
+			}
+			return nil
+		}
+	}
+
+	if len(parts) == 2 {
+		rootVar := parts[1]
+
+		rootScope := scopeStack[0]
+		for _, f := range rootScope.Fields {
+			if f.Name == rootVar {
+				return nil
+			}
+		}
+
+		if _, ok := varMap[rootVar]; ok {
+			return nil
+		}
+
+		return &ValidationResult{
+			Template: templateName,
+			Line:     line,
+			Column:   col,
+			Variable: varExpr,
+			Message:  fmt.Sprintf(`Template variable %q is not defined in the render context`, varExpr),
+			Severity: "error",
+		}
+	}
+
+	rootVar := parts[1]
+
+	var rootVarInfo *TemplateVar
+	if v, ok := varMap[rootVar]; ok {
+		rootVarInfo = &v
+	} else {
+		rootScope := scopeStack[0]
+		for _, f := range rootScope.Fields {
+			if f.Name == rootVar {
+				return validateNestedFields(parts[2:], f.Fields, f.TypeStr, varExpr, line, col, templateName)
+			}
+		}
+
+		return &ValidationResult{
+			Template: templateName,
+			Line:     line,
+			Column:   col,
+			Variable: varExpr,
+			Message:  fmt.Sprintf(`Template variable %q is not defined in the render context`, varExpr),
+			Severity: "error",
+		}
+	}
+
+	return validateNestedFields(parts[2:], rootVarInfo.Fields, rootVarInfo.TypeStr, varExpr, line, col, templateName)
+
+}
+
+// validateNestedFields validates a field path against available fields
+func validateNestedFields(fieldParts []string, fields []FieldInfo, parentTypeName, fullExpr string, line, col int, templateName string) *ValidationResult {
+	currentFields := fields
+	parentType := parentTypeName
+
+	for _, fieldName := range fieldParts {
+		found := false
+		var nextFields []FieldInfo
+
+		for _, f := range currentFields {
+			if f.Name == fieldName {
+				found = true
+				nextFields = f.Fields
+				parentType = f.TypeStr
+				break
+			}
+		}
+
+		if !found {
+			if parentType == "" {
+				parentType = "unknown"
+			}
+			return &ValidationResult{
+				Template: templateName,
+				Line:     line,
+				Column:   col,
+				Variable: fullExpr,
+				Message:  fmt.Sprintf(`Field %q does not exist on type %s`, fieldName, parentType),
+				Severity: "error",
+			}
+		}
+
+		currentFields = nextFields
+	}
+
+	return nil
+}
+
+// parseTemplateAction parses a template action to extract arguments
+func parseTemplateAction(action string) []string {
+	rest := strings.TrimPrefix(action, "template ")
+	rest = strings.TrimSpace(rest)
+
+	var parts []string
+	var current strings.Builder
+	inString := false
+	stringChar := rune(0)
+
+	for _, r := range rest {
+		switch {
+		case !inString && (r == '"' || r == '`'):
+			inString = true
+			stringChar = r
+			if current.Len() > 0 {
+				parts = append(parts, strings.TrimSpace(current.String()))
+				current.Reset()
+			}
+		case inString && r == stringChar:
+			inString = false
+			parts = append(parts, current.String())
+			current.Reset()
+		case !inString && r == ' ':
+			if current.Len() > 0 {
+				parts = append(parts, strings.TrimSpace(current.String()))
+				current.Reset()
+			}
+		default:
+			current.WriteRune(r)
+		}
+	}
+
+	if current.Len() > 0 {
+		parts = append(parts, strings.TrimSpace(current.String()))
+	}
+
+	return parts
+}
+
+// extractVariablesFromAction extracts all valid variables from an action string,
+// ignoring string literals and correctly splitting on operators and parentheses.
+func extractVariablesFromAction(action string) []string {
+	var vars []string
+	var current strings.Builder
+	inString := false
+	stringChar := rune(0)
+
+	for _, r := range action {
+		switch {
+		case !inString && (r == '"' || r == '`'):
+			inString = true
+			stringChar = r
+			if current.Len() > 0 {
+				vars = append(vars, current.String())
+				current.Reset()
+			}
+		case inString && r == stringChar:
+			inString = false
+			current.Reset()
+		case !inString && (r == ' ' || r == '(' || r == ')' || r == '|' || r == '=' || r == ',' || r == '+' || r == '-' || r == '*' || r == '/' || r == '!' || r == '<' || r == '>' || r == '%' || r == '&'):
+			if current.Len() > 0 {
+				vars = append(vars, current.String())
+				current.Reset()
+			}
+		default:
+			if !inString {
+				current.WriteRune(r)
+			}
+		}
+	}
+
+	if current.Len() > 0 && !inString {
+		vars = append(vars, current.String())
+	}
+
+	var validVars []string
+	for _, v := range vars {
+		v = strings.TrimSpace(v)
+		if (strings.HasPrefix(v, ".") || strings.HasPrefix(v, "$.")) && v != "." && v != "$" && !strings.HasPrefix(v, "..") {
+			validVars = append(validVars, v)
+		}
+	}
+
+	return validVars
+}
+
+// ValidateTemplateFileStr exposes internal method for testing
+func ValidateTemplateFileStr(content string, vars []TemplateVar, templateName string, baseDir, templateRoot string, registry map[string]NamedTemplate) []ValidationResult {
+	varMap := make(map[string]TemplateVar)
+	for _, v := range vars {
+		varMap[v.Name] = v
+	}
+	return validateTemplateContent(string(content), varMap, templateName, baseDir, templateRoot, 1, registry)
+}
+
+// ParseAllNamedTemplates exposes for testing
+func ParseAllNamedTemplates(baseDir, templateRoot string) map[string]NamedTemplate {
+	return parseAllNamedTemplates(baseDir, templateRoot)
+}
+
+// ExtractNamedTemplatesFromContent exposes for testing
+func ExtractNamedTemplatesFromContent(content, templateName string, registry map[string]NamedTemplate) {
+	extractNamedTemplatesFromContent(content, templateName, registry)
+}
+
+
+################################################################
+# FILE: analyzer/validator/validator_test.go
+################################################################
+package validator
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+// sharedVars is the common variable set used across tests
+var sharedVars = map[string]TemplateVar{
+	"User": {
+		Name:    "User",
+		TypeStr: "User",
+		Fields: []FieldInfo{
+			{Name: "Name", TypeStr: "string"},
+			{Name: "Age", TypeStr: "int"},
+			{
+				Name:    "Address",
+				TypeStr: "Address",
+				Fields: []FieldInfo{
+					{Name: "City", TypeStr: "string"},
+					{Name: "Zip", TypeStr: "string"},
+				},
+			},
+		},
+	},
+	"Items": {
+		Name:     "Items",
+		TypeStr:  "[]Item",
+		IsSlice:  true,
+		ElemType: "Item",
+		Fields: []FieldInfo{
+			{Name: "Title", TypeStr: "string"},
+			{Name: "Price", TypeStr: "float64"},
+		},
+	},
+}
+
+func TestValidateTemplateContent(t *testing.T) {
+	tests := []struct {
+		name     string
+		content  string
+		expected []ValidationResult
+	}{
+		// --- Basic variable access ---
+		{
+			name:     "Valid variable access",
+			content:  "{{ .User.Name }}",
+			expected: nil,
+		},
+		{
+			name:    "Invalid variable access",
+			content: "{{ .User.Invalid }}",
+			expected: []ValidationResult{
+				{
+					Variable: ".User.Invalid",
+					Message:  `Field "Invalid" does not exist on type User`,
+					Line:     1,
+					Column:   4,
+					Severity: "error",
+				},
+			},
+		},
+		{
+			name:     "Valid nested variable access",
+			content:  "{{ .User.Address.City }}",
+			expected: nil,
+		},
+		{
+			name:    "Invalid nested variable access",
+			content: "{{ .User.Address.Invalid }}",
+			expected: []ValidationResult{
+				{
+					Variable: ".User.Address.Invalid",
+					Message:  `Field "Invalid" does not exist on type Address`,
+					Line:     1,
+					Column:   4,
+					Severity: "error",
+				},
+			},
+		},
+
+		// --- Range scope ---
+		{
+			name:     "Valid range access",
+			content:  "{{ range .Items }}{{ .Title }}{{ end }}",
+			expected: nil,
+		},
+		{
+			name:    "Invalid range access",
+			content: "{{ range .Items }}{{ .Invalid }}{{ end }}",
+			expected: []ValidationResult{
+				{
+					Variable: ".Invalid",
+					Message:  `Template variable ".Invalid" is not defined in the render context`,
+					Line:     1,
+					Column:   22,
+					Severity: "error",
+				},
+			},
+		},
+		{
+			name:     "Valid range with variable assignment",
+			content:  "{{ range $i := .Items }}{{ .Title }}{{ end }}",
+			expected: nil,
+		},
+
+		// --- With scope ---
+		{
+			name:     "Valid with block",
+			content:  "{{ with .User }}{{ .Name }}{{ end }}",
+			expected: nil,
+		},
+		{
+			name:    "Invalid with block access",
+			content: "{{ with .User }}{{ .Invalid }}{{ end }}",
+			expected: []ValidationResult{
+				{
+					Variable: ".Invalid",
+					Message:  `Template variable ".Invalid" is not defined in the render context`,
+					Line:     1,
+					Column:   20,
+					Severity: "error",
+				},
+			},
+		},
+		{
+			name: "Valid nested scoped access inside with (bug reproduction)",
+			content: `
+				{{ with .User }}
+					{{ .Address.City }}
+				{{ end }}
+			`,
+			expected: nil,
+		},
+		{
+			name: "Invalid nested scoped access inside with",
+			content: `
+				{{ with .User }}
+					{{ .Address.Invalid }}
+				{{ end }}
+			`,
+			expected: []ValidationResult{
+				{
+					Variable: ".Address.Invalid",
+					Message:  `Field "Invalid" does not exist on type Address`,
+					Line:     3,
+					Column:   9,
+					Severity: "error",
+				},
+			},
+		},
+
+		// --- FIX 1: Named block vs file partial discrimination ---
+		{
+			name: "Named block template call is not resolved as a file",
+			// "content" is a named block (no extension, no path sep) — must not trigger file-not-found
+			content:  `{{ template "content" . }}`,
+			expected: nil, // no error: named blocks are skipped for file resolution
+		},
+		{
+			name:     "Named block with dot-only context is not resolved as a file",
+			content:  `{{ template "sidebar" . }}`,
+			expected: nil,
+		},
+		{
+			name:     "Named block with variable context skips file resolution but validates var",
+			content:  `{{ template "header" .User }}`,
+			expected: nil, // .User exists, no file resolution attempted
+		},
+		{
+			name:    "Named block with invalid variable context still validates the variable",
+			content: `{{ template "header" .NonExistent }}`,
+			expected: []ValidationResult{
+				{
+					Variable: ".NonExistent",
+					Message:  `Template variable ".NonExistent" is not defined in the render context`,
+					Severity: "error",
+				},
+			},
+		},
+
+		// --- Dot reference ---
+		{
+			name:     "Bare dot is always valid",
+			content:  "{{ . }}",
+			expected: nil,
+		},
+		{
+			name:     "Dot passed to template is valid",
+			content:  `{{ template "block" . }}`,
+			expected: nil,
+		},
+
+		// --- if/else (no scope change) ---
+		{
+			name:     "Valid if block does not change scope",
+			content:  "{{ if .User.Name }}{{ .User.Age }}{{ end }}",
+			expected: nil,
+		},
+		{
+			name:    "Invalid variable inside if",
+			content: "{{ if .User.Name }}{{ .User.Invalid }}{{ end }}",
+			expected: []ValidationResult{
+				{
+					Variable: ".User.Invalid",
+					Message:  `Field "Invalid" does not exist on type User`,
+					Severity: "error",
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := validateTemplateContent(tt.content, sharedVars, "test.html", ".", "", 1, nil)
+
+			if len(got) != len(tt.expected) {
+				t.Errorf("expected %d errors, got %d", len(tt.expected), len(got))
+				for i, err := range got {
+					t.Logf("Got[%d]: variable=%q message=%q line=%d col=%d", i, err.Variable, err.Message, err.Line, err.Column)
+				}
+				return
+			}
+
+			for i := range got {
+				if got[i].Message != tt.expected[i].Message {
+					t.Errorf("[%d] message mismatch:\n  want: %q\n   got: %q", i, tt.expected[i].Message, got[i].Message)
+				}
+				if got[i].Variable != tt.expected[i].Variable {
+					t.Errorf("[%d] variable mismatch:\n  want: %q\n   got: %q", i, tt.expected[i].Variable, got[i].Variable)
+				}
+				if tt.expected[i].Severity != "" && got[i].Severity != tt.expected[i].Severity {
+					t.Errorf("[%d] severity mismatch:\n  want: %q\n   got: %q", i, tt.expected[i].Severity, got[i].Severity)
+				}
+				if tt.expected[i].Line != 0 && got[i].Line != tt.expected[i].Line {
+					t.Errorf("[%d] line mismatch:\n  want: %d\n   got: %d", i, tt.expected[i].Line, got[i].Line)
+				}
+				if tt.expected[i].Column != 0 && got[i].Column != tt.expected[i].Column {
+					t.Errorf("[%d] column mismatch:\n  want: %d\n   got: %d", i, tt.expected[i].Column, got[i].Column)
+				}
+			}
+		})
+	}
+}
+
+// TestIsFileBasedPartial directly tests the block vs file discrimination (Fix 1)
+func TestIsFileBasedPartial(t *testing.T) {
+	cases := []struct {
+		name     string
+		input    string
+		expected bool
+	}{
+		{"html extension", "partials/nav.html", true},
+		{"tmpl extension", "partials/nav.tmpl", true},
+		{"gohtml extension", "base.gohtml", true},
+		{"tpl extension", "base.tpl", true},
+		{"htm extension", "index.htm", true},
+		{"path separator unix", "views/header.html", true},
+		{"path separator windows", `views\header.html`, true},
+		{"named block no ext", "content", false},
+		{"named block no ext with spaces", "my block", false},
+		{"named block looks like func", "navbar", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := isFileBasedPartial(tc.input)
+			if got != tc.expected {
+				t.Errorf("isFileBasedPartial(%q) = %v, want %v", tc.input, got, tc.expected)
+			}
+		})
+	}
+}
+
+// TestPartialTemplateResolution tests Fix 2 (templateName in diagnostics) and
+// Fix 3 (recursive partial validation with scope propagation).
+func TestPartialTemplateResolution(t *testing.T) {
+	// Create a temp directory that mimics a template root
+	tmpDir := t.TempDir()
+	templateRoot := "views"
+	viewsDir := filepath.Join(tmpDir, templateRoot)
+	if err := os.MkdirAll(viewsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("Fix2: diagnostic templateName is relative not absolute", func(t *testing.T) {
+		// Write a partial that accesses a non-existent field
+		partialPath := filepath.Join(viewsDir, "partials", "user_card.html")
+		if err := os.MkdirAll(filepath.Dir(partialPath), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(partialPath, []byte(`{{ .Name }}{{ .NonExistent }}`), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		// Write parent template that includes the partial with .User scope
+		parentPath := filepath.Join(viewsDir, "index.html")
+		if err := os.WriteFile(parentPath, []byte(`{{ template "partials/user_card.html" .User }}`), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		vars := []TemplateVar{sharedVars["User"]}
+		errs := validateTemplateFile(parentPath, vars, "index.html", tmpDir, templateRoot, nil)
+
+		// We expect exactly 1 error from the partial (NonExistent field)
+		if len(errs) != 1 {
+			t.Errorf("expected 1 error, got %d", len(errs))
+			for _, e := range errs {
+				t.Logf("  error: template=%q variable=%q message=%q", e.Template, e.Variable, e.Message)
+			}
+			return
+		}
+
+		// Fix 2: Template name in error should be the relative partial name, not the OS path
+		wantTemplate := "partials/user_card.html"
+		if errs[0].Template != wantTemplate {
+			t.Errorf("Fix2: template name in diagnostic = %q, want %q", errs[0].Template, wantTemplate)
+		}
+	})
+
+	t.Run("Fix3: partial receives correct scope when called with .User", func(t *testing.T) {
+		// Partial accesses fields of User directly (Name, Age, Address.City)
+		partialPath := filepath.Join(viewsDir, "user_detail.html")
+		if err := os.WriteFile(partialPath, []byte(`{{ .Name }} {{ .Age }} {{ .Address.City }}`), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		parentPath := filepath.Join(viewsDir, "parent.html")
+		if err := os.WriteFile(parentPath, []byte(`{{ template "user_detail.html" .User }}`), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		vars := []TemplateVar{sharedVars["User"]}
+		errs := validateTemplateFile(parentPath, vars, "parent.html", tmpDir, templateRoot, nil)
+
+		if len(errs) != 0 {
+			t.Errorf("Fix3: expected no errors for valid partial scope, got %d", len(errs))
+			for _, e := range errs {
+				t.Logf("  error: template=%q variable=%q message=%q", e.Template, e.Variable, e.Message)
+			}
+		}
+	})
+
+	t.Run("Fix3: partial with . receives full root scope", func(t *testing.T) {
+		// Partial accessed with . should see all root-level vars
+		partialPath := filepath.Join(viewsDir, "full_ctx.html")
+		if err := os.WriteFile(partialPath, []byte(`{{ .User.Name }} {{ .Items }}`), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		parentPath := filepath.Join(viewsDir, "root_parent.html")
+		if err := os.WriteFile(parentPath, []byte(`{{ template "full_ctx.html" . }}`), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		vars := []TemplateVar{sharedVars["User"], sharedVars["Items"]}
+		errs := validateTemplateFile(parentPath, vars, "root_parent.html", tmpDir, templateRoot, nil)
+
+		if len(errs) != 0 {
+			t.Errorf("Fix3: expected no errors when partial receives full root scope, got %d", len(errs))
+			for _, e := range errs {
+				t.Logf("  error: template=%q variable=%q message=%q", e.Template, e.Variable, e.Message)
+			}
+		}
+	})
+
+	t.Run("Fix3: partial with invalid field access is caught", func(t *testing.T) {
+		partialPath := filepath.Join(viewsDir, "bad_partial.html")
+		if err := os.WriteFile(partialPath, []byte(`{{ .Name }} {{ .DoesNotExist }}`), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		parentPath := filepath.Join(viewsDir, "bad_parent.html")
+		if err := os.WriteFile(parentPath, []byte(`{{ template "bad_partial.html" .User }}`), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		vars := []TemplateVar{sharedVars["User"]}
+		errs := validateTemplateFile(parentPath, vars, "bad_parent.html", tmpDir, templateRoot, nil)
+
+		if len(errs) != 1 {
+			t.Errorf("Fix3: expected 1 error for invalid field in partial, got %d", len(errs))
+			for _, e := range errs {
+				t.Logf("  error: template=%q variable=%q message=%q", e.Template, e.Variable, e.Message)
+			}
+			return
+		}
+		if errs[0].Template != "bad_partial.html" {
+			t.Errorf("Fix2+3: error template should be %q, got %q", "bad_partial.html", errs[0].Template)
+		}
+	})
+
+	t.Run("Fix1+Fix2: missing file partial reports error with relative name", func(t *testing.T) {
+		parentPath := filepath.Join(viewsDir, "missing_parent.html")
+		if err := os.WriteFile(parentPath, []byte(`{{ template "does_not_exist.html" . }}`), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		vars := []TemplateVar{sharedVars["User"]}
+		errs := validateTemplateFile(parentPath, vars, "missing_parent.html", tmpDir, templateRoot, nil)
+
+		if len(errs) != 1 {
+			t.Errorf("expected 1 error for missing partial, got %d", len(errs))
+			return
+		}
+		// Fix 2: The error Template should be the caller's name, not an absolute path
+		if errs[0].Template != "missing_parent.html" {
+			t.Errorf("Fix2: error.Template = %q, want %q", errs[0].Template, "missing_parent.html")
+		}
+		if errs[0].Variable != "does_not_exist.html" {
+			t.Errorf("error.Variable should be the missing partial name, got %q", errs[0].Variable)
+		}
+	})
+}
+
+
+################################################################
+# FILE: build.sh
+################################################################
+#!/usr/bin/env bash
+set -e
+
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+ANALYZER_DIR="$ROOT/analyzer"
+EXT_DIR="$ROOT/extension"
+OUT_DIR="$EXT_DIR/out"
+
+echo "══════════════════════════════════════"
+echo "  Rex Template Validator — Build"
+echo "══════════════════════════════════════"
+
+# ─── Build Go Analyzer ───────────────────
+echo ""
+echo "▶ Building Go analyzer binary..."
+mkdir -p "$OUT_DIR"
+cd "$ANALYZER_DIR"
+
+if ! command -v go &>/dev/null; then
+  echo "  ⚠ 'go' not found on PATH — skipping analyzer build"
+  echo "  Install Go from https://go.dev/dl/ then re-run this script"
+else
+  EXT=""
+  if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "win32" ]]; then
+    EXT=".exe"
+  fi
+
+  go build -o "$OUT_DIR/rex-analyzer$EXT" .
+  echo "  ✓ Analyzer built → out/rex-analyzer$EXT"
+fi
+
+# ─── Build TypeScript Extension ──────────
+echo ""
+echo "▶ Compiling TypeScript extension..."
+cd "$EXT_DIR"
+
+if ! command -v npm &>/dev/null; then
+  echo "  ⚠ npm not found. Install Node.js from https://nodejs.org/"
+  exit 1
+fi
+
+# Install deps if needed
+if [ ! -d node_modules ]; then
+  echo "  Installing npm dependencies..."
+  npm install
+fi
+
+npx tsc -p tsconfig.json
+echo "  ✓ TypeScript compiled → out/"
+
+# ─── Done ────────────────────────────────
+echo ""
+echo "══════════════════════════════════════"
+echo "  Build complete!"
+echo ""
+echo "  To install in VSCode:"
+echo "    1. Open the extension/ folder in VSCode"
+echo "    2. Press F5 to launch the Extension Development Host"
+echo ""
+echo "  Or package as .vsix:"
+echo "    cd extension && npx vsce package"
+echo "══════════════════════════════════════"
+
+
+################################################################
+# FILE: changelog.md
+################################################################
+1. Fix Live Validation & Rerun on Block Edit
+Issue: The validation wouldn't trigger as you were typing, requiring a manual save. Additionally, editing partial blocks lost validation context because the validator's root context was not cleanly passed down during file re-validation.
+Fixes:
+- Swapped VS Code's onDidSaveTextDocument (for templates) to onDidChangeTextDocument so validation now evaluates live as you type. It leverages the existing debounce to ensure performance is not affected.
+- In validator.ts, validateDocument was overriding the explicitly detected context from extension.ts that handled partial template fallbacks. It now natively accepts the correctly resolved TemplateContext and correctly applies diagnostics without throwing a missing context error. 
+2. Add Hover Docs and Go-to-Definition for Defines & Blocks
+Issue: Variables had hover definitions and go-to-definition mapping out to Go files, but partial/block calls explicitly lacked define/block hover/navigation.
+Fixes:
+- Updated the Hover Provider to detect when hovering over a template call {{ template "..." }}, {{ block "..." }}, or {{ define "..." }} block keyword. It now correctly identifies the template block name and returns Markdown hover documentation.
+- Extensively modified the Go To Definition logic by adding findNamedBlockDefinition. When Go to Definition is clicked on a template "myBlock" partial, it will now prioritize the active file's AST and globally grep across all loaded files inside the KnowledgeGraphBuilder mapping to jump precisely to where the {{ define "myBlock" }} or {{ block "myBlock" }} is placed. I also included a fallback so any unsaved block edits update live.
+
+################################################################
+# FILE: extension/package.json
+################################################################
+{
+  "name": "rex-template-validator",
+  "displayName": "Rex Template Validator",
+  "description": "Validates Go template variables in .html/.tmpl files used with the rex framework",
+  "version": "0.2.0",
+  "publisher": "Nabiizy",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Linters",
+    "Other"
+  ],
+  "keywords": [
+    "go",
+    "golang",
+    "template",
+    "html",
+    "rex",
+    "validation"
+  ],
+  "activationEvents": [
+    "workspaceContains:**/*.go",
+    "onLanguage:html",
+    "onLanguage:go-template"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "rexTemplateValidator.validate",
+        "title": "Rex: Validate Template Variables",
+        "icon": "$(check-all)"
+      },
+      {
+        "command": "rexTemplateValidator.rebuildIndex",
+        "title": "Rex: Rebuild Template Index",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "rexTemplateValidator.showKnowledgeGraph",
+        "title": "Rex: Show Template Knowledge Graph"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "rexTemplateValidator.validate",
+          "when": "resourceExtname == .html || resourceExtname == .tmpl",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Rex Template Validator",
+      "properties": {
+        "rexTemplateValidator.goAnalyzerPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the rex-analyzer binary. Leave empty to use the bundled binary."
+        },
+        "rexTemplateValidator.sourceDir": {
+          "type": "string",
+          "default": ".",
+          "description": "Go source directory relative to the workspace root, passed as the -dir flag to the CLI (e.g. 'sample' if your Go files live in a subdirectory)."
+        },
+        "rexTemplateValidator.templateRoot": {
+          "type": "string",
+          "default": "",
+          "description": "Root directory for templates, relative to sourceDir, passed as the -template-root flag (e.g. 'templates')."
+        },
+        "rexTemplateValidator.templateBaseDir": {
+          "type": "string",
+          "default": "",
+          "description": "Base directory for templates, relative to the workspace root, used as the -template-base-dir flag. If empty, defaults to the workspace root."
+        },
+        "rexTemplateValidator.debounceMs": {
+          "type": "number",
+          "default": 1500,
+          "description": "Debounce delay in milliseconds before re-validating on file change."
+        },
+        "rexTemplateValidator.enableAutoValidate": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically validate templates on save."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile && npm run build-analyzer",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "build-analyzer": "cd ../analyzer && go build -o ../extension/out/rex-analyzer .",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {}
+}
+
+################################################################
+# FILE: extension/src/analyzer.ts
+################################################################
+import * as cp from 'child_process';
+import * as path from 'path';
+import * as fs from 'fs';
+import * as vscode from 'vscode';
+import { AnalysisResult } from './types';
+
+export class GoAnalyzer {
+  private analyzerPath: string;
+  private outputChannel: vscode.OutputChannel;
+
+  constructor(context: vscode.ExtensionContext, outputChannel: vscode.OutputChannel) {
+    this.outputChannel = outputChannel;
+    this.analyzerPath = this.resolveAnalyzerPath(context);
+  }
+
+  private resolveAnalyzerPath(context: vscode.ExtensionContext): string {
+    const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+    const configPath = config.get<string>('goAnalyzerPath');
+
+    if (configPath && fs.existsSync(configPath)) {
+      return configPath;
+    }
+
+    const ext = process.platform === 'win32' ? '.exe' : '';
+    const bundled = path.join(context.extensionPath, 'out', `rex-analyzer${ext}`);
+    if (fs.existsSync(bundled)) {
+      return bundled;
+    }
+
+    return 'rex-analyzer';
+  }
+
+  /**
+   * Analyze the workspace by invoking the Go analyzer once.
+   *
+   * The analyzer is invoked with:
+   *   -dir <workspaceRoot/sourceDir>   (absolute path to Go source)
+   *   -template-root <templateRoot>     (relative to -dir)
+   *   -validate
+   *
+   * cwd is set to workspaceRoot so relative paths in output stay predictable.
+   */
+  async analyzeWorkspace(workspaceRoot: string): Promise<AnalysisResult> {
+    const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+    const sourceDir: string = config.get('sourceDir') ?? '.';
+    const templateRoot: string = config.get('templateRoot') ?? '';
+    const templateBaseDir: string = config.get('templateBaseDir') ?? '';
+
+    // Resolve the Go source directory to an absolute path
+    const absSourceDir = path.resolve(workspaceRoot, sourceDir);
+
+    if (!fs.existsSync(absSourceDir)) {
+      this.outputChannel.appendLine(`[Analyzer] Source dir does not exist: ${absSourceDir}`);
+      return { renderCalls: [], errors: [`Source directory not found: ${absSourceDir}`] };
+    }
+
+    const args = ['-dir', absSourceDir, '-validate'];
+    args.push('-template-base-dir', templateBaseDir || workspaceRoot);
+
+    if (templateRoot) {
+      args.push('-template-root', templateRoot);
+    }
+
+    this.outputChannel.appendLine(`[Analyzer] Running: ${this.analyzerPath} ${args.join(' ')}`);
+
+    return new Promise((resolve) => {
+      let stdout = '';
+      let stderr = '';
+
+      const proc = cp.spawn(this.analyzerPath, args, {
+        // cwd is the workspace root so relative file paths in output are stable
+        cwd: workspaceRoot,
+        env: process.env,
+      });
+
+      proc.stdout.on('data', (data: Buffer) => { stdout += data.toString(); });
+      proc.stderr.on('data', (data: Buffer) => { stderr += data.toString(); });
+
+      proc.on('error', (err) => {
+        this.outputChannel.appendLine(`[Analyzer] Failed to spawn: ${err.message}`);
+        resolve({
+          renderCalls: [],
+          errors: [`Failed to run analyzer: ${err.message}. Make sure rex-analyzer is built.`],
+        });
+      });
+
+      proc.on('close', (code) => {
+        if (stderr) {
+          this.outputChannel.appendLine(`[Analyzer] stderr: ${stderr}`);
+        }
+
+        if (code !== 0 && !stdout) {
+          resolve({
+            renderCalls: [],
+            errors: [`Analyzer exited with code ${code}: ${stderr}`],
+          });
+          return;
+        }
+
+        try {
+          const result: AnalysisResult = JSON.parse(stdout);
+          this.outputChannel.appendLine(
+            `[Analyzer] Found ${result.renderCalls?.length ?? 0} render calls, ` +
+            `${result.validationErrors?.length ?? 0} validation errors`
+          );
+          resolve(result);
+        } catch (e) {
+          this.outputChannel.appendLine(`[Analyzer] JSON parse error: ${e}`);
+          this.outputChannel.appendLine(`[Analyzer] Raw output: ${stdout.slice(0, 500)}`);
+          resolve({
+            renderCalls: [],
+            errors: [`Failed to parse analyzer output: ${e}`],
+          });
+        }
+      });
+    });
+  }
+}
+
+
+################################################################
+# FILE: extension/src/extension.ts
+################################################################
+import * as vscode from 'vscode';
+import * as path from 'path';
+import { GoAnalyzer } from './analyzer';
+import { KnowledgeGraphBuilder } from './knowledgeGraph';
+import { TemplateValidator } from './validator';
+import { KnowledgeGraphPanel } from './graphPanel';
+import { KnowledgeGraph } from './types';
+
+const TEMPLATE_SELECTOR: vscode.DocumentSelector = [
+  { language: 'html', scheme: 'file' },
+  { language: 'go-template', scheme: 'file' },
+  { pattern: '**/*.tmpl' },
+  { pattern: '**/*.html' },
+];
+
+// Two separate collections so they never interfere with each other:
+// - analyzerCollection: diagnostics from the Go binary (persists across template edits)
+// - editorCollection:   diagnostics from the in-editor TypeScript validator (per-document)
+let analyzerCollection: vscode.DiagnosticCollection;
+let editorCollection: vscode.DiagnosticCollection;
+let outputChannel: vscode.OutputChannel;
+let graphBuilder: KnowledgeGraphBuilder | undefined;
+let validator: TemplateValidator | undefined;
+let currentGraph: KnowledgeGraph | undefined;
+let analyzer: GoAnalyzer | undefined;
+
+// Separate timers for rebuild (Go changes) vs validate (template changes)
+// so a template edit doesn't trigger a full Go re-analysis.
+let rebuildTimer: NodeJS.Timeout | undefined;
+let validateTimer: NodeJS.Timeout | undefined;
+
+export async function activate(context: vscode.ExtensionContext) {
+  outputChannel = vscode.window.createOutputChannel('Rex Template Validator');
+  analyzerCollection = vscode.languages.createDiagnosticCollection('rex-analyzer');
+  editorCollection = vscode.languages.createDiagnosticCollection('rex-editor');
+
+  context.subscriptions.push(outputChannel, analyzerCollection, editorCollection);
+  outputChannel.appendLine('[Rex] Extension activated');
+
+  const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  if (!workspaceRoot) {
+    outputChannel.appendLine('[Rex] No workspace folder found');
+    return;
+  }
+
+  analyzer = new GoAnalyzer(context, outputChannel);
+  graphBuilder = new KnowledgeGraphBuilder(workspaceRoot, outputChannel);
+  validator = new TemplateValidator(outputChannel, graphBuilder);
+
+  // ── Commands ───────────────────────────────────────────────────────────────
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('rexTemplateValidator.validate', async () => {
+      const doc = vscode.window.activeTextEditor?.document;
+      if (doc && isTemplate(doc)) {
+        await validateDocument(doc);
+      }
+    }),
+
+    vscode.commands.registerCommand('rexTemplateValidator.rebuildIndex', async () => {
+      await rebuildIndex(workspaceRoot);
+    }),
+
+    vscode.commands.registerCommand('rexTemplateValidator.showKnowledgeGraph', () => {
+      if (currentGraph) {
+        KnowledgeGraphPanel.show(context, currentGraph);
+      } else {
+        vscode.window.showInformationMessage(
+          'No template index yet. Run "Rex: Rebuild Template Index" first.'
+        );
+      }
+    })
+  );
+
+  // ── Language features ──────────────────────────────────────────────────────
+
+  // Hover
+  context.subscriptions.push(
+    vscode.languages.registerHoverProvider(TEMPLATE_SELECTOR, {
+      async provideHover(document, position) {
+        if (!validator || !graphBuilder) return;
+        let ctx = graphBuilder.findContextForFile(document.uri.fsPath);
+        // If this file has no render calls or wasn't found, it might be a partial used by other templates
+        // Try to find the context from a parent template's partial call
+        if (!ctx || ctx.renderCalls.length === 0) {
+          const partialCtx = graphBuilder.findContextForFileAsPartial(document.uri.fsPath);
+          if (partialCtx) {
+            ctx = partialCtx;
+          }
+        }
+        if (!ctx) return;
+        return await validator.getHoverInfo(document, position, ctx);
+      },
+    })
+  );
+
+  // Completion
+  context.subscriptions.push(
+    vscode.languages.registerCompletionItemProvider(
+      TEMPLATE_SELECTOR,
+      {
+        provideCompletionItems(document, position) {
+          if (!validator || !graphBuilder) return;
+          let ctx = graphBuilder.findContextForFile(document.uri.fsPath);
+          // If this file has no render calls or wasn't found, it might be a partial used by other templates
+          // Try to find the context from a parent template's partial call
+          if (!ctx || ctx.renderCalls.length === 0) {
+            const partialCtx = graphBuilder.findContextForFileAsPartial(document.uri.fsPath);
+            if (partialCtx) {
+              ctx = partialCtx;
+            }
+          }
+          if (!ctx) return [];
+          return validator.getCompletions(document, position, ctx);
+        },
+      },
+      '.'
+    )
+  );
+
+  // Go to Definition — jumps from template variable to the c.Render() call in Go
+  context.subscriptions.push(
+    vscode.languages.registerDefinitionProvider(TEMPLATE_SELECTOR, {
+      async provideDefinition(document, position) {
+        if (!validator || !graphBuilder) return;
+        let ctx = graphBuilder.findContextForFile(document.uri.fsPath);
+        // If this file has no render calls or wasn't found, it might be a partial used by other templates
+        // Try to find the context from a parent template's partial call
+        if (!ctx || ctx.renderCalls.length === 0) {
+          const partialCtx = graphBuilder.findContextForFileAsPartial(document.uri.fsPath);
+          if (partialCtx) {
+            ctx = partialCtx;
+          }
+        }
+        if (!ctx) return;
+        return await validator.getDefinitionLocation(document, position, ctx);
+      },
+    })
+  );
+
+  // Go to Definition for Go files — jumps from c.Render("template.html", ...) to the template file
+  const GO_SELECTOR: vscode.DocumentSelector = [{ language: 'go', scheme: 'file' }];
+  context.subscriptions.push(
+    vscode.languages.registerDefinitionProvider(GO_SELECTOR, {
+      provideDefinition(document, position) {
+        if (!validator) return;
+        return validator.getTemplateDefinitionFromGo(document, position);
+      },
+    })
+  );
+
+  // ── File watchers ──────────────────────────────────────────────────────────
+
+  // Go source changes → full re-analysis
+  const goWatcher = vscode.workspace.createFileSystemWatcher('**/*.go');
+  context.subscriptions.push(
+    goWatcher,
+    goWatcher.onDidChange(() => scheduleRebuild(workspaceRoot)),
+    goWatcher.onDidCreate(() => scheduleRebuild(workspaceRoot)),
+    goWatcher.onDidDelete(() => scheduleRebuild(workspaceRoot))
+  );
+
+  // Template changes → re-validate only (no Go analysis needed)
+  const tplWatcher = vscode.workspace.createFileSystemWatcher('**/*.{html,tmpl}');
+  context.subscriptions.push(
+    tplWatcher,
+    tplWatcher.onDidChange(async (uri) => {
+      const doc = await vscode.workspace.openTextDocument(uri);
+      if (isTemplate(doc)) scheduleValidate(doc);
+    }),
+    tplWatcher.onDidCreate(async (uri) => {
+      // New template file — rebuild so it can be indexed
+      scheduleRebuild(workspaceRoot);
+    })
+  );
+
+  // Validate on open/change/save
+  context.subscriptions.push(
+    vscode.workspace.onDidOpenTextDocument((doc) => {
+      if (isTemplate(doc)) scheduleValidate(doc);
+    }),
+
+    vscode.workspace.onDidChangeTextDocument((e) => {
+      if (isTemplate(e.document)) scheduleValidate(e.document);
+    }),
+
+    vscode.workspace.onDidSaveTextDocument((doc) => {
+      if (doc.fileName.endsWith('.go')) {
+        scheduleRebuild(workspaceRoot);      // re-run Go analyzer
+      } else if (isTemplate(doc)) {
+        scheduleValidate(doc);               // re-validate template against existing graph
+      } else {
+        scheduleRebuild(workspaceRoot); // default
+      }
+    })
+  );
+
+  // Config changes → rebuild so new sourceDir/templateRoot take effect
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration('rexTemplateValidator')) {
+        outputChannel.appendLine('[Rex] Configuration changed, rebuilding index...');
+        scheduleRebuild(workspaceRoot);
+      }
+    })
+  );
+
+  // ── Initial build ──────────────────────────────────────────────────────────
+
+  await rebuildIndex(workspaceRoot);
+
+  // Validate already-open templates
+  for (const doc of vscode.workspace.textDocuments) {
+    if (isTemplate(doc)) {
+      await validateDocument(doc);
+    }
+  }
+
+  outputChannel.appendLine('[Rex] Ready');
+  vscode.window.setStatusBarMessage('$(check) Rex templates indexed', 3000);
+}
+
+// ── Template detection ─────────────────────────────────────────────────────────
+
+function isTemplate(doc: vscode.TextDocument): boolean {
+  return (
+    doc.uri.scheme === 'file' &&
+    (doc.fileName.endsWith('.html') || doc.fileName.endsWith('.tmpl'))
+  );
+}
+
+// ── Rebuild (full Go analysis) ─────────────────────────────────────────────────
+
+async function rebuildIndex(workspaceRoot: string) {
+  if (!analyzer || !graphBuilder) return;
+
+  const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
+  statusBarItem.text = '$(sync~spin) Rex: Analyzing...';
+  statusBarItem.show();
+
+  const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+  const sourceDir: string = config.get('sourceDir') ?? '.';
+  const templateRoot: string = config.get('templateRoot') ?? '';
+  const templateBaseDir: string = config.get('templateBaseDir') ?? '';
+
+  try {
+    const result = await analyzer.analyzeWorkspace(workspaceRoot);
+    currentGraph = graphBuilder.build(result);
+
+    if (result.errors?.length) {
+      outputChannel.appendLine('[Rex] Analysis warnings:');
+      result.errors.slice(0, 10).forEach(e => outputChannel.appendLine(`  ${e}`));
+    }
+
+    const count = currentGraph.templates.size;
+    if (count === 0) {
+      outputChannel.appendLine('[Rex] No templates found.');
+      if (!result.renderCalls.length) {
+        outputChannel.appendLine('[Rex] No render calls found. Check your Go code calls c.Render().');
+      }
+    }
+
+    statusBarItem.text = `$(check) Rex: ${count} template${count === 1 ? '' : 's'} indexed`;
+
+    // Apply diagnostics from Go analyzer
+    applyAnalyzerDiagnostics(result.validationErrors ?? [], workspaceRoot, sourceDir, templateRoot, templateBaseDir);
+
+    // Re-validate open template docs with fresh graph (editor diagnostics only)
+    for (const doc of vscode.workspace.textDocuments) {
+      if (isTemplate(doc)) {
+        await validateDocument(doc);
+      }
+    }
+  } catch (err) {
+    outputChannel.appendLine(`[Rex] Rebuild failed: ${err}`);
+    statusBarItem.text = '$(error) Rex: Analysis failed';
+  } finally {
+    setTimeout(() => statusBarItem.dispose(), 5000);
+  }
+}
+
+function applyAnalyzerDiagnostics(
+  validationErrors: import('./types').GoValidationError[],
+  workspaceRoot: string,
+  sourceDir: string,
+  templateRoot: string,
+  templateBaseDir: string
+) {
+  analyzerCollection.clear();
+
+  const issuesByFile = new Map<string, vscode.Diagnostic[]>();
+
+  for (const err of validationErrors) {
+    const baseDir = templateBaseDir === '' ? workspaceRoot : path.join(workspaceRoot, templateBaseDir);
+    const absPath = path.join(baseDir, templateRoot, err.template);
+
+    const startLine = Math.max(0, err.line - 1);
+    const startCol = Math.max(0, err.column - 1);
+    const endCol = startCol + (err.variable?.length || 1);
+
+    const range = new vscode.Range(startLine, startCol, startLine, endCol);
+    const diag = new vscode.Diagnostic(
+      range,
+      err.message,
+      err.severity === 'warning' ? vscode.DiagnosticSeverity.Warning : vscode.DiagnosticSeverity.Error
+    );
+    diag.source = 'Rex';
+
+    if (err.goFile) {
+      const goFileAbs = path.join(workspaceRoot, sourceDir, err.goFile);
+      diag.relatedInformation = [
+        new vscode.DiagnosticRelatedInformation(
+          new vscode.Location(
+            vscode.Uri.file(goFileAbs),
+            new vscode.Position(Math.max(0, (err.goLine ?? 1) - 1), 0)
+          ),
+          'Variable passed from here'
+        ),
+      ];
+    }
+
+    const list = issuesByFile.get(absPath) ?? [];
+    list.push(diag);
+    issuesByFile.set(absPath, list);
+  }
+
+  for (const [filePath, issues] of issuesByFile) {
+    analyzerCollection.set(vscode.Uri.file(filePath), issues);
+  }
+
+  outputChannel.appendLine(`[Rex] Applied ${validationErrors.length} analyzer diagnostics`);
+}
+
+// ── Per-document validation ────────────────────────────────────────────────────
+
+async function validateDocument(doc: vscode.TextDocument) {
+  if (!validator || !graphBuilder) return;
+
+  let ctx = graphBuilder.findContextForFile(doc.uri.fsPath);
+
+  // If this file has no render calls or wasn't found, it might be a partial used by other templates
+  // Try to find the context from a parent template's partial call
+  if (!ctx || ctx.renderCalls.length === 0) {
+    const partialCtx = graphBuilder.findContextForFileAsPartial(doc.uri.fsPath);
+    if (partialCtx) {
+      ctx = partialCtx;
+    }
+  }
+
+  if (!ctx) {
+    editorCollection.delete(doc.uri);
+    return;
+  }
+
+  const diagnostics = await validator.validateDocument(doc, ctx);
+  editorCollection.set(doc.uri, diagnostics);
+}
+
+// ── Debounce helpers ───────────────────────────────────────────────────────────
+
+function scheduleRebuild(workspaceRoot: string) {
+  const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+  const debounceMs = config.get<number>('debounceMs') ?? 1500;
+
+  if (rebuildTimer) clearTimeout(rebuildTimer);
+  rebuildTimer = setTimeout(() => rebuildIndex(workspaceRoot), debounceMs * 2);
+}
+
+function scheduleValidate(doc: vscode.TextDocument) {
+  const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+  const debounceMs = config.get<number>('debounceMs') ?? 1500;
+
+  if (validateTimer) clearTimeout(validateTimer);
+  validateTimer = setTimeout(() => validateDocument(doc), debounceMs);
+}
+
+// ── Deactivation ───────────────────────────────────────────────────────────────
+
+export function deactivate() {
+  if (rebuildTimer) clearTimeout(rebuildTimer);
+  if (validateTimer) clearTimeout(validateTimer);
+  analyzerCollection?.dispose();
+  editorCollection?.dispose();
+  outputChannel?.dispose();
+}
+
+
+################################################################
+# FILE: extension/src/graphPanel.ts
+################################################################
+import * as vscode from 'vscode';
+import { KnowledgeGraph } from './types';
+
+export class KnowledgeGraphPanel {
+  private static currentPanel: KnowledgeGraphPanel | undefined;
+  private readonly panel: vscode.WebviewPanel;
+  private disposables: vscode.Disposable[] = [];
+
+  static show(context: vscode.ExtensionContext, graph: KnowledgeGraph) {
+    if (KnowledgeGraphPanel.currentPanel) {
+      KnowledgeGraphPanel.currentPanel.panel.reveal();
+      KnowledgeGraphPanel.currentPanel.update(graph);
+      return;
+    }
+
+    const panel = vscode.window.createWebviewPanel(
+      'rexKnowledgeGraph',
+      'Rex Template Knowledge Graph',
+      vscode.ViewColumn.Beside,
+      { enableScripts: true }
+    );
+
+    KnowledgeGraphPanel.currentPanel = new KnowledgeGraphPanel(panel, graph, context);
+  }
+
+  private constructor(
+    panel: vscode.WebviewPanel,
+    graph: KnowledgeGraph,
+    context: vscode.ExtensionContext
+  ) {
+    this.panel = panel;
+    this.panel.webview.html = this.buildHTML(graph);
+
+    this.panel.onDidDispose(
+      () => {
+        KnowledgeGraphPanel.currentPanel = undefined;
+        this.dispose();
+      },
+      null,
+      this.disposables
+    );
+  }
+
+  update(graph: KnowledgeGraph) {
+    this.panel.webview.html = this.buildHTML(graph);
+  }
+
+  private dispose() {
+    this.disposables.forEach((d) => d.dispose());
+  }
+
+  private shortType(typeStr: string): string {
+    // "github.com/example/pkg.TypeName" -> "TypeName"
+    // "*github.com/example/pkg.TypeName" -> "*TypeName"
+    const prefix = typeStr.startsWith('*') ? '*' : '';
+    const base = typeStr.replace(/^\*/, '');
+    const parts = base.split('.');
+    return prefix + parts[parts.length - 1];
+  }
+
+  private buildHTML(graph: KnowledgeGraph): string {
+    const nodes: { id: string; label: string; group: string }[] = [];
+    const edges: { from: string; to: string; label?: string }[] = [];
+
+    for (const [tplPath, ctx] of graph.templates) {
+      const tplId = `tpl:${tplPath}`;
+      nodes.push({
+        id: tplId,
+        label: tplPath.split('/').slice(-2).join('/'),
+        group: 'template',
+      });
+
+      for (const [varName, v] of ctx.vars) {
+        const varId = `var:${tplPath}:${varName}`;
+        nodes.push({
+          id: varId,
+          label: `${varName}\n(${this.shortType(v.type)})`,
+          group: 'variable',
+        });
+        edges.push({ from: tplId, to: varId });
+
+        // Show fields
+        if (v.fields) {
+          for (const f of v.fields.slice(0, 8)) {
+            const fId = `field:${tplPath}:${varName}:${f.name}`;
+            nodes.push({
+              id: fId,
+              label: `${f.name}\n(${this.shortType(f.type)})`,
+              group: 'field',
+            });
+            edges.push({ from: varId, to: fId, label: '' });
+          }
+        }
+      }
+
+      // Go source -> template edges
+      for (const rc of ctx.renderCalls) {
+        const srcId = `src:${rc.file}:${rc.line}`;
+        const existingNode = nodes.find((n) => n.id === srcId);
+        if (!existingNode) {
+          const shortFile = rc.file.split('/').slice(-2).join('/');
+          nodes.push({
+            id: srcId,
+            label: `${shortFile}\nL${rc.line}`,
+            group: 'gofile',
+          });
+        }
+        edges.push({ from: srcId, to: tplId, label: 'Render()' });
+      }
+    }
+
+    const nodesJson = JSON.stringify(nodes);
+    const edgesJson = JSON.stringify(edges);
+    const analyzedAt = graph.analyzedAt.toLocaleTimeString();
+
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Rex Template Knowledge Graph</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --border: #2a2d3a;
+    --accent: #6c63ff;
+    --green: #00d9a3;
+    --yellow: #ffd166;
+    --red: #ef476f;
+    --text: #e2e8f0;
+    --muted: #64748b;
+    --font: 'Fira Code', 'Cascadia Code', monospace;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  header {
+    padding: 12px 20px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+
+  header h1 {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--accent);
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+
+  .badge {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 4px;
+    background: rgba(108,99,255,0.15);
+    color: var(--accent);
+    border: 1px solid rgba(108,99,255,0.3);
+  }
+
+  .time {
+    margin-left: auto;
+    font-size: 11px;
+    color: var(--muted);
+  }
+
+  .legend {
+    display: flex;
+    gap: 16px;
+    padding: 8px 20px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    font-size: 11px;
+  }
+
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--muted);
+  }
+
+  .dot {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+  }
+
+  .dot.template { background: var(--accent); }
+  .dot.variable { background: var(--green); }
+  .dot.field    { background: var(--yellow); }
+  .dot.gofile   { background: #ff6b9d; }
+
+  #graph-container {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+  }
+
+  canvas {
+    width: 100%;
+    height: 100%;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>⬡ Rex Template Knowledge Graph</h1>
+  <span class="badge">${nodes.length} nodes · ${edges.length} edges</span>
+  <span class="time">Analyzed at ${analyzedAt}</span>
+</header>
+<div class="legend">
+  <div class="legend-item"><div class="dot gofile"></div> Go Handler</div>
+  <div class="legend-item"><div class="dot template"></div> Template</div>
+  <div class="legend-item"><div class="dot variable"></div> Variable</div>
+  <div class="legend-item"><div class="dot field"></div> Field</div>
+</div>
+<div id="graph-container">
+  ${nodes.length === 0 ? `
+    <div class="no-data">
+      <div class="icon">🔍</div>
+      <div>No render calls found. Rebuild the index first.</div>
+    </div>` : '<canvas id="canvas"></canvas>'}
+  <div class="tooltip" id="tooltip"></div>
+</div>
+
+<script>
+const RAW_NODES = ${nodesJson};
+const RAW_EDGES = ${edgesJson};
+
+function log(msg) {
+    console.log(msg);
+}
+
+if (RAW_NODES.length > 0) {
+  const canvas = document.getElementById('canvas');
+  const tooltip = document.getElementById('tooltip');
+  const container = document.getElementById('graph-container');
+  const ctx = canvas.getContext('2d');
+
+  const COLORS = {
+    template: '#6c63ff',
+    variable: '#00d9a3',
+    field: '#ffd166',
+    gofile: '#ff6b9d',
+  };
+
+  let width = 0, height = 0;
+  let nodes = [], edges = [];
+  let transform = { x: 0, y: 0, scale: 1 };
+  let dragging = null, panning = false, lastMouse = null;
+  let animFrame;
+
+  function resize() {
+    if (!container) return;
+    width = canvas.width = container.clientWidth;
+    height = canvas.height = container.clientHeight;
+    log(\`Size: \${width}x\${height} | Nodes: \${nodes.length}\`);
+    
+    // Center the graph if offset
+    transform.x = width / 2;
+    transform.y = height / 2;
+    // We render relative to center (0,0 is center)
+  }
+
+  function initNodes() {
+    // Need dimensions to place initially
+    if (width === 0 || height === 0) return;
+
+    const angleStep = (2 * Math.PI) / Math.max(RAW_NODES.length, 1);
+    const radius = Math.min(width, height) * 0.35;
+    
+    nodes = RAW_NODES.map((n, i) => ({
+      ...n,
+      // Initialize around (0,0) which we will center with transform
+      x: radius * Math.cos(i * angleStep),
+      y: radius * Math.sin(i * angleStep),
+      vx: 0, vy: 0,
+    }));
+    
+    edges = RAW_EDGES.map(e => ({
+      ...e,
+      source: nodes.find(n => n.id === e.from),
+      target: nodes.find(n => n.id === e.to),
+    })).filter(e => e.source && e.target);
+    
+    log(\`Initialized \${nodes.length} nodes\`);
+  }
+
+  // Force-directed layout
+  function tick() {
+    const repulse = 5000; // Stronger repulsion
+    const attract = 0.05;
+
+    // Repulsion
+    for (let i = 0; i < nodes.length; i++) {
+      for (let j = i + 1; j < nodes.length; j++) {
+        const a = nodes[i], b = nodes[j];
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let dist = Math.sqrt(dx*dx + dy*dy);
+        
+        // Jitter if overlapping
+        if (dist < 0.1) {
+            dx = (Math.random() - 0.5);
+            dy = (Math.random() - 0.5);
+            dist = Math.sqrt(dx*dx + dy*dy) || 1;
+        }
+        
+        const force = repulse / (dist * dist);
+        a.vx -= force * dx / dist;
+        a.vy -= force * dy / dist;
+        b.vx += force * dx / dist;
+        b.vy += force * dy / dist;
+      }
+    }
+
+    // Attraction along edges
+    for (const e of edges) {
+      if (!e.source || !e.target) continue;
+      const dx = e.target.x - e.source.x;
+      const dy = e.target.y - e.source.y;
+      const dist = Math.sqrt(dx*dx + dy*dy) || 1;
+      const force = attract * (dist - 100);
+      e.source.vx += force * dx / dist;
+      e.source.vy += force * dy / dist;
+      e.target.vx -= force * dx / dist;
+      e.target.vy -= force * dy / dist;
+    }
+    
+    // Center gravity (pull to 0,0)
+    for (const n of nodes) {
+        const dist = Math.sqrt(n.x*n.x + n.y*n.y) || 1;
+        const force = 0.01 * dist; // Weak pull to center
+        n.vx -= force * n.x / dist;
+        n.vy -= force * n.y / dist;
+    }
+
+    // Damping + integrate
+    for (const n of nodes) {
+      n.vx *= 0.85; n.vy *= 0.85;
+      n.x += n.vx; n.y += n.vy;
+    }
+  }
+
+  function draw() {
+    try {
+        ctx.clearRect(0, 0, width, height);
+        
+        // Debug border
+        ctx.strokeStyle = '#333';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(0, 0, width, height);
+
+        ctx.save();
+        // Move origin to center + transform offset
+        ctx.translate(transform.x, transform.y);
+        ctx.scale(transform.scale, transform.scale);
+
+        // Edges
+        ctx.strokeStyle = 'rgba(100,116,139,0.35)';
+        ctx.lineWidth = 1;
+        for (const e of edges) {
+          if (!e.source || !e.target) continue;
+          ctx.beginPath();
+          ctx.moveTo(e.source.x, e.source.y);
+          ctx.lineTo(e.target.x, e.target.y);
+          ctx.stroke();
+        }
+
+        // Nodes
+        for (const n of nodes) {
+          const r = n.group === 'template' ? 28 : n.group === 'gofile' ? 22 : 18;
+          const color = COLORS[n.group] || '#888';
+
+          // Glow
+          const grd = ctx.createRadialGradient(n.x, n.y, 0, n.x, n.y, r + 8);
+          grd.addColorStop(0, color + '33');
+          grd.addColorStop(1, 'transparent');
+          ctx.beginPath();
+          ctx.arc(n.x, n.y, r + 8, 0, Math.PI * 2);
+          ctx.fillStyle = grd;
+          ctx.fill();
+
+          // Circle
+          ctx.beginPath();
+          ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
+          ctx.fillStyle = '#1a1d27';
+          ctx.fill();
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 2;
+          ctx.stroke();
+
+          // Label
+          ctx.fillStyle = color;
+          ctx.font = '9px Fira Code, monospace';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          const lines = n.label.split('\\n');
+          lines.forEach((line, i) => {
+            ctx.fillText(line, n.x, n.y + (i - (lines.length-1)/2) * 11);
+          });
+        }
+
+        ctx.restore();
+    } catch(e) {
+        log('Draw error: ' + e);
+    }
+  }
+
+  function loop() {
+    tick();
+    draw();
+    animFrame = requestAnimationFrame(loop);
+  }
+
+  // Mouse interaction
+  function screenToWorld(x, y) {
+    return {
+      x: (x - transform.x) / transform.scale,
+      y: (y - transform.y) / transform.scale,
+    };
+  }
+
+  function nodeAt(wx, wy) {
+    for (const n of nodes) {
+      const r = n.group === 'template' ? 28 : 20;
+      const dx = n.x - wx, dy = n.y - wy;
+      if (dx*dx + dy*dy <= r*r) return n;
+    }
+    return null;
+  }
+
+  canvas.addEventListener('mousedown', e => {
+    const w = screenToWorld(e.offsetX, e.offsetY);
+    const n = nodeAt(w.x, w.y);
+    if (n) { dragging = n; }
+    else { panning = true; lastMouse = { x: e.offsetX, y: e.offsetY }; }
+  });
+
+  canvas.addEventListener('mousemove', e => {
+    if (dragging) {
+      const w = screenToWorld(e.offsetX, e.offsetY);
+      dragging.x = w.x; dragging.y = w.y;
+      dragging.vx = 0; dragging.vy = 0;
+    } else if (panning && lastMouse) {
+      transform.x += e.offsetX - lastMouse.x;
+      transform.y += e.offsetY - lastMouse.y;
+      lastMouse = { x: e.offsetX, y: e.offsetY };
+    } else {
+      const w = screenToWorld(e.offsetX, e.offsetY);
+      const n = nodeAt(w.x, w.y);
+      if (n) {
+        tooltip.style.display = 'block';
+        tooltip.style.left = (e.offsetX + 12) + 'px';
+        tooltip.style.top = (e.offsetY - 8) + 'px';
+        tooltip.textContent = n.id;
+      } else {
+        tooltip.style.display = 'none';
+      }
+    }
+  });
+
+  canvas.addEventListener('mouseup', () => { dragging = null; panning = false; lastMouse = null; });
+  canvas.addEventListener('mouseleave', () => { dragging = null; panning = false; tooltip.style.display = 'none'; });
+
+  canvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    const factor = e.deltaY > 0 ? 0.9 : 1.1;
+    // Zoom towards cursor (cx, cy)
+    // transform.x and y are translation.
+    // screenX = worldX * scale + transX
+    // newScale = scale * factor
+    // transX' = cx - (cx - transX) * factor
+    const cx = e.offsetX, cy = e.offsetY;
+    transform.x = cx - factor * (cx - transform.x);
+    transform.y = cy - factor * (cy - transform.y);
+    transform.scale *= factor;
+  }, { passive: false });
+
+  window.addEventListener('resize', () => {
+      resize();
+      // If we haven't initialized nodes yet (because width was 0), do it now
+      if (nodes.length === 0 && width > 0) {
+          initNodes();
+      }
+  });
+  
+  if (window.ResizeObserver) {
+    const ro = new ResizeObserver(() => {
+        resize();
+        if (nodes.length === 0 && width > 0) {
+             initNodes();
+        }
+    });
+    ro.observe(container);
+  }
+
+  resize();
+  initNodes();
+  loop();
+}
+</script>
+</body>
+</html>`;
+  }
+}
+
+
+################################################################
+# FILE: extension/src/knowledgeGraph.ts
+################################################################
+import * as path from 'path';
+import * as fs from 'fs';
+import * as vscode from 'vscode';
+import {
+  AnalysisResult,
+  KnowledgeGraph,
+  RenderCall,
+  TemplateContext,
+  TemplateVar,
+  TemplateNode,
+} from './types';
+import { TemplateParser, resolvePath } from './templateParser';
+
+export class KnowledgeGraphBuilder {
+  private graph: KnowledgeGraph = {
+    templates: new Map(),
+    analyzedAt: new Date(),
+  };
+
+  private workspaceRoot: string;
+  private outputChannel: vscode.OutputChannel;
+
+  constructor(workspaceRoot: string, outputChannel: vscode.OutputChannel) {
+    this.workspaceRoot = workspaceRoot;
+    this.outputChannel = outputChannel;
+  }
+
+  build(analysisResult: AnalysisResult): KnowledgeGraph {
+    const templates = new Map<string, TemplateContext>();
+    const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+    const sourceDir: string = config.get('sourceDir') ?? '.';
+    const templateRoot: string = config.get('templateRoot') ?? '';
+
+    for (const rc of analysisResult.renderCalls ?? []) {
+      const logicalPath = rc.template.replace(/^\.\//, '');
+
+      // Absolute path on disk: workspaceRoot / sourceDir / templateRoot / template
+      const absPath = path.join(this.workspaceRoot, sourceDir, templateRoot, logicalPath);
+
+      let ctx = templates.get(logicalPath);
+      if (!ctx) {
+        ctx = {
+          templatePath: logicalPath,
+          absolutePath: absPath,
+          vars: new Map(),
+          renderCalls: [],
+        };
+        templates.set(logicalPath, ctx);
+      }
+
+      ctx.renderCalls.push(rc);
+
+      for (const v of rc.vars ?? []) {
+        const existing = ctx.vars.get(v.name);
+        if (!existing || (v.fields && v.fields.length > 0)) {
+          ctx.vars.set(v.name, v);
+        }
+      }
+    }
+
+    this.graph = { templates, analyzedAt: new Date() };
+
+    this.outputChannel.appendLine(
+      `[KnowledgeGraph] Built graph with ${templates.size} templates`
+    );
+    for (const [tpl, ctx] of templates) {
+      this.outputChannel.appendLine(
+        `  ${tpl}: ${[...ctx.vars.keys()].join(', ')} (${ctx.renderCalls.length} call(s))`
+      );
+    }
+
+    return this.graph;
+  }
+
+  getGraph(): KnowledgeGraph {
+    return this.graph;
+  }
+
+  /**
+   * Find the TemplateContext for a given absolute file path.
+   * Handles templateRoot stripping and fuzzy suffix matching.
+   */
+  findContextForFile(absolutePath: string): TemplateContext | undefined {
+    const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+    const sourceDir: string = config.get('sourceDir') ?? '.';
+    const templateRoot: string = config.get('templateRoot') ?? '';
+
+    // Compute path relative to: workspaceRoot / sourceDir / templateRoot
+    const templateBase = path.join(this.workspaceRoot, sourceDir, templateRoot);
+    let rel = path.relative(templateBase, absolutePath).replace(/\\/g, '/');
+
+    // Direct match
+    if (this.graph.templates.has(rel)) {
+      return this.graph.templates.get(rel);
+    }
+
+    // Suffix match — the render call path may be a suffix of the relative path
+    for (const [tplPath, ctx] of this.graph.templates) {
+      if (rel.endsWith(tplPath) || tplPath.endsWith(rel)) {
+        return ctx;
+      }
+    }
+
+    // Basename match as last resort
+    const base = path.basename(absolutePath);
+    for (const [, ctx] of this.graph.templates) {
+      if (path.basename(ctx.templatePath) === base) {
+        return ctx;
+      }
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Find a partial template context by name, searching the graph and filesystem.
+   */
+  findPartialContext(partialName: string, currentFile: string): TemplateContext | undefined {
+    // 1. Check graph first
+    for (const [tplPath, ctx] of this.graph.templates) {
+      if (
+        tplPath === partialName ||
+        tplPath.endsWith('/' + partialName) ||
+        path.basename(tplPath) === partialName
+      ) {
+        return ctx;
+      }
+    }
+
+    // 2. Search filesystem
+    const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+    const sourceDir: string = config.get('sourceDir') ?? '.';
+    const templateRoot: string = config.get('templateRoot') ?? '';
+
+    const templateBase = path.join(this.workspaceRoot, sourceDir, templateRoot);
+    const candidates = [
+      path.join(path.dirname(currentFile), partialName),
+      path.join(templateBase, partialName),
+      path.join(this.workspaceRoot, partialName),
+    ];
+
+    for (const candidate of candidates) {
+      if (fs.existsSync(candidate)) {
+        return {
+          templatePath: path.relative(templateBase, candidate).replace(/\\/g, '/'),
+          absolutePath: candidate,
+          vars: new Map(),
+          renderCalls: [],
+        };
+      }
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Find the context for a file when it's being used as a partial.
+   * This walks the graph to find which parent templates include this partial
+   * and what context they pass to it, then resolves the correct vars.
+   */
+  findContextForFileAsPartial(absolutePath: string): TemplateContext | undefined {
+    const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+    const sourceDir: string = config.get('sourceDir') ?? '.';
+    const templateRoot: string = config.get('templateRoot') ?? '';
+
+    // Compute the relative path for the partial file
+    const templateBase = path.join(this.workspaceRoot, sourceDir, templateRoot);
+    let partialRelPath = path.relative(templateBase, absolutePath).replace(/\\/g, '/');
+
+    // Also check basename for matching
+    const partialBasename = path.basename(absolutePath);
+
+    this.outputChannel.appendLine(
+      `[KnowledgeGraph] Looking for partial: ${partialRelPath} (basename: ${partialBasename})`
+    );
+    this.outputChannel.appendLine(
+      `[KnowledgeGraph] Template base: ${templateBase}, Graph has ${this.graph.templates.size} templates`
+    );
+
+    const parser = new TemplateParser();
+
+    // Search through all templates in the graph to find calls to this partial
+    for (const [parentTplPath, parentCtx] of this.graph.templates) {
+      this.outputChannel.appendLine(
+        `[KnowledgeGraph] Checking parent template: ${parentTplPath} at ${parentCtx.absolutePath}`
+      );
+      
+      // Read and parse the parent template
+      if (!parentCtx.absolutePath || !fs.existsSync(parentCtx.absolutePath)) {
+        this.outputChannel.appendLine(
+          `[KnowledgeGraph] Skipping ${parentTplPath}: file not found at ${parentCtx.absolutePath}`
+        );
+        continue;
+      }
+
+      try {
+        const content = fs.readFileSync(parentCtx.absolutePath, 'utf8');
+        const nodes = parser.parse(content);
+
+        // Search for partial nodes that reference this file
+        const partialCall = this.findPartialCall(nodes, partialRelPath, partialBasename);
+        if (partialCall) {
+          this.outputChannel.appendLine(
+            `[KnowledgeGraph] Found partial call in ${parentTplPath}: template "${partialCall.partialName}" ${partialCall.partialContext}`
+          );
+          // Found a call to this partial - resolve the context argument
+          const partialVars = this.resolvePartialVars(
+            partialCall.partialContext ?? '.',
+            parentCtx.vars,
+            [],
+            parentCtx
+          );
+
+          this.outputChannel.appendLine(
+            `[KnowledgeGraph] Resolved partial vars: ${[...partialVars.keys()].join(', ')}`
+          );
+
+          // Track which parent variable was passed to this partial for go-to-definition
+          const partialSourceVar = this.findPartialSourceVar(
+            partialCall.partialContext ?? '.',
+            parentCtx.vars
+          );
+
+          return {
+            templatePath: partialRelPath,
+            absolutePath: absolutePath,
+            vars: partialVars,
+            renderCalls: parentCtx.renderCalls, // Inherit parent's render calls for go-to-def
+            partialSourceVar, // Track the source variable passed to this partial
+          };
+        }
+      } catch {
+        // Ignore read/parse errors
+        continue;
+      }
+    }
+
+    this.outputChannel.appendLine(
+      `[KnowledgeGraph] No partial call found for ${partialRelPath}`
+    );
+    return undefined;
+  }
+
+  /**
+   * Recursively search for a partial call in the AST that matches the given partial path.
+   */
+  private findPartialCall(
+    nodes: TemplateNode[],
+    partialRelPath: string,
+    partialBasename: string
+  ): TemplateNode | undefined {
+    for (const node of nodes) {
+      if (node.kind === 'partial' && node.partialName) {
+        // Check if this partial call matches our target
+        const name = node.partialName;
+        this.outputChannel.appendLine(
+          `[KnowledgeGraph] Found partial call: "${name}" (looking for: ${partialRelPath} or ${partialBasename})`
+        );
+        if (
+          name === partialRelPath ||
+          name === partialBasename ||
+          partialRelPath.endsWith('/' + name) ||
+          partialRelPath.endsWith(name)
+        ) {
+          return node;
+        }
+      }
+
+      // Recurse into children
+      if (node.children) {
+        const found = this.findPartialCall(node.children, partialRelPath, partialBasename);
+        if (found) return found;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Given the context arg passed to a partial (e.g. ".", ".User", ".User.Address"),
+   * build the vars map that the partial will see as its root scope.
+   */
+  private resolvePartialVars(
+    contextArg: string,
+    vars: Map<string, TemplateVar>,
+    scopeStack: { key: string; typeStr: string; fields?: { name: string; type: string; fields?: any[]; isSlice: boolean; defFile?: string; defLine?: number; defCol?: number; doc?: string }[] }[],
+    ctx: TemplateContext
+  ): Map<string, TemplateVar> {
+    // "." → pass through all current vars + current dot scope
+    if (contextArg === '.') {
+      // If we're in a scoped block, expose the dot frame's fields as top-level vars
+      const dotFrame = scopeStack.slice().reverse().find(f => f.key === '.');
+      if (dotFrame?.fields) {
+        const result = new Map<string, TemplateVar>();
+        for (const f of dotFrame.fields) {
+          result.set(f.name, {
+            name: f.name,
+            type: f.type,
+            fields: f.fields,
+            isSlice: f.isSlice ?? false,
+            defFile: f.defFile,
+            defLine: f.defLine,
+            defCol: f.defCol,
+            doc: f.doc,
+          });
+        }
+        return result;
+      }
+      // Root scope: pass through all vars (preserve all metadata)
+      return new Map(vars);
+    }
+
+    // ".SomePath" → resolve that path and expose its fields
+    const parser = new TemplateParser();
+    const path = parser.parseDotPath(contextArg);
+    const result = resolvePath(path, vars, scopeStack);
+
+    if (!result.found || !result.fields) {
+      return new Map();
+    }
+
+    const partialVars = new Map<string, TemplateVar>();
+    for (const f of result.fields) {
+      partialVars.set(f.name, {
+        name: f.name,
+        type: f.type,
+        fields: f.fields,
+        isSlice: f.isSlice,
+        defFile: f.defFile,
+        defLine: f.defLine,
+        defCol: f.defCol,
+        doc: f.doc,
+      });
+    }
+    return partialVars;
+  }
+
+  /**
+   * Find the source variable that was passed to a partial.
+   * For {{ template "partial" .User }}, returns the "User" TemplateVar.
+   */
+  private findPartialSourceVar(
+    contextArg: string,
+    vars: Map<string, TemplateVar>
+  ): TemplateVar | undefined {
+    // "." means all vars passed - no single source
+    if (contextArg === '.' || contextArg === '') {
+      return undefined;
+    }
+
+    // Parse path like ".User" or ".User.Address"
+    const parser = new TemplateParser();
+    const path = parser.parseDotPath(contextArg);
+    if (path.length === 0) {
+      return undefined;
+    }
+
+    // Find the top-level variable
+    const topVar = vars.get(path[0]);
+    if (!topVar) {
+      return undefined;
+    }
+
+    // If it's just a single path component, return that var
+    if (path.length === 1) {
+      return topVar;
+    }
+
+    // Navigate through fields to find the nested type
+    let currentVar = topVar;
+    for (let i = 1; i < path.length; i++) {
+      const field = currentVar.fields?.find(f => f.name === path[i]);
+      if (!field) {
+        return undefined;
+      }
+      // Create a synthetic TemplateVar from the field
+      currentVar = {
+        name: field.name,
+        type: field.type,
+        fields: field.fields,
+        isSlice: field.isSlice ?? false,
+        defFile: field.defFile,
+        defLine: field.defLine,
+        defCol: field.defCol,
+        doc: field.doc,
+      };
+    }
+
+    return currentVar;
+  }
+
+  /**
+   * Resolve a Go source file path (relative to sourceDir) to an absolute path.
+   * Used for go-to-definition.
+   */
+  resolveGoFilePath(relativeFile: string): string | null {
+    const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+    const sourceDir: string = config.get('sourceDir') ?? '.';
+
+    const abs = path.join(this.workspaceRoot, sourceDir, relativeFile);
+    return fs.existsSync(abs) ? abs : null;
+  }
+
+  /**
+   * Resolve a template path (e.g., "views/partial.html") to an absolute file path.
+   * Searches the graph and filesystem for the template.
+   */
+  resolveTemplatePath(templatePath: string): string | null {
+    const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+    const sourceDir: string = config.get('sourceDir') ?? '.';
+    const templateRoot: string = config.get('templateRoot') ?? '';
+
+    // 1. Check if it's already in the graph
+    const ctx = this.graph.templates.get(templatePath);
+    if (ctx?.absolutePath && fs.existsSync(ctx.absolutePath)) {
+      return ctx.absolutePath;
+    }
+
+    // 2. Search by suffix match in the graph
+    for (const [tplPath, tplCtx] of this.graph.templates) {
+      if (tplPath.endsWith(templatePath) || templatePath.endsWith(tplPath)) {
+        if (tplCtx.absolutePath && fs.existsSync(tplCtx.absolutePath)) {
+          return tplCtx.absolutePath;
+        }
+      }
+    }
+
+    // 3. Search filesystem at common locations
+    const templateBase = path.join(this.workspaceRoot, sourceDir, templateRoot);
+    const candidates = [
+      path.join(templateBase, templatePath),
+      path.join(this.workspaceRoot, templatePath),
+      path.join(this.workspaceRoot, sourceDir, templatePath),
+    ];
+
+    for (const candidate of candidates) {
+      if (fs.existsSync(candidate)) {
+        return candidate;
+      }
+    }
+
+    return null;
+  }
+
+  toJSON(): object {
+    const obj: Record<string, unknown> = {};
+    for (const [key, ctx] of this.graph.templates) {
+      obj[key] = {
+        vars: Object.fromEntries(
+          [...ctx.vars.entries()].map(([k, v]) => [k, { type: v.type, fields: v.fields }])
+        ),
+        renderCalls: ctx.renderCalls.map(r => ({ file: r.file, line: r.line })),
+      };
+    }
+    return obj;
+  }
+}
+
+
+################################################################
+# FILE: extension/src/templateParser.ts
+################################################################
+import { FieldInfo, ScopeFrame, TemplateNode, TemplateVar } from './types';
+
+/**
+ * Go template parser that produces a proper nested AST.
+ * range/with/if blocks contain their children so the validator
+ * can push/pop scope correctly.
+ */
+export class TemplateParser {
+  parse(content: string): TemplateNode[] {
+    const tokens = this.tokenize(content);
+    const { nodes } = this.buildTree(tokens, 0);
+    return nodes;
+  }
+
+  // ── Tokenizer ──────────────────────────────────────────────────────────────
+
+  private tokenize(content: string): Token[] {
+    const tokens: Token[] = [];
+    // Match {{ ... }} with optional whitespace trimming dashes
+    const actionRe = /\{\{-?\s*([\s\S]*?)\s*-?\}\}/g;
+
+    // Pre-compute line start offsets for O(log n) position lookup
+    const lineOffsets: number[] = [0];
+    for (let i = 0; i < content.length; i++) {
+      if (content[i] === '\n') {
+        lineOffsets.push(i + 1);
+      }
+    }
+
+    const getPos = (offset: number): { line: number; col: number } => {
+      let lo = 0, hi = lineOffsets.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (lineOffsets[mid] <= offset) lo = mid; else hi = mid - 1;
+      }
+      return { line: lo + 1, col: offset - lineOffsets[lo] + 1 };
+    };
+
+    let m: RegExpExecArray | null;
+    while ((m = actionRe.exec(content)) !== null) {
+      const inner = m[1].trim();
+      if (!inner) continue;
+      const pos = getPos(m.index);
+      tokens.push({ inner, line: pos.line, col: pos.col, raw: m[0] });
+    }
+
+    return tokens;
+  }
+
+  // ── Tree builder ───────────────────────────────────────────────────────────
+
+  private buildTree(tokens: Token[], pos: number): { nodes: TemplateNode[]; nextPos: number; endToken?: Token } {
+    const nodes: TemplateNode[] = [];
+
+    while (pos < tokens.length) {
+      const tok = tokens[pos];
+      const inner = tok.inner;
+
+      // end / else → stop this level
+      if (inner === 'end' || inner === 'else' || inner.startsWith('else ')) {
+        return { nodes, nextPos: pos + 1, endToken: tok };
+      }
+
+      // Comments
+      if (inner.startsWith('/*') || inner.startsWith('-/*') || inner.startsWith('//')) {
+        pos++; continue;
+      }
+
+      // ── Block openers ────────────────────────────────────────────────────
+
+      if (inner.startsWith('range ')) {
+        const expr = inner.slice(6).trim();
+        // Strip "$i, $v :=" or "$v :=" or "$_, $v :=" assignment prefix
+        const cleanExpr = expr.replace(/^\$\w+\s*(?:,\s*\$\w+)?\s*:=\s*/, '').trim();
+        const child = this.buildTree(tokens, pos + 1);
+        nodes.push({
+          kind: 'range',
+          path: this.parseDotPath(cleanExpr),
+          rawText: tok.raw,
+          line: tok.line,
+          col: tok.col,
+          endLine: child.endToken?.line,
+          endCol: child.endToken?.col,
+          children: child.nodes,
+        });
+        pos = child.nextPos;
+        continue;
+      }
+
+      if (inner.startsWith('with ')) {
+        const expr = inner.slice(5).trim().replace(/^\$\w+\s*:=\s*/, '').trim();
+        const child = this.buildTree(tokens, pos + 1);
+        nodes.push({
+          kind: 'with',
+          path: this.parseDotPath(expr),
+          rawText: tok.raw,
+          line: tok.line,
+          col: tok.col,
+          endLine: child.endToken?.line,
+          endCol: child.endToken?.col,
+          children: child.nodes,
+        });
+        pos = child.nextPos;
+        continue;
+      }
+
+      if (inner.startsWith('if ')) {
+        const expr = inner.slice(3).trim();
+        const child = this.buildTree(tokens, pos + 1);
+        nodes.push({
+          kind: 'if',
+          path: this.parseDotPath(expr),
+          rawText: tok.raw,
+          line: tok.line,
+          col: tok.col,
+          endLine: child.endToken?.line,
+          endCol: child.endToken?.col,
+          children: child.nodes,
+        });
+        pos = child.nextPos;
+        continue;
+      }
+
+      if (inner.startsWith('block ')) {
+        const words = inner.slice(6).trim().split(/\s+/);
+        let blockName = '';
+        let blockExpr = '.';
+        if (words.length >= 1) {
+          blockName = words[0].replace(/^"|"$/g, '');
+        }
+        if (words.length >= 2) {
+          blockExpr = words.slice(1).join(' ');
+        }
+        
+        const child = this.buildTree(tokens, pos + 1);
+        nodes.push({
+          kind: 'block',
+          path: this.parseDotPath(blockExpr),
+          rawText: tok.raw,
+          line: tok.line,
+          col: tok.col,
+          endLine: child.endToken?.line,
+          endCol: child.endToken?.col,
+          children: child.nodes,
+          blockName,
+        });
+        pos = child.nextPos;
+        continue;
+      }
+
+      if (inner.startsWith('define ')) {
+        const words = inner.slice(7).trim().split(/\s+/);
+        let blockName = '';
+        if (words.length >= 1) {
+          blockName = words[0].replace(/^"|"$/g, '');
+        }
+
+        const child = this.buildTree(tokens, pos + 1);
+        nodes.push({
+          kind: 'define',
+          path: [],
+          rawText: tok.raw,
+          line: tok.line,
+          col: tok.col,
+          endLine: child.endToken?.line,
+          endCol: child.endToken?.col,
+          children: child.nodes,
+          blockName,
+        });
+        pos = child.nextPos;
+        continue;
+      }
+
+      // ── Template / partial calls ─────────────────────────────────────────
+
+      if (inner.startsWith('template ')) {
+        const tplMatch = inner.match(/^template\s+"([^"]+)"(?:\s+(.+))?/);
+        if (tplMatch) {
+          const contextRaw = tplMatch[2]?.trim() ?? '.';
+          nodes.push({
+            kind: 'partial',
+            path: this.parseDotPath(contextRaw),
+            rawText: tok.raw,
+            line: tok.line,
+            col: tok.col,
+            partialName: tplMatch[1],
+            partialContext: contextRaw,
+          });
+        }
+        pos++; continue;
+      }
+
+      // ── Variable / pipeline ──────────────────────────────────────────────
+
+      const varNodes = this.tryParseVariables(tok);
+      nodes.push(...varNodes);
+      pos++;
+    }
+
+    return { nodes, nextPos: pos };
+  }
+
+  // ── Helpers ────────────────────────────────────────────────────────────────
+
+  /**
+   * Extract all dot-path variable references from a token.
+   * A single action may contain multiple refs: `eq .Name "foo"`, `not .IsLast`
+   */
+  private tryParseVariables(tok: Token): TemplateNode[] {
+    const inner = tok.inner;
+    const results: TemplateNode[] = [];
+
+    // Direct dot expression
+    if (inner.startsWith('.')) {
+      // Take only the path, stop at pipe or space
+      const pathStr = inner.split(/[\s|]/)[0];
+      results.push({
+        kind: 'variable',
+        path: this.parseDotPath(pathStr),
+        rawText: tok.raw,
+        line: tok.line,
+        col: tok.col,
+      });
+      return results;
+    }
+
+    // Pipelines and builtins that contain dot references
+    // e.g. "not .IsLast", "eq .Name .OtherName", "len .Items"
+    const dotRefs = inner.match(/(\.[A-Za-z_][A-Za-z0-9_.]*)/g);
+    if (dotRefs) {
+      for (const ref of dotRefs) {
+        results.push({
+          kind: 'variable',
+          path: this.parseDotPath(ref),
+          rawText: tok.raw,
+          line: tok.line,
+          col: tok.col,
+        });
+      }
+    }
+
+    return results;
+  }
+
+  /**
+   * Parse a dot-path expression into path segments.
+   *
+   * ".Visit.Doctor.Name" → ["Visit", "Doctor", "Name"]
+   * "."                  → ["."]   (bare dot = current scope)
+   * ".Items"             → ["Items"]
+   */
+  parseDotPath(expr: string): string[] {
+    // Strip variable assignment prefix "$v := "
+    expr = expr.replace(/^\$\w+\s*:=\s*/, '').trim();
+
+    // Extract path from (call .Method args)
+    const callMatch = expr.match(/\(call\s+(\.[^\s)]+)/);
+    if (callMatch) expr = callMatch[1];
+
+    // Take only the path part before any space/pipe/paren
+    const pathPart = expr.split(/[\s|(),]/)[0];
+
+    if (pathPart === '.' || pathPart === '') return ['.'];
+    if (!pathPart.startsWith('.')) return [];
+
+    return pathPart.split('.').filter(p => p.length > 0);
+  }
+}
+
+interface Token {
+  inner: string;
+  line: number;
+  col: number;
+  raw: string;
+}
+
+// ── Path resolution ────────────────────────────────────────────────────────────
+
+export interface ResolveResult {
+  typeStr: string;
+  found: boolean;
+  fields?: FieldInfo[];
+  isSlice?: boolean;
+}
+
+/**
+ * Resolve a dot-path against the current variable context and scope stack.
+ *
+ * Scope stack is innermost-last. The topmost frame with key "." represents
+ * the current implicit dot (inside range/with blocks).
+ */
+export function resolvePath(
+  path: string[],
+  vars: Map<string, TemplateVar>,
+  scopeStack: ScopeFrame[]
+): ResolveResult {
+  if (path.length === 0) {
+    return { typeStr: 'context', found: true };
+  }
+
+  // Bare dot → current scope
+  if (path.length === 1 && path[0] === '.') {
+    const frame = findDotFrame(scopeStack);
+    if (frame) return { typeStr: frame.typeStr, found: true, fields: frame.fields };
+    return { typeStr: 'context', found: true };
+  }
+
+  // Path starts with explicit "$var"
+  if (path[0].startsWith('$')) {
+    for (let i = scopeStack.length - 1; i >= 0; i--) {
+      const frame = scopeStack[i];
+      if (frame.key === path[0]) {
+        if (path.length === 1) return { typeStr: frame.typeStr, found: true, fields: frame.fields };
+        return resolveFields(path.slice(1), frame.fields ?? []);
+      }
+    }
+    return { typeStr: 'unknown', found: false };
+  }
+
+  // Path inside a with/range scope → check dot frame fields first
+  const dotFrame = findDotFrame(scopeStack);
+  if (dotFrame?.fields) {
+    const res = resolveFields(path, dotFrame.fields);
+    if (res.found) return res;
+  }
+
+  // Fall through to top-level vars
+  const topVar = vars.get(path[0]);
+  if (!topVar) {
+    return { typeStr: 'unknown', found: false };
+  }
+
+  if (path.length === 1) {
+    return { typeStr: topVar.type, found: true, fields: topVar.fields, isSlice: topVar.isSlice };
+  }
+
+  return resolveFields(path.slice(1), topVar.fields ?? []);
+}
+
+function findDotFrame(scopeStack: ScopeFrame[]): ScopeFrame | undefined {
+  for (let i = scopeStack.length - 1; i >= 0; i--) {
+    if (scopeStack[i].key === '.') return scopeStack[i];
+  }
+  return undefined;
+}
+
+function resolveFields(
+  parts: string[],
+  fields: FieldInfo[]
+): ResolveResult {
+  let current = fields;
+
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    const field = current.find(f => f.name === part);
+    if (!field) {
+      return { typeStr: 'unknown', found: false };
+    }
+    if (i === parts.length - 1) {
+      return { typeStr: field.type, found: true, fields: field.fields, isSlice: field.isSlice };
+    }
+    current = field.fields ?? [];
+  }
+
+  return { typeStr: 'unknown', found: false };
+}
+
+
+################################################################
+# FILE: extension/src/test_ast.ts
+################################################################
+import { TemplateParser } from './/templateParser';
+
+const content = `
+{{ range .billedDrugs }}
+  {{ template "billed-drug" . }}
+{{ end }}
+
+{{ block "billed-drug" . }}
+  {{ .Name }}
+{{ end }}
+`;
+
+const p = new TemplateParser();
+console.log(JSON.stringify(p.parse(content), null, 2));
+
+
+################################################################
+# FILE: extension/src/test_hover.ts
+################################################################
+import { TemplateParser } from './templateParser';
+import { TemplateValidator } from './validator';
+import { KnowledgeGraphBuilder } from './knowledgeGraph';
+import * as vscode from 'vscode';
+
+const p = new TemplateParser();
+const content = `{{ block "billed-drug" .Drug }}
+    {{ .Name }}
+{{ end }}`;
+
+// Dummy output channel
+const outputChannel: any = { appendLine: console.log };
+const validator = new TemplateValidator(outputChannel, {} as any);
+
+const vars = new Map<string, any>([
+  ['Drug', { name: 'Drug', type: 'Drug', isSlice: false, fields: [{ name: 'Name', type: 'string', isSlice: false, doc: 'The name' }] }]
+]);
+
+const doc: any = {
+  getText: () => content,
+  uri: { fsPath: 'test.html' }
+};
+
+const pos = new vscode.Position(1, 8); // Line 2, column 9 (hover over .Name)
+// Wait, position lines are 0-based in vscode
+const hit = (validator as any).findNodeAtPosition(p.parse(content), pos, vars, []);
+console.log(JSON.stringify(hit, null, 2));
+
+
+
+################################################################
+# FILE: extension/src/test_parser.ts
+################################################################
+import { TemplateParser } from './templateParser';
+
+const p = new TemplateParser();
+const content = `
+{{ with .User }}
+    {{ define "header" }}
+        {{ .Age }}
+    {{ end }}
+    {{ .Name }}
+{{ end }}
+`;
+
+const res = p.parse(content);
+console.log(JSON.stringify(res, null, 2));
+
+
+################################################################
+# FILE: extension/src/types.ts
+################################################################
+// Types mirroring the Go analyzer output
+
+export interface FieldInfo {
+  name: string;
+  type: string;
+  fields?: FieldInfo[];
+  isSlice: boolean;
+  methods?: string[];
+  // Definition location in Go source (for go-to-definition)
+  defFile?: string;  // Go file where the field is defined
+  defLine?: number;  // Line number where the field is defined (1-based)
+  defCol?: number;   // Column number where the field is defined (1-based)
+  // Documentation
+  doc?: string;  // Documentation comment for the field
+}
+
+export interface TemplateVar {
+  name: string;
+  type: string;
+  fields?: FieldInfo[];
+  isSlice: boolean;
+  elemType?: string;
+  // Definition location in Go source (for go-to-definition)
+  defFile?: string;  // Go file where the variable is defined
+  defLine?: number;  // Line number where the variable is defined (1-based)
+  defCol?: number;   // Column number where the variable is defined (1-based)
+  // Documentation
+  doc?: string;  // Documentation comment for the type
+}
+
+export interface RenderCall {
+  file: string;   // relative to sourceDir, e.g. "handler.go"
+  line: number;
+  template: string; // e.g. "views/inpatient/treatment-chart.html"
+  vars: TemplateVar[];
+}
+
+export interface GoValidationError {
+  template: string;
+  line: number;
+  column: number;
+  variable: string;
+  message: string;
+  severity: 'error' | 'warning';
+  goFile?: string;  // relative path to the .go file with the c.Render() call
+  goLine?: number;  // line number of the c.Render() call
+}
+
+export interface AnalysisResult {
+  renderCalls: RenderCall[];
+  errors: string[];
+  validationErrors?: GoValidationError[];
+}
+
+// ─── Knowledge Graph ──────────────────────────────────────────────────────────
+
+export interface TemplateContext {
+  templatePath: string;         // logical path, e.g. "views/inpatient/treatment-chart.html"
+  absolutePath: string;         // absolute fs path for opening files
+  vars: Map<string, TemplateVar>;
+  renderCalls: RenderCall[];
+  // For partials: tracks which parent variable was passed as context (e.g., "User" from {{ template "partial" .User }})
+  partialSourceVar?: TemplateVar;
+}
+
+export interface KnowledgeGraph {
+  templates: Map<string, TemplateContext>; // keyed by logical templatePath
+  analyzedAt: Date;
+}
+
+// ─── Template AST ─────────────────────────────────────────────────────────────
+
+export interface TemplateNode {
+  kind: 'variable' | 'range' | 'if' | 'with' | 'block' | 'partial' | 'call' | 'define';
+  path: string[];        // e.g. ["Visit", "Doctor", "DisplayName"]
+  rawText: string;
+  line: number;
+  col: number;
+  endLine?: number;
+  endCol?: number;
+  children?: TemplateNode[];
+  partialName?: string;   // for 'partial' kind
+  partialContext?: string; // raw context arg, e.g. "." or ".User"
+  blockName?: string;     // for 'block' and 'define' kind
+}
+
+export interface ValidationError {
+  message: string;
+  line: number;
+  col: number;
+  severity: 'error' | 'warning' | 'info';
+  variable?: string;
+}
+
+// ─── Scope ────────────────────────────────────────────────────────────────────
+
+export interface ScopeFrame {
+  /** "." for range/with implicit dot, or "$varName" for explicit assignments */
+  key: string;
+  typeStr: string;
+  fields?: FieldInfo[];
+  isRange?: boolean;
+  /** For ranges: the source variable being iterated (e.g., "prescriptions" from {{ range .prescriptions }}) */
+  sourceVar?: TemplateVar;
+}
+
+// ─── Definition location ──────────────────────────────────────────────────────
+
+export interface DefinitionLocation {
+  /** Absolute path to the Go file */
+  file: string;
+  /** 0-based line */
+  line: number;
+  /** 0-based column */
+  col: number;
+}
+
+
+################################################################
+# FILE: extension/src/validator.ts
+################################################################
+import * as fs from 'fs';
+import * as path from 'path';
+import * as vscode from 'vscode';
+import { FieldInfo, ScopeFrame, TemplateContext, TemplateNode, TemplateVar, ValidationError } from './types';
+import { TemplateParser, resolvePath, ResolveResult } from './templateParser';
+import { KnowledgeGraphBuilder } from './knowledgeGraph';
+
+export class TemplateValidator {
+  private parser = new TemplateParser();
+  private outputChannel: vscode.OutputChannel;
+  private graphBuilder: KnowledgeGraphBuilder;
+
+  constructor(outputChannel: vscode.OutputChannel, graphBuilder: KnowledgeGraphBuilder) {
+    this.outputChannel = outputChannel;
+    this.graphBuilder = graphBuilder;
+  }
+
+  // ── Public API ─────────────────────────────────────────────────────────────
+
+  async validateDocument(document: vscode.TextDocument, providedCtx?: TemplateContext): Promise<vscode.Diagnostic[]> {
+    const ctx = providedCtx || this.graphBuilder.findContextForFile(document.uri.fsPath);
+
+    if (!ctx) {
+      return [
+        new vscode.Diagnostic(
+          new vscode.Range(0, 0, 0, 0),
+          'No rex.Render() call found for this template. Run "Rex: Rebuild Template Index" if you just added it.',
+          vscode.DiagnosticSeverity.Hint
+        ),
+      ];
+    }
+
+    const content = document.getText();
+    const errors = this.validate(content, ctx, document.uri.fsPath);
+
+    return errors.map((e) => {
+      const line = Math.max(0, e.line - 1);
+      const col = Math.max(0, e.col - 1);
+      const range = new vscode.Range(line, col, line, col + (e.variable?.length ?? 10));
+      const diag = new vscode.Diagnostic(
+        range,
+        e.message,
+        e.severity === 'error'
+          ? vscode.DiagnosticSeverity.Error
+          : e.severity === 'warning'
+            ? vscode.DiagnosticSeverity.Warning
+            : vscode.DiagnosticSeverity.Information
+      );
+      diag.source = 'Rex';
+      return diag;
+    });
+  }
+
+  validate(content: string, ctx: TemplateContext, filePath: string): ValidationError[] {
+    const errors: ValidationError[] = [];
+    const nodes = this.parser.parse(content);
+    this.validateNodes(nodes, ctx.vars, [], errors, ctx, filePath);
+    return errors;
+  }
+
+  // ── Validation ─────────────────────────────────────────────────────────────
+
+  private validateNodes(
+    nodes: TemplateNode[],
+    vars: Map<string, TemplateVar>,
+    scopeStack: ScopeFrame[],
+    errors: ValidationError[],
+    ctx: TemplateContext,
+    filePath: string
+  ) {
+    for (const node of nodes) {
+      this.validateNode(node, vars, scopeStack, errors, ctx, filePath);
+    }
+  }
+
+  private validateNode(
+    node: TemplateNode,
+    vars: Map<string, TemplateVar>,
+    scopeStack: ScopeFrame[],  // never mutated; always copy before pushing
+    errors: ValidationError[],
+    ctx: TemplateContext,
+    filePath: string
+  ) {
+    switch (node.kind) {
+      case 'variable': {
+        if (node.path.length > 0 && node.path[0] !== '.') {
+          const result = resolvePath(node.path, vars, scopeStack);
+          if (!result.found) {
+            errors.push({
+              message: `Template variable ".${node.path.join('.')}" is not defined in the render context`,
+              line: node.line,
+              col: node.col,
+              severity: 'error',
+              variable: node.rawText,
+            });
+          }
+        }
+        // Recurse children (shouldn't exist for variables, but safe)
+        break;
+      }
+
+      case 'range': {
+        // Validate the range expression itself
+        if (node.path.length > 0 && node.path[0] !== '.') {
+          const result = resolvePath(node.path, vars, scopeStack);
+          if (!result.found) {
+            errors.push({
+              message: `Range target ".${node.path.join('.')}" is not defined`,
+              line: node.line,
+              col: node.col,
+              severity: 'error',
+              variable: node.path[0],
+            });
+          } else {
+            // Build child scope from element type
+            const elemScope = this.buildRangeScope(node.path, vars, scopeStack, ctx);
+            const childStack = elemScope ? [...scopeStack, elemScope] : scopeStack;
+            if (node.children) {
+              this.validateNodes(node.children, vars, childStack, errors, ctx, filePath);
+            }
+            return; // children already handled
+          }
+        }
+        break;
+      }
+
+      case 'with': {
+        if (node.path.length > 0 && node.path[0] !== '.') {
+          const result = resolvePath(node.path, vars, scopeStack);
+          if (!result.found) {
+            errors.push({
+              message: `".${node.path.join('.')}" is not defined`,
+              line: node.line,
+              col: node.col,
+              severity: 'warning',
+              variable: node.path[0],
+            });
+          } else if (result.fields) {
+            // Push the resolved type as the new dot
+            const childStack: ScopeFrame[] = [...scopeStack, {
+              key: '.',
+              typeStr: result.typeStr,
+              fields: result.fields,
+            }];
+            if (node.children) {
+              this.validateNodes(node.children, vars, childStack, errors, ctx, filePath);
+            }
+            return;
+          }
+        }
+        break;
+      }
+
+      case 'if': {
+        // if doesn't change scope; just validate condition references
+        if (node.path.length > 0 && node.path[0] !== '.') {
+          const result = resolvePath(node.path, vars, scopeStack);
+          if (!result.found) {
+            errors.push({
+              message: `".${node.path.join('.')}" is not defined`,
+              line: node.line,
+              col: node.col,
+              severity: 'warning',
+              variable: node.path[0],
+            });
+          }
+        }
+        // Children inherit same scope
+        break;
+      }
+
+      case 'partial': {
+        this.validatePartial(node, vars, scopeStack, errors, ctx, filePath);
+        return; // partial handler recurses children itself
+      }
+
+      case 'block':
+      case 'define': {
+        // We do NOT validate the default body of a block or define during initial 
+        // per-file pass. They are meant to be executed and evaluated when explicitly 
+        // called via `template`, potentially with a different scope context!
+        // Returning here prevents `this.validateNodes` from recursing into their children.
+        return;
+      }
+    }
+
+    // Default: recurse children with unchanged scope
+    if (node.children) {
+      this.validateNodes(node.children, vars, scopeStack, errors, ctx, filePath);
+    }
+  }
+
+  private buildRangeScope(
+    path: string[],
+    vars: Map<string, TemplateVar>,
+    scopeStack: ScopeFrame[],
+    ctx: TemplateContext
+  ): ScopeFrame | null {
+    // The range target should be a slice; its element type becomes the new dot
+    const topVar = vars.get(path[0]);
+    if (topVar?.isSlice) {
+      return {
+        key: '.',
+        typeStr: topVar.elemType ?? topVar.type,
+        fields: topVar.fields,
+        isRange: true,
+        sourceVar: topVar,
+      };
+    }
+
+    // Try resolving through scope
+    const result = resolvePath(path, vars, scopeStack);
+    if (result.found && result.isSlice && result.fields) {
+      // Find the source variable from render calls to track definition
+      let sourceVar: TemplateVar | undefined;
+      for (const rc of ctx.renderCalls) {
+        const v = rc.vars.find(v => v.name === path[0]);
+        if (v?.isSlice) {
+          sourceVar = v;
+          break;
+        }
+      }
+      return {
+        key: '.',
+        typeStr: result.typeStr,
+        fields: result.fields,
+        isRange: true,
+        sourceVar,
+      };
+    }
+
+    return null;
+  }
+
+  private validatePartial(
+    node: TemplateNode,
+    vars: Map<string, TemplateVar>,
+    scopeStack: ScopeFrame[],
+    errors: ValidationError[],
+    ctx: TemplateContext,
+    filePath: string
+  ) {
+    if (!node.partialName) return;
+
+    // Named blocks (no file extension) are validated by Go itself
+    if (!isFileBasedPartial(node.partialName)) return;
+
+    const partialCtx = this.graphBuilder.findPartialContext(node.partialName, filePath);
+    if (!partialCtx) {
+      errors.push({
+        message: `Partial template "${node.partialName}" could not be found`,
+        line: node.line,
+        col: node.col,
+        severity: 'warning',
+        variable: node.partialName,
+      });
+      return;
+    }
+
+    if (!fs.existsSync(partialCtx.absolutePath)) return;
+
+    // Resolve the vars the partial receives based on its context arg
+    const partialVars = this.resolvePartialVars(
+      node.partialContext ?? '.',
+      vars,
+      scopeStack,
+      ctx
+    );
+
+    try {
+      let content = '';
+      const openDoc = vscode.workspace.textDocuments.find(d => d.uri.fsPath === partialCtx.absolutePath);
+      if (openDoc) {
+        content = openDoc.getText();
+      } else {
+        content = fs.readFileSync(partialCtx.absolutePath, 'utf8');
+      }
+      const partialErrors = this.validate(content, { ...partialCtx, vars: partialVars }, partialCtx.absolutePath);
+      for (const e of partialErrors) {
+        errors.push({
+          ...e,
+          message: `[in partial "${node.partialName}"] ${e.message}`,
+          line: node.line,  // Report at the call site line in parent
+          col: node.col,
+        });
+      }
+    } catch {
+      // ignore read errors
+    }
+  }
+
+  /**
+   * Given the context arg passed to a partial (e.g. ".", ".User", ".User.Address"),
+   * build the vars map that the partial will see as its root scope.
+   */
+  private resolvePartialVars(
+    contextArg: string,
+    vars: Map<string, TemplateVar>,
+    scopeStack: ScopeFrame[],
+    ctx: TemplateContext
+  ): Map<string, TemplateVar> {
+    // "." → pass through all current vars + current dot scope
+    if (contextArg === '.') {
+      // If we're in a scoped block, expose the dot frame's fields as top-level vars
+      const dotFrame = scopeStack.slice().reverse().find(f => f.key === '.');
+      if (dotFrame?.fields) {
+        const result = new Map<string, TemplateVar>();
+        for (const f of dotFrame.fields) {
+          result.set(f.name, {
+            name: f.name,
+            type: f.type,
+            fields: f.fields,
+            isSlice: f.isSlice,
+          });
+        }
+        return result;
+      }
+      // Root scope: pass through all vars
+      return new Map(vars);
+    }
+
+    // ".SomePath" → resolve that path and expose its fields
+    const parser = new TemplateParser();
+    const path = parser.parseDotPath(contextArg);
+    const result = resolvePath(path, vars, scopeStack);
+
+    if (!result.found || !result.fields) {
+      return new Map();
+    }
+
+    const partialVars = new Map<string, TemplateVar>();
+    for (const f of result.fields) {
+      partialVars.set(f.name, {
+        name: f.name,
+        type: f.type,
+        fields: f.fields,
+        isSlice: f.isSlice,
+      });
+    }
+    return partialVars;
+  }
+
+  // ── Hover ──────────────────────────────────────────────────────────────────
+
+  async getHoverInfo(
+    document: vscode.TextDocument,
+    position: vscode.Position,
+    ctx: TemplateContext
+  ): Promise<vscode.Hover | null> {
+    const content = document.getText();
+    const nodes = this.parser.parse(content);
+
+    // Check if hovering over a block/define/partial name
+    const blockHover = this.findTemplateNameHover(nodes, position);
+    if (blockHover) {
+      const md = new vscode.MarkdownString();
+      md.appendMarkdown(`**Template Block:** \`${blockHover}\`\n`);
+      return new vscode.Hover(md);
+    }
+
+    const hit = this.findNodeAtPosition(nodes, position, ctx.vars, []);
+    if (!hit) return null;
+
+    const { node, stack } = hit;
+    let result = resolvePath(node.path, ctx.vars, stack);
+    let resolvedStack = stack;
+    let varInfo = this.findVariableInfo(node.path, ctx.vars, stack);
+
+    if (!result.found) {
+      // If we couldn't resolve it, check if we are inside a define or block and try to infer 
+      // the context from a template call in the same file!
+      const fallback = this.tryResolveFromTemplateCalls(node, nodes, position, ctx);
+      if (fallback) {
+        result = fallback.result;
+        resolvedStack = fallback.stack;
+      } else {
+        return null;
+      }
+    }
+
+    const varName = node.path[0] === '.' ? '.' : '.' + node.path.join('.');
+    const md = new vscode.MarkdownString();
+    md.isTrusted = true;
+
+    // Build hover content similar to gopls
+    md.appendCodeblock(`${varName}: ${result.typeStr}`, 'go');
+
+    // Add documentation if available
+    if (varInfo?.doc) {
+      md.appendMarkdown('\n\n---\n\n');
+      md.appendMarkdown(varInfo.doc);
+    }
+
+    // Add field information with documentation
+    if (result.fields && result.fields.length > 0) {
+      md.appendMarkdown('\n\n---\n\n');
+      md.appendMarkdown('**Fields:**\n\n');
+
+      for (const f of result.fields.slice(0, 30)) {
+        const typeLabel = f.isSlice ? `[]${f.type}` : f.type;
+
+        // Field signature
+        md.appendMarkdown(`**${f.name}** \`${typeLabel}\`\n`);
+
+        // Field documentation if available
+        if (f.doc) {
+          md.appendMarkdown(`\n${f.doc}\n`);
+        }
+
+        md.appendMarkdown('\n');
+      }
+    }
+
+    return new vscode.Hover(md);
+  }
+
+  /**
+   * Find variable information including documentation for a path
+   */
+  private findVariableInfo(
+    path: string[],
+    vars: Map<string, TemplateVar>,
+    scopeStack: ScopeFrame[]
+  ): { typeStr: string; doc?: string } | null {
+    if (path.length === 0) return null;
+
+    const topVarName = path[0] === '.' ? null : path[0];
+    if (!topVarName) return null;
+
+    // Check top-level vars
+    const topVar = vars.get(topVarName);
+    if (!topVar) {
+      // Check scope stack
+      const dotFrame = scopeStack.slice().reverse().find(f => f.key === '.');
+      if (dotFrame?.fields) {
+        const field = dotFrame.fields.find(f => f.name === topVarName);
+        if (field) {
+          return { typeStr: field.type, doc: field.doc };
+        }
+      }
+      return null;
+    }
+
+    // If just the top-level var
+    if (path.length === 1) {
+      return { typeStr: topVar.type, doc: topVar.doc };
+    }
+
+    // Navigate through fields
+    let fields = topVar.fields ?? [];
+    for (let i = 1; i < path.length; i++) {
+      const field = fields.find(f => f.name === path[i]);
+      if (!field) return null;
+
+      if (i === path.length - 1) {
+        return { typeStr: field.type, doc: field.doc };
+      }
+
+      fields = field.fields ?? [];
+    }
+
+    return null;
+  }
+
+  // ── Definition ─────────────────────────────────────────────────────────────
+
+  /**
+   * Returns the definition location for the symbol at the given position.
+   * Handles:
+   * - Template variables → jumps to c.Render() call in Go code
+   * - Partial template names → jumps to the template file
+   */
+  async getDefinitionLocation(
+    document: vscode.TextDocument,
+    position: vscode.Position,
+    ctx: TemplateContext
+  ): Promise<vscode.Location | null> {
+    const content = document.getText();
+    const nodes = this.parser.parse(content);
+
+    // First, check if cursor is on a partial/template name
+    const partialLocation = await this.findPartialDefinitionAtPosition(
+      nodes,
+      position,
+      ctx
+    );
+    if (partialLocation) {
+      return partialLocation;
+    }
+
+    // Otherwise, handle variable definitions
+    const hit = this.findNodeAtPosition(nodes, position, ctx.vars, []);
+    if (!hit) return null;
+
+    const { node, stack } = hit;
+    const topVarName = node.path[0] === '.' ? null : node.path[0];
+    if (!topVarName) return null;
+
+    // Check for explicitly declared variables first (e.g., $name := .DrugName)
+    if (topVarName.startsWith('$')) {
+      // Search in all nodes but also check if it's accessing a range element
+      const declaredVar = this.findDeclaredVariableDefinition(node, nodes, position, ctx);
+      if (declaredVar) {
+        return declaredVar;
+      }
+      // For $ variables inside ranges, they might be assigned from range elements
+      // Try to resolve through the scope stack
+      const rangeVarResult = this.findRangeAssignedVariable(node, stack, ctx);
+      if (rangeVarResult) {
+        return rangeVarResult;
+      }
+    }
+
+    // For partials: check if the variable is a field of the partial source variable
+    // e.g., partial called with {{ template "partial" .User }}, and we're clicking on .Name
+    // or clicking on .Patient.Name - need to navigate through the path
+    if (ctx.partialSourceVar) {
+      // Navigate through the path to find the final field
+      let currentFields = ctx.partialSourceVar.fields;
+      let currentVar: TemplateVar | FieldInfo | undefined = ctx.partialSourceVar;
+
+      for (const pathPart of node.path) {
+        if (pathPart === '.') continue;
+
+        // Find the field matching this path component
+        const field = currentFields?.find(f => f.name === pathPart);
+        if (!field) {
+          currentVar = undefined;
+          break;
+        }
+
+        currentVar = field;
+        currentFields = field.fields;
+      }
+
+      // If we found the final field/variable, go to its definition
+      if (currentVar) {
+        const target = currentVar as FieldInfo;
+        if (target.defFile && target.defLine) {
+          let absGoFile: string | null = target.defFile;
+          if (!path.isAbsolute(absGoFile)) {
+            absGoFile = this.graphBuilder.resolveGoFilePath(absGoFile);
+          } else if (!fs.existsSync(absGoFile)) {
+            absGoFile = null;
+          }
+          if (absGoFile) {
+            return new vscode.Location(
+              vscode.Uri.file(absGoFile),
+              new vscode.Position(Math.max(0, target.defLine - 1), (target.defCol ?? 1) - 1)
+            );
+          }
+        }
+      }
+
+      // Fallback: use the source variable's location
+      if (ctx.partialSourceVar.defFile && ctx.partialSourceVar.defLine) {
+        let absGoFile: string | null = ctx.partialSourceVar.defFile;
+        if (!path.isAbsolute(absGoFile)) {
+          absGoFile = this.graphBuilder.resolveGoFilePath(absGoFile);
+        } else if (!fs.existsSync(absGoFile)) {
+          absGoFile = null;
+        }
+        if (absGoFile) {
+          return new vscode.Location(
+            vscode.Uri.file(absGoFile),
+            new vscode.Position(Math.max(0, ctx.partialSourceVar.defLine - 1), (ctx.partialSourceVar.defCol ?? 1) - 1)
+          );
+        }
+      }
+    }
+
+    // Find the variable definition and go to its source location
+    for (const rc of ctx.renderCalls) {
+      const passedVar = rc.vars.find(v => v.name === topVarName);
+      if (passedVar) {
+        // Use the definition location if available
+        if (passedVar.defFile && passedVar.defLine) {
+          // defFile may be absolute or relative - handle both
+          let absGoFile: string | null = passedVar.defFile;
+          if (!path.isAbsolute(absGoFile)) {
+            absGoFile = this.graphBuilder.resolveGoFilePath(absGoFile);
+          } else if (!fs.existsSync(absGoFile)) {
+            absGoFile = null;
+          }
+          if (absGoFile) {
+            return new vscode.Location(
+              vscode.Uri.file(absGoFile),
+              new vscode.Position(Math.max(0, passedVar.defLine - 1), (passedVar.defCol ?? 1) - 1)
+            );
+          }
+        }
+        // Fallback to render call location if no definition location available
+        if (rc.file) {
+          const absGoFile = this.graphBuilder.resolveGoFilePath(rc.file);
+          if (absGoFile) {
+            return new vscode.Location(
+              vscode.Uri.file(absGoFile),
+              new vscode.Position(Math.max(0, rc.line - 1), 0)
+            );
+          }
+        }
+      }
+    }
+
+    // Handle variables inside range blocks (where path starts from element type)
+    // e.g., {{ range .prescriptions }} ... {{ .DrugName }}
+    const rangeScopeResult = this.findRangeVariableDefinition(node, stack, ctx);
+    if (rangeScopeResult) {
+      return rangeScopeResult;
+    }
+
+    return null;
+  }
+
+  /**
+   * Find definition for a variable declared inside the template (e.g., $name := .DrugName)
+   */
+  private findDeclaredVariableDefinition(
+    targetNode: TemplateNode,
+    nodes: TemplateNode[],
+    position: vscode.Position,
+    ctx: TemplateContext
+  ): vscode.Location | null {
+    // Search for the assignment that defines this variable
+    const varName = targetNode.path[0];
+    if (!varName?.startsWith('$')) return null;
+
+    for (const node of nodes) {
+      const result = this.findVariableAssignment(node, varName, position, ctx);
+      if (result) return result;
+    }
+
+    return null;
+  }
+
+  /**
+   * Recursively search for a variable assignment (e.g., $name := .DrugName)
+   */
+  private findVariableAssignment(
+    node: TemplateNode,
+    varName: string,
+    position: vscode.Position,
+    ctx: TemplateContext
+  ): vscode.Location | null {
+    // Check if this node is a variable assignment
+    if (node.kind === 'variable' && node.rawText.includes(':=')) {
+      const assignMatch = node.rawText.match(/\{\{\s*\$([\w]+)\s*:=\s*(.+?)\s*\}\}/);
+      if (assignMatch && '$' + assignMatch[1] === varName) {
+        // This is the assignment - go to the right-hand side definition
+        const rhs = assignMatch[2].trim();
+        // Create a temporary node to resolve the RHS
+        const rhsNode: TemplateNode = {
+          kind: 'variable',
+          path: this.parser.parseDotPath(rhs),
+          rawText: rhs,
+          line: node.line,
+          col: node.col,
+        };
+        // Try to find definition for the RHS
+        return this.findVariableDefinition(rhsNode, ctx);
+      }
+    }
+
+    // Recurse into children
+    if (node.children) {
+      for (const child of node.children) {
+        const result = this.findVariableAssignment(child, varName, position, ctx);
+        if (result) return result;
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Find definition for a variable, checking render calls
+   */
+  private findVariableDefinition(
+    node: TemplateNode,
+    ctx: TemplateContext
+  ): vscode.Location | null {
+    const topVarName = node.path[0] === '.' ? null : node.path[0];
+    if (!topVarName) return null;
+
+    for (const rc of ctx.renderCalls) {
+      const passedVar = rc.vars.find(v => v.name === topVarName);
+      if (passedVar?.defFile && passedVar.defLine) {
+        let absGoFile: string | null = passedVar.defFile;
+        if (!path.isAbsolute(absGoFile)) {
+          absGoFile = this.graphBuilder.resolveGoFilePath(absGoFile);
+        } else if (!fs.existsSync(absGoFile)) {
+          absGoFile = null;
+        }
+        if (absGoFile) {
+          return new vscode.Location(
+            vscode.Uri.file(absGoFile),
+            new vscode.Position(Math.max(0, passedVar.defLine - 1), (passedVar.defCol ?? 1) - 1)
+          );
+        }
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Find definition for a variable assigned from a range element
+   * e.g., {{ $i, $v := range .Items }} ... {{ $v.Name }}
+   */
+  private findRangeAssignedVariable(
+    node: TemplateNode,
+    scopeStack: ScopeFrame[],
+    ctx: TemplateContext
+  ): vscode.Location | null {
+    const varName = node.path[0];
+    if (!varName?.startsWith('$')) return null;
+
+    // Look through the scope stack for range contexts
+    // Check if this $variable is an iteration variable from a range
+    for (const frame of scopeStack) {
+      if (frame.isRange && frame.sourceVar) {
+        // This might be an iteration variable
+        // Go to the slice/array definition
+        if (frame.sourceVar.defFile && frame.sourceVar.defLine) {
+          let absGoFile: string | null = frame.sourceVar.defFile;
+          if (!path.isAbsolute(absGoFile)) {
+            absGoFile = this.graphBuilder.resolveGoFilePath(absGoFile);
+          } else if (!fs.existsSync(absGoFile)) {
+            absGoFile = null;
+          }
+          if (absGoFile) {
+            return new vscode.Location(
+              vscode.Uri.file(absGoFile),
+              new vscode.Position(Math.max(0, frame.sourceVar.defLine - 1), (frame.sourceVar.defCol ?? 1) - 1)
+            );
+          }
+        }
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Find definition for variables accessed inside range blocks
+   * e.g., {{ range .prescriptions }} ... {{ .DrugName }}
+   * When clicking on a field inside a range, goes to the specific struct field definition
+   */
+  private findRangeVariableDefinition(
+    node: TemplateNode,
+    scopeStack: ScopeFrame[],
+    ctx: TemplateContext
+  ): vscode.Location | null {
+    // If path doesn't start with a top-level var, it might be accessing range element
+    if (node.path.length === 0 || node.path[0] === '.') return null;
+
+    const firstFieldName = node.path[0];
+
+    // Look through scope stack for range contexts
+    for (let i = scopeStack.length - 1; i >= 0; i--) {
+      const frame = scopeStack[i];
+      if (frame.isRange && frame.fields) {
+        // Check if the first path element is a field of this range element
+        const field = frame.fields.find(f => f.name === firstFieldName);
+        if (field) {
+          // Try to go to the specific field definition if available
+          if (field.defFile && field.defLine) {
+            let absGoFile: string | null = field.defFile;
+            if (!path.isAbsolute(absGoFile)) {
+              absGoFile = this.graphBuilder.resolveGoFilePath(absGoFile);
+            } else if (!fs.existsSync(absGoFile)) {
+              absGoFile = null;
+            }
+            if (absGoFile) {
+              return new vscode.Location(
+                vscode.Uri.file(absGoFile),
+                new vscode.Position(Math.max(0, field.defLine - 1), (field.defCol ?? 1) - 1)
+              );
+            }
+          }
+
+          // Fallback: go to the slice/array definition
+          if (frame.sourceVar?.defFile && frame.sourceVar.defLine) {
+            let absGoFile: string | null = frame.sourceVar.defFile;
+            if (!path.isAbsolute(absGoFile)) {
+              absGoFile = this.graphBuilder.resolveGoFilePath(absGoFile);
+            } else if (!fs.existsSync(absGoFile)) {
+              absGoFile = null;
+            }
+            if (absGoFile) {
+              return new vscode.Location(
+                vscode.Uri.file(absGoFile),
+                new vscode.Position(Math.max(0, frame.sourceVar.defLine - 1), (frame.sourceVar.defCol ?? 1) - 1)
+              );
+            }
+          }
+        }
+      }
+    }
+
+    return null;
+  }
+
+  private findTemplateNameHover(nodes: TemplateNode[], position: vscode.Position): string | null {
+    for (const node of nodes) {
+      if ((node.kind === 'partial' && node.partialName) || 
+          (node.kind === 'block' && node.blockName) || 
+          (node.kind === 'define' && node.blockName)) {
+        
+        const name = node.partialName || node.blockName!;
+        const startLine = node.line - 1;
+        const startCol = node.col - 1;
+
+        const keywordMatch = node.rawText.match(/\{\{\s*(template|block|define)\s+/);
+        if (keywordMatch) {
+          const nameMatch = node.rawText.match(new RegExp(`\\{\\{\\s*(template|block|define)\\s+"([^"]+)"`));
+          if (nameMatch && nameMatch[2] === name) {
+            const nameStartOffset = node.rawText.indexOf('"' + name + '"') + 1;
+            const nameStartCol = startCol + nameStartOffset;
+            const nameEndCol = nameStartCol + name.length;
+
+            if (
+              position.line === startLine &&
+              position.character >= nameStartCol &&
+              position.character <= nameEndCol
+            ) {
+              return name;
+            }
+          }
+        }
+      }
+
+      if (node.children) {
+        const found = this.findTemplateNameHover(node.children, position);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Check if cursor is on a partial/template/block name in {{ template "name" . }}
+   * and return the location of the template file or define block.
+   */
+  private async findPartialDefinitionAtPosition(
+    nodes: TemplateNode[],
+    position: vscode.Position,
+    ctx: TemplateContext
+  ): Promise<vscode.Location | null> {
+    for (const node of nodes) {
+      // Check if this is a partial, block, or define node
+      if ((node.kind === 'partial' && node.partialName) || 
+          (node.kind === 'block' && node.blockName) || 
+          (node.kind === 'define' && node.blockName)) {
+        
+        const name = node.partialName || node.blockName!;
+        const startLine = node.line - 1;
+        const startCol = node.col - 1;
+
+        const keywordMatch = node.rawText.match(/\{\{\s*(template|block|define)\s+/);
+        if (keywordMatch) {
+          const nameMatch = node.rawText.match(new RegExp(`\\{\\{\\s*(template|block|define)\\s+"([^"]+)"`));
+          if (nameMatch && nameMatch[2] === name) {
+            const nameStartOffset = node.rawText.indexOf('"' + name + '"') + 1;
+            const nameStartCol = startCol + nameStartOffset;
+            const nameEndCol = nameStartCol + name.length;
+
+            // Check if cursor is on the template name
+            if (
+              position.line === startLine &&
+              position.character >= nameStartCol &&
+              position.character <= nameEndCol
+            ) {
+              if (isFileBasedPartial(name)) {
+                const templatePath = this.graphBuilder.resolveTemplatePath(name);
+                if (templatePath) {
+                  return new vscode.Location(
+                    vscode.Uri.file(templatePath),
+                    new vscode.Position(0, 0)
+                  );
+                }
+              } else {
+                return await this.findNamedBlockDefinition(name, ctx);
+              }
+            }
+          }
+        }
+      }
+
+      // Recurse into children
+      if (node.children) {
+        const found = await this.findPartialDefinitionAtPosition(
+          node.children,
+          position,
+          ctx
+        );
+        if (found) return found;
+      }
+    }
+
+    return null;
+  }
+
+  private async findNamedBlockDefinition(name: string, ctx: TemplateContext): Promise<vscode.Location | null> {
+    const graph = this.graphBuilder.getGraph();
+    if (!graph) return null;
+
+    const defineRegex = new RegExp(`\\{\\{\\s*(?:define|block)\\s+"${name}"`);
+
+    // Prioritize current file
+    const filesToSearch = [ctx.absolutePath];
+    for (const [_, tctx] of graph.templates) {
+      if (tctx.absolutePath !== ctx.absolutePath) {
+        filesToSearch.push(tctx.absolutePath);
+      }
+    }
+
+    for (const filePath of filesToSearch) {
+      try {
+        let content = '';
+        const openDoc = vscode.workspace.textDocuments.find(d => d.uri.fsPath === filePath);
+        if (openDoc) {
+          content = openDoc.getText();
+        } else {
+          if (!fs.existsSync(filePath)) continue;
+          content = await fs.promises.readFile(filePath, 'utf-8');
+        }
+        
+        if (!defineRegex.test(content)) continue;
+
+        const nodes = this.parser.parse(content);
+        const defNode = this.findDefineNodeInAST(nodes, name);
+        if (defNode) {
+          return new vscode.Location(
+            vscode.Uri.file(filePath),
+            new vscode.Position(defNode.line - 1, defNode.col - 1)
+          );
+        }
+      } catch (err) {
+        // ignore
+      }
+    }
+    return null;
+  }
+
+  private findDefineNodeInAST(nodes: TemplateNode[], name: string): TemplateNode | null {
+    for (const node of nodes) {
+      if ((node.kind === 'define' || node.kind === 'block') && node.blockName === name) {
+        return node;
+      }
+      if (node.children) {
+        const found = this.findDefineNodeInAST(node.children, name);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
+  // ── Block/Define Context Inference ──────────────────────────────────────────
+
+  private findEnclosingBlockOrDefine(nodes: TemplateNode[], position: vscode.Position): TemplateNode | null {
+    for (const node of nodes) {
+      if (node.endLine !== undefined) {
+        const startLine = node.line - 1;
+        const startCol = node.col - 1;
+        const endLine = node.endLine - 1;
+
+        const afterStart = position.line > startLine ||
+          (position.line === startLine && position.character >= startCol);
+        const beforeEnd = position.line < endLine ||
+          (position.line === endLine && position.character <= (node.endCol ?? 0) - 1);
+
+        if (afterStart && beforeEnd) {
+          if (node.kind === 'block' || node.kind === 'define') {
+            const deeper = this.findEnclosingBlockOrDefine(node.children ?? [], position);
+            return deeper || node;
+          } else if (node.children) {
+            const found = this.findEnclosingBlockOrDefine(node.children, position);
+            if (found) return found;
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  private findTemplateCallSite(nodes: TemplateNode[], partialName: string): TemplateNode | null {
+    for (const node of nodes) {
+      if (node.kind === 'partial' && node.partialName === partialName) {
+        return node;
+      }
+      if (node.children) {
+        const found = this.findTemplateCallSite(node.children, partialName);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
+  private tryResolveFromTemplateCalls(
+    varNode: TemplateNode,
+    allNodes: TemplateNode[],
+    position: vscode.Position,
+    ctx: TemplateContext
+  ): { result: ResolveResult; stack: ScopeFrame[]; varInfo?: FieldInfo | TemplateVar } | null {
+    const enclosingBlock = this.findEnclosingBlockOrDefine(allNodes, position);
+    if (!enclosingBlock || !enclosingBlock.blockName) return null;
+
+    const callSite = this.findTemplateCallSite(allNodes, enclosingBlock.blockName);
+    if (!callSite) return null;
+
+    // Mock position to be directly on the template call node
+    const callPos = new vscode.Position(callSite.line - 1, callSite.col);
+    const callStackHit = this.findNodeAtPosition(allNodes, callPos, ctx.vars, []);
+    if (!callStackHit) return null;
+
+    const callResult = resolvePath(callSite.path, ctx.vars, callStackHit.stack);
+    if (!callResult.found) return null;
+
+    // Use the call context to evaluate the hovered variable!
+    const syntheticFrame: ScopeFrame = {
+      key: '.',
+      typeStr: callResult.typeStr,
+      fields: callResult.fields,
+    };
+
+    const syntheticStack = [...callStackHit.stack, syntheticFrame];
+    const result = resolvePath(varNode.path, ctx.vars, syntheticStack);
+
+    if (result.found) {
+      const varInfo = this.findVariableInfo(varNode.path, ctx.vars, syntheticStack);
+      return { result, stack: syntheticStack };
+    }
+
+    return null;
+  }
+
+  // ── Node search ────────────────────────────────────────────────────────────
+
+  private findNodeAtPosition(
+    nodes: TemplateNode[],
+    position: vscode.Position,
+    vars: Map<string, TemplateVar>,
+    scopeStack: ScopeFrame[]
+  ): { node: TemplateNode; stack: ScopeFrame[] } | null {
+    for (const node of nodes) {
+      const startLine = node.line - 1;
+      const startCol = node.col - 1;
+
+      // Variable node — check if cursor is over it
+      if (node.kind === 'variable') {
+        const endCol = startCol + node.rawText.length;
+        if (
+          position.line === startLine &&
+          position.character >= startCol &&
+          position.character <= endCol
+        ) {
+          return { node, stack: scopeStack };
+        }
+        continue;
+      }
+
+      // Block node — check if cursor is inside
+      if (node.endLine !== undefined) {
+        const endLine = node.endLine - 1;
+
+        const afterStart = position.line > startLine ||
+          (position.line === startLine && position.character >= startCol);
+        const beforeEnd = position.line < endLine ||
+          (position.line === endLine && position.character <= (node.endCol ?? 0) - 1);
+
+        if (!afterStart || !beforeEnd) continue;
+
+        // Cursor on opening tag → hover the condition variable
+        const openEndCol = startCol + node.rawText.length;
+        if (position.line === startLine && position.character <= openEndCol) {
+          return { node, stack: scopeStack };
+        }
+
+        // Inside block body → push scope and recurse
+        let childStack = scopeStack;
+
+        if ((node.kind === 'range' || node.kind === 'with') && node.path.length > 0 && node.path[0] !== '.') {
+          const result = resolvePath(node.path, vars, scopeStack);
+          if (result.found && result.fields) {
+            // Find the source variable for ranges (to enable go-to-definition)
+            let sourceVar: TemplateVar | undefined;
+            if (node.kind === 'range') {
+              // Try to find the source variable from top-level vars or scope
+              sourceVar = vars.get(node.path[0]);
+              if (!sourceVar && scopeStack.length > 0) {
+                // Check scope stack for the variable
+                const dotFrame = scopeStack.slice().reverse().find(f => f.key === '.');
+                if (dotFrame?.fields) {
+                  const field = dotFrame.fields.find(f => f.name === node.path[0]);
+                  if (field) {
+                    // Create a synthetic TemplateVar from field info
+                    sourceVar = {
+                      name: node.path[0],
+                      type: field.type,
+                      fields: field.fields,
+                      isSlice: field.isSlice,
+                    };
+                  }
+                }
+              }
+            }
+            const frame: ScopeFrame = {
+              key: '.',
+              typeStr: result.typeStr,
+              fields: result.fields,
+              isRange: node.kind === 'range',
+              sourceVar,
+            };
+            childStack = [...scopeStack, frame];
+          }
+        }
+
+        if (node.children) {
+          const found = this.findNodeAtPosition(node.children, position, vars, childStack);
+          if (found) return found;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Get definition location for a template path string in Go code.
+   * Used when clicking on c.Render("template.html", data).
+   */
+  getTemplateDefinitionFromGo(
+    document: vscode.TextDocument,
+    position: vscode.Position
+  ): vscode.Location | null {
+    const line = document.lineAt(position.line).text;
+
+    // Look for c.Render("template-path", ...) pattern
+    // Match the template string literal at cursor position
+    const renderRegex = /\.Render\s*\(\s*"([^"]+)"/g;
+    let match: RegExpExecArray | null;
+
+    while ((match = renderRegex.exec(line)) !== null) {
+      const templatePath = match[1];
+      const matchStart = match.index + '.Render("'.length;
+      const matchEnd = matchStart + templatePath.length;
+
+      // Check if cursor is within the template path string
+      if (position.character >= matchStart && position.character <= matchEnd) {
+        const absPath = this.graphBuilder.resolveTemplatePath(templatePath);
+        if (absPath) {
+          return new vscode.Location(
+            vscode.Uri.file(absPath),
+            new vscode.Position(0, 0)
+          );
+        }
+      }
+    }
+
+    return null;
+  }
+
+  // ── Completions ────────────────────────────────────────────────────────────
+
+  getCompletions(
+    document: vscode.TextDocument,
+    position: vscode.Position,
+    ctx: TemplateContext
+  ): vscode.CompletionItem[] {
+    const line = document.lineAt(position.line).text.slice(0, position.character);
+
+    // Match dot expression inside a template action: {{ .Foo.Bar| }}
+    const dotMatch = line.match(/\{\{.*?\.([\w.]*)$/);
+    if (!dotMatch) return [];
+
+    const partial = dotMatch[1];
+    const parts = partial.split('.');
+
+    // Single segment → suggest top-level vars
+    if (parts.length <= 1) {
+      const prefix = parts[0] ?? '';
+      return [...ctx.vars.values()]
+        .filter(v => v.name.toLowerCase().startsWith(prefix.toLowerCase()))
+        .map(v => {
+          const item = new vscode.CompletionItem(v.name, vscode.CompletionItemKind.Variable);
+          item.detail = v.type;
+          item.documentation = new vscode.MarkdownString(`**Type:** \`${v.type}\``);
+          return item;
+        });
+    }
+
+    // Multi-segment → resolve parent path and suggest its fields
+    const parentPath = parts.slice(0, -1);
+    const prefix = parts[parts.length - 1];
+    const topVar = ctx.vars.get(parentPath[0]);
+    if (!topVar?.fields) return [];
+
+    let fields = topVar.fields;
+    for (let i = 1; i < parentPath.length; i++) {
+      const field = fields.find(f => f.name === parentPath[i]);
+      if (!field) return [];
+      fields = field.fields ?? [];
+    }
+
+    return fields
+      .filter(f => f.name.toLowerCase().startsWith(prefix.toLowerCase()))
+      .map(f => {
+        const kind = f.type === 'method'
+          ? vscode.CompletionItemKind.Method
+          : vscode.CompletionItemKind.Field;
+        const item = new vscode.CompletionItem(f.name, kind);
+        item.detail = f.isSlice ? `[]${f.type}` : f.type;
+        return item;
+      });
+  }
+}
+
+/**
+ * Returns true if the template name looks like a file path
+ * (has a file extension or path separator) rather than a named block.
+ */
+function isFileBasedPartial(name: string): boolean {
+  if (name.includes('/') || name.includes('\\')) return true;
+  const ext = name.slice(name.lastIndexOf('.')).toLowerCase();
+  return ['.html', '.tmpl', '.gohtml', '.tpl', '.htm'].includes(ext);
+}
+
+
+################################################################
+# FILE: extension/tsconfig.json
+################################################################
+{
+  "compilerOptions": {
+    "module": "commonjs",
+    "target": "ES2020",
+    "outDir": "./out",
+    "lib": ["ES2020"],
+    "sourceMap": true,
+    "rootDir": "./src",
+    "strict": true,
+    "esModuleInterop": true
+  },
+  "exclude": ["node_modules", ".vscode-test"]
+}
+
+
+################################################################
+# FILE: .gitignore
+################################################################
+# Binaries
+rex-analyzer
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Node
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# VSCode Extension Build
+extension/out/
+extension/dist/
+*.vsix
+.vscode-test/
+
+# Editor
+.vscode/
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/settings.json
+!.vscode/tasks.json
+.idea/
+*.swp
+.DS_Store
+
+# Go
+analyzer/analyzer
+analyzer/rex-analyzer
+.opencode
+prompt*.txt
+
+################################################################
+# FILE: .opencode/.gitignore
+################################################################
+node_modules
+package.json
+bun.lock
+.gitignore
+
+################################################################
+# FILE: .opencode/package.json
+################################################################
+{
+  "dependencies": {
+    "@opencode-ai/plugin": "1.1.51"
+  }
+}
+
+################################################################
+# FILE: .opencode/plans/named_templates_plan.md
+################################################################
+# Plan to Support Named Templates (`define` and `block`)
+
+## Findings
+1. Currently, `validateTemplateContent` evaluates variables inside `{{ define "name" }}` blocks as if they belong to the current lexical scope (i.e. top level or inside `range`/`with`). This is incorrect because `define` blocks are not executed in-place; they are merely declared and evaluated later when `{{ template "name" ... }}` is called.
+2. This creates a severe bug where `{{ end }}` closing a `define` accidentally pops the scope from the stack!
+3. To validate `{{ template "name" .Data }}` correctly, we need to locate the definition of `"name"`, which might be in any parsed template file in `templateRoot`.
+4. `{{ block "name" .Data }}` defines a template AND executes it in-place using `.Data` as the scope. It needs to be validated like a `with` block locally, but also stored in the registry so it can be invoked by other templates.
+
+## The Proposed Plan
+
+### 1. Pre-parse all template files
+- Create a `NamedTemplate` struct containing `Name`, `Content` (the actual string body of the block), `FilePath`, and `LineOffset`.
+- Add a function `parseAllNamedTemplates(baseDir, templateRoot string)` that walks `templateRoot`, reads all valid template files, and extracts `define` and `block` bodies using regex and index tracking (already tested in my scratchpad). It will return a `map[string]NamedTemplate` registry.
+
+### 2. Pass Registry and Line Offsets to Validator
+- Update `validateTemplateContent` and `validateTemplateFile` signatures to accept `namedTemplates map[string]NamedTemplate` and `lineOffset int`. The default `lineOffset` will be 1 for root files. This ensures error diagnostics correctly map back to the original file lines.
+
+### 3. Handle `define` and `block` during parsing
+- Inside `validateTemplateContent`, if we encounter `{{ define ... }}`, we will track a `skipDepth` counter to ignore all nested actions and variables until the matching `{{ end }}`. We won't validate variables inside `define` because they shouldn't be executed here.
+- If we encounter `{{ block "name" .Data }}`, we will extract and validate `.Data` against the *current* scope, and then push a new scope for `.Data` (exactly like `with .Data`). We will NOT skip the inside of the block since it executes immediately in-place. Its matching `{{ end }}` will safely pop the scope.
+
+### 4. Resolve `template` calls
+- Update the `template` action handler in `validateTemplateContent`.
+- After checking if it's a file-based partial, if it is *not*, we check if it exists in the `namedTemplates` registry.
+- If found in the registry, we recursively call `validateTemplateContent(registryTemplate.Content, ...)` using the context arguments passed (e.g., `.Data`). We pass the registryTemplate's `LineOffset` and `FilePath` so that any variable errors found inside the block are correctly reported on the right line of the right file!
+
+### 5. Fix tests
+- Add comprehensive tests for `define`, `block`, nested variables, and scope popping bugs to `statements_test.go` and `validator_test.go`.
+
+## Clarification required
+1. Go templates usually parse *all* files matching a glob, but a project might have multiple separate template sets. Since `rex` analyzer currently assumes all templates in `templateRoot` are part of the same execution context, I will parse **all** `.html`/`.tmpl` files under `baseDir/templateRoot` into one global `map[string]NamedTemplate`. Does this approach align with how `rex` handles template registries?
+
+
+################################################################
+# FILE: README.md
+################################################################
+# Rex Template Validator
+
+A powerful VSCode extension and CLI tool for validating Go templates in [Rex](https://github.com/abiiranathan/rex) applications. It ensures your templates are type-safe by analyzing your Go handlers and validating variable usage within your HTML templates.
+
+## Features
+
+-   **Type-Safe Validation**: Detects missing variables, undefined fields, and type mismatches in your templates.
+-   **Nested Scope Support**: Correctly handles `{{ range }}`, `{{ with }}`, and `{{ if }}` scoping rules, including nested slices and structs.
+-   **Partial Template Validation**: Validates `{{ template "..." }}` calls, checking for file existence and context passing.
+-   **Intelligent Hover**: Hover over variables in your HTML to see their Go type and available fields.
+-   **Knowledge Graph**: Visualize the relationships between your Go handlers, templates, and variables.
+
+## Installation
+
+### VSCode Extension
+
+1.  Clone this repository.
+2.  Open the `extension` folder in VSCode.
+3.  Press `F5` to launch the Extension Development Host.
+4.  Open your Rex project folder.
+
+(Marketplace link coming soon)
+
+### CLI Tool
+
+You can also use the analyzer as a standalone CLI tool.
+
+```bash
+cd analyzer
+go build -o rex-analyzer .
+./rex-analyzer -dir /path/to/your/project -validate
+```
+
+## Usage
+
+The extension automatically activates when you open a Go or HTML file in a workspace containing Go code.
+
+-   **Validation**: Open an HTML template. Errors will appear in the "Problems" tab.
+-   **Hover**: Hover over `{{ .VariableName }}` to see type info.
+-   **Knowledge Graph**: Run the command `Rex: Show Template Knowledge Graph` to see a visualization.
+
+## Development
+
+### Prerequisites
+
+-   Go 1.21+
+-   Node.js & npm
+
+### Building
+
+Use the included build script to compile both the Go analyzer and the VSCode extension:
+
+```bash
+./build.sh
+```
+
+### Architecture
+
+1.  **Go Analyzer (`analyzer/`)**: Parses Go source code to extract `c.Render` calls and type definitions. It performs strict validation of template variables against Go types.
+2.  **VSCode Extension (`extension/`)**: 
+    -   Runs the Go analyzer to get validation errors and type data.
+    -   Provides editor integration (Diagnostics, Hover, Completion).
+    -   Visualizes the template dependency graph.
+
+## License
+
+MIT © [Dr. Abiira Nathan](https://github.com/abiiranathan)
+
+
+################################################################
+# FILE: sample/handler.go
+################################################################
+// Package handlers
+package handlers
+
+import (
+	"fmt"
+
+	"github.com/abiiranathan/rex"
+)
+
+// Breadcrumb represents a navigation breadcrumb
+type Breadcrumb struct {
+	Label  string
+	URL    string
+	IsLast bool
+}
+
+// Breadcrumbs is a slice of Breadcrumb
+type Breadcrumbs []Breadcrumb
+
+// Visit represents a patient visit
+type Visit struct {
+	ID        uint
+	PatientID uint
+	Patient   Patient
+	Doctor    Doctor
+}
+
+// Patient represents a patient
+type Patient struct {
+	Name string // Patient Full name
+	ID   uint   // Patient ID
+}
+
+// Doctor represents a doctor
+type Doctor struct {
+	DisplayName string
+	ID          uint
+}
+
+// Drug represents a drug
+type Drug struct {
+	Name     string
+	Quantity int
+	Price    float64
+}
+
+// Prescription represents a prescription
+type Prescription struct {
+	// Drug name
+	DrugName string
+
+	// Quantity
+	Quantity int
+	Dosage   string // Dosage
+}
+
+// Management represents a management entry
+type Management struct {
+	Name   string
+	Dosage string
+}
+
+// Handler holds service dependencies
+type Handler struct{}
+
+// RenderTreatmentChart renders the treatment chart
+func (h *Handler) RenderTreatmentChart(inpatient bool) rex.HandlerFunc {
+	return func(c *rex.Context) error {
+		visitID := c.ParamUint("visit_id")
+		visit := &Visit{ID: visitID}
+
+		var billedDrugs []Drug
+		var prescriptions []Prescription
+		var management []Management
+
+		pathPrefix := "/inpatient"
+		title := "Inpatient Treatment Chart"
+		label := "Inpatient"
+
+		if !inpatient {
+			pathPrefix = "/outpatient"
+			title = "OPD Progressive Treatment Chart"
+			label = "OPD"
+		}
+
+		return c.Render("views/inpatient/treatment-chart.html", rex.Map{
+			"management":    management,
+			"visit":         visit,
+			"Title":         title,
+			"PathPrefix":    pathPrefix,
+			"billedDrugs":   billedDrugs,
+			"prescriptions": prescriptions,
+			"doctor":        visit.Doctor.DisplayName,
+			"breadcrumbs": Breadcrumbs{
+				{Label: label, URL: pathPrefix},
+				{Label: visit.Patient.Name, URL: fmt.Sprintf("/patients/%d", visit.PatientID)},
+				{Label: "Treatment Chart", IsLast: true},
+			},
+		})
+	}
+}
+
+
+################################################################
+# FILE: sample/templates/views/inpatient/treatment-chart.html
+################################################################
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>{{ .Title }}</title>
+</head>
+
+<body>
+    <nav>
+        {{ range .breadcrumbs }}
+        <a href="{{ .URL }}">{{ .Label }}</a>
+        {{ if not .IsLast }} / {{ end }}
+        {{ end }}
+    </nav>
+
+    <h1>{{ .Title }}</h1>
+    <p>Patient: {{ .visit.Patient.Name }}</p>
+    <p>Doctor: {{ .doctor }}</p>
+    <h2>Management</h2>
+    {{ range .management }}
+    <div>{{ .Name }}: {{ .Dosage }}</div>
+    {{ end }}
+
+    <h2>Prescriptions</h2>
+    {{ range .prescriptions }}
+    <div class="prescription">
+        {{ $name := .DrugName }}
+        <span>{{ $name }}</span>
+        <span>{{ .Quantity }}</span>
+        <span>{{ .Dosage }}</span>
+    </div>
+    {{ end }}
+
+    <h2>Billed Drugs</h2>
+    {{ range .billedDrugs }}
+    {{ template "billed-drug" . }}
+    {{ end }}
+
+    <a href="{{ .PathPrefix }}/new">New Entry</a>
+
+    <!-- Include a partial -->
+    {{ template "views/partials/footer.html" .visit }}
+
+    {{ define "billed-drug" }}
+    <div>{{ .Name }}</div>
+    {{ end }}
+</body>
+
+</html>
+
+################################################################
+# FILE: sample/templates/views/partials/footer.html
+################################################################
+<h1>{{ .Patient.Name }}</h1>
+

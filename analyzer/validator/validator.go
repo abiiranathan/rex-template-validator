@@ -196,7 +196,10 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 	actionPattern := regexp.MustCompile(`\{\{\s*(.+?)\s*\}\}`)
 	lines := strings.Split(content, "\n")
 
-	skipDepth := 0
+	// defineSkipDepth tracks depth inside {{ define "..." }} blocks.
+	// Variables inside define blocks are NOT validated at definition time — only
+	// when the block is called via {{ template "name" .Ctx }}.
+	defineSkipDepth := 0
 
 	for i, line := range lines {
 		actualLineNum := i + lineOffset
@@ -220,17 +223,58 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 				first = words[0]
 			}
 
-			if first == "define" || first == "block" {
-				skipDepth++
+			// ── define skip logic ──────────────────────────────────────────────
+			// Unlike block (which executes in place), define only declares.
+			// We skip its body entirely to avoid false positives.
+
+			if first == "define" {
+				defineSkipDepth++
 				continue
 			}
 
-			if skipDepth > 0 {
+			if defineSkipDepth > 0 {
 				switch first {
 				case "if", "with", "range", "block":
-					skipDepth++
+					defineSkipDepth++
 				case "end":
-					skipDepth--
+					defineSkipDepth--
+				}
+				continue
+			}
+
+			// ── block handling ─────────────────────────────────────────────────
+			// {{ block "name" .Ctx }} executes its body in-place with .Ctx as the
+			// new dot scope, exactly like {{ with .Ctx }}. We validate it now.
+
+			if first == "block" {
+				// Extract block name and context expression
+				blockCtxExpr := ""
+				if len(words) >= 3 {
+					// words[1] is the name (quoted), words[2:] is the context expression
+					blockCtxExpr = strings.Join(words[2:], " ")
+				} else if len(words) == 2 {
+					blockCtxExpr = "."
+				}
+
+				// Validate any variable references in the block context expression
+				varsInAction := extractVariablesFromAction(action)
+				for _, v := range varsInAction {
+					if err := validateVariableInScope(v, scopeStack, varMap, actualLineNum, col, templateName); err != nil {
+						errors = append(errors, *err)
+					}
+				}
+
+				// Push scope for the block body (like with)
+				if blockCtxExpr != "" && blockCtxExpr != "." {
+					newScope := createScopeFromWith(blockCtxExpr, scopeStack, varMap)
+					scopeStack = append(scopeStack, newScope)
+				} else {
+					// "." context — push a copy of the current scope so "end" can pop it
+					if len(scopeStack) > 0 {
+						scopeStack = append(scopeStack, scopeStack[len(scopeStack)-1])
+					} else {
+						scopeStack = append(scopeStack, ScopeType{})
+					}
 				}
 				continue
 			}
@@ -259,12 +303,6 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 				continue
 			}
 
-			// Handle block (pushes scope like with, validates pipeline)
-			// Wait, if block is skipped by skipDepth, we never reach here during the initial pass.
-			// However, if we recursively validate the block's content from the registry,
-			// the block string itself shouldn't be in the registry's content body (only the inside).
-			// If it IS, we would need to not skip it. But let's check what the registry holds!
-
 			// Handle if (pushes copy of current scope since `if` needs an `end`)
 			if first == "if" {
 				if len(scopeStack) > 0 {
@@ -291,7 +329,8 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 					tmplName := parts[0]
 
 					if nt, ok := registry[tmplName]; ok {
-						// Named template block found in registry
+						// Named template block found in registry — validate its body
+						// with the context argument resolved against the current scope.
 						var contextArg string
 						if len(parts) >= 2 {
 							contextArg = parts[1]
@@ -312,7 +351,7 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 						fullPath := filepath.Join(baseDir, templateRoot, tmplName)
 						if _, err := os.Stat(fullPath); os.IsNotExist(err) {
 							errors = append(errors, ValidationResult{
-								Template: templateName, // caller template name (relative)
+								Template: templateName,
 								Line:     actualLineNum,
 								Column:   col,
 								Variable: tmplName,
@@ -369,7 +408,6 @@ func buildPartialVarMap(contextArg string, partialScope ScopeType, scopeStack []
 
 	if contextArg == "." {
 		// The partial receives the current dot — expose all fields of current scope
-		// If we're in root scope, that means all top-level vars are available
 		if len(scopeStack) > 0 {
 			currentScope := scopeStack[len(scopeStack)-1]
 			if currentScope.IsRoot {

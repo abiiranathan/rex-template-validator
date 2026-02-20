@@ -95,7 +95,6 @@ export class TemplateValidator {
             });
           }
         }
-        // Recurse children (shouldn't exist for variables, but safe)
         break;
       }
 
@@ -174,12 +173,47 @@ export class TemplateValidator {
         return; // partial handler recurses children itself
       }
 
-      case 'block':
+      case 'block': {
+        // {{ block "name" .Expr }} executes in-place with .Expr as the new dot scope.
+        // We validate the body with that resolved scope, exactly like `with`.
+        if (node.path.length > 0 && node.path[0] !== '.') {
+          // Context arg is a top-level variable reference (e.g. {{ block "foo" .User }})
+          const result = resolvePath(node.path, vars, scopeStack);
+          if (result.found && result.fields) {
+            const childStack: ScopeFrame[] = [...scopeStack, {
+              key: '.',
+              typeStr: result.typeStr,
+              fields: result.fields,
+            }];
+            if (node.children) {
+              this.validateNodes(node.children, vars, childStack, errors, ctx, filePath);
+            }
+            return;
+          }
+          // If we couldn't resolve the path, still validate children with current scope
+          // so we don't silently skip errors
+        } else {
+          // Context arg is "." (bare dot) — pass the current scope through unchanged
+          // This is the most common case: {{ block "billed-drug" . }}
+          // The dot inside the block body refers to whatever "." is at the call site.
+          // Since block is defined in the same file it's called from, use current scope.
+        }
+        // Fall through: validate children with current scope (covers "." context)
+        if (node.children) {
+          this.validateNodes(node.children, vars, scopeStack, errors, ctx, filePath);
+        }
+        return;
+      }
+
       case 'define': {
-        // We do NOT validate the default body of a block or define during initial 
-        // per-file pass. They are meant to be executed and evaluated when explicitly 
-        // called via `template`, potentially with a different scope context!
-        // Returning here prevents `this.validateNodes` from recursing into their children.
+        // {{ define "name" }} blocks are only executed when explicitly called via
+        // {{ template "name" .Ctx }}. Their body scope depends entirely on what
+        // context is passed at the call site, which we don't know at definition time.
+        //
+        // However: if a matching {{ template "name" . }} call exists in the same
+        // file's AST, we can infer the scope and validate. For now we skip validation
+        // here to avoid false positives — the call-site validation in validatePartial
+        // covers named block bodies when called via {{ template }}.
         return;
       }
     }
@@ -242,8 +276,12 @@ export class TemplateValidator {
   ) {
     if (!node.partialName) return;
 
-    // Named blocks (no file extension) are validated by Go itself
-    if (!isFileBasedPartial(node.partialName)) return;
+    // Named blocks (no file extension) — validate their body with the resolved context scope.
+    // We look up the define/block node in the current file's AST and re-validate it.
+    if (!isFileBasedPartial(node.partialName)) {
+      this.validateNamedBlock(node, vars, scopeStack, errors, ctx, filePath);
+      return;
+    }
 
     const partialCtx = this.graphBuilder.findPartialContext(node.partialName, filePath);
     if (!partialCtx) {
@@ -277,16 +315,113 @@ export class TemplateValidator {
       }
       const partialErrors = this.validate(content, { ...partialCtx, vars: partialVars }, partialCtx.absolutePath);
       for (const e of partialErrors) {
+        // Keep the original line/col so the error points inside the partial file,
+        // not at the {{ template "..." }} call site in the parent.
         errors.push({
           ...e,
           message: `[in partial "${node.partialName}"] ${e.message}`,
-          line: node.line,  // Report at the call site line in parent
-          col: node.col,
         });
       }
     } catch {
       // ignore read errors
     }
+  }
+
+  /**
+   * Validate a named block (define/block) body when it is called via {{ template "name" .Ctx }}.
+   * We find the define/block node in the current document and validate its children
+   * with the scope that the template call passes.
+   */
+  private validateNamedBlock(
+    callNode: TemplateNode,
+    vars: Map<string, TemplateVar>,
+    scopeStack: ScopeFrame[],
+    errors: ValidationError[],
+    ctx: TemplateContext,
+    filePath: string
+  ) {
+    if (!callNode.partialName) return;
+
+    // Build the scope the named block body will see
+    const partialVars = this.resolvePartialVars(
+      callNode.partialContext ?? '.',
+      vars,
+      scopeStack,
+      ctx
+    );
+
+    // Try to find and validate the named block body from the current file
+    try {
+      let content = '';
+      const openDoc = vscode.workspace.textDocuments.find(d => d.uri.fsPath === filePath);
+      if (openDoc) {
+        content = openDoc.getText();
+      } else if (fs.existsSync(filePath)) {
+        content = fs.readFileSync(filePath, 'utf8');
+      } else {
+        return;
+      }
+
+      const nodes = this.parser.parse(content);
+      const blockNode = this.findDefineNodeInAST(nodes, callNode.partialName);
+      if (!blockNode || !blockNode.children) return;
+
+      // Build scope frame from partialVars
+      // For "." context: partialVars mirrors current scope vars, validate children directly
+      // For ".Expr" context: push a dot frame with the resolved fields
+      const contextArg = callNode.partialContext ?? '.';
+      let childStack = scopeStack;
+
+      if (contextArg !== '.') {
+        const result = resolvePath(
+          this.parser.parseDotPath(contextArg),
+          vars,
+          scopeStack
+        );
+        if (result.found && result.fields) {
+          childStack = [...scopeStack, {
+            key: '.',
+            typeStr: result.typeStr,
+            fields: result.fields,
+          }];
+        }
+      }
+      // For "." context, use partialVars as the vars map (mirrors current scope)
+
+      const blockErrors = this.validateBlockChildren(
+        blockNode.children,
+        partialVars,
+        contextArg === '.' ? scopeStack : childStack,
+        ctx,
+        filePath
+      );
+
+      for (const e of blockErrors) {
+        // Keep the error's original line/col so it points inside the block body,
+        // not at the {{ template "..." }} call site.
+        errors.push({
+          ...e,
+          message: `[in block "${callNode.partialName}"] ${e.message}`,
+        });
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  /**
+   * Validate block children using the provided vars map and scope stack.
+   */
+  private validateBlockChildren(
+    children: TemplateNode[],
+    vars: Map<string, TemplateVar>,
+    scopeStack: ScopeFrame[],
+    ctx: TemplateContext,
+    filePath: string
+  ): ValidationError[] {
+    const errors: ValidationError[] = [];
+    this.validateNodes(children, vars, scopeStack, errors, ctx, filePath);
+    return errors;
   }
 
   /**
@@ -367,12 +502,12 @@ export class TemplateValidator {
     let varInfo = this.findVariableInfo(node.path, ctx.vars, stack);
 
     if (!result.found) {
-      // If we couldn't resolve it, check if we are inside a define or block and try to infer 
-      // the context from a template call in the same file!
+      // Try to resolve from template call context (for define/block bodies)
       const fallback = this.tryResolveFromTemplateCalls(node, nodes, position, ctx);
       if (fallback) {
         result = fallback.result;
         resolvedStack = fallback.stack;
+        varInfo = this.findVariableInfo(node.path, ctx.vars, resolvedStack);
       } else {
         return null;
       }
@@ -504,7 +639,6 @@ export class TemplateValidator {
         return declaredVar;
       }
       // For $ variables inside ranges, they might be assigned from range elements
-      // Try to resolve through the scope stack
       const rangeVarResult = this.findRangeAssignedVariable(node, stack, ctx);
       if (rangeVarResult) {
         return rangeVarResult;
@@ -512,8 +646,6 @@ export class TemplateValidator {
     }
 
     // For partials: check if the variable is a field of the partial source variable
-    // e.g., partial called with {{ template "partial" .User }}, and we're clicking on .Name
-    // or clicking on .Patient.Name - need to navigate through the path
     if (ctx.partialSourceVar) {
       // Navigate through the path to find the final field
       let currentFields = ctx.partialSourceVar.fields;
@@ -522,7 +654,6 @@ export class TemplateValidator {
       for (const pathPart of node.path) {
         if (pathPart === '.') continue;
 
-        // Find the field matching this path component
         const field = currentFields?.find(f => f.name === pathPart);
         if (!field) {
           currentVar = undefined;
@@ -533,7 +664,6 @@ export class TemplateValidator {
         currentFields = field.fields;
       }
 
-      // If we found the final field/variable, go to its definition
       if (currentVar) {
         const target = currentVar as FieldInfo;
         if (target.defFile && target.defLine) {
@@ -569,13 +699,19 @@ export class TemplateValidator {
       }
     }
 
+    // Check if we're inside a block/define body — resolve via call-site scope
+    const blockCtx = this.resolveBlockCallSiteContext(node, nodes, position, ctx);
+    if (blockCtx) {
+      // Try to find definition using the inferred scope
+      const defLoc = this.findDefinitionInScope(node, blockCtx.vars, blockCtx.scopeStack, ctx);
+      if (defLoc) return defLoc;
+    }
+
     // Find the variable definition and go to its source location
     for (const rc of ctx.renderCalls) {
       const passedVar = rc.vars.find(v => v.name === topVarName);
       if (passedVar) {
-        // Use the definition location if available
         if (passedVar.defFile && passedVar.defLine) {
-          // defFile may be absolute or relative - handle both
           let absGoFile: string | null = passedVar.defFile;
           if (!path.isAbsolute(absGoFile)) {
             absGoFile = this.graphBuilder.resolveGoFilePath(absGoFile);
@@ -589,7 +725,7 @@ export class TemplateValidator {
             );
           }
         }
-        // Fallback to render call location if no definition location available
+        // Fallback to render call location
         if (rc.file) {
           const absGoFile = this.graphBuilder.resolveGoFilePath(rc.file);
           if (absGoFile) {
@@ -602,11 +738,141 @@ export class TemplateValidator {
       }
     }
 
-    // Handle variables inside range blocks (where path starts from element type)
-    // e.g., {{ range .prescriptions }} ... {{ .DrugName }}
+    // Handle variables inside range blocks
     const rangeScopeResult = this.findRangeVariableDefinition(node, stack, ctx);
     if (rangeScopeResult) {
       return rangeScopeResult;
+    }
+
+    return null;
+  }
+
+  /**
+   * Resolve the call-site context for a variable inside a define/block body.
+   * Returns the vars map and scope stack that the block body would see when called
+   * via {{ template "blockName" .Ctx }}.
+   */
+  private resolveBlockCallSiteContext(
+    varNode: TemplateNode,
+    allNodes: TemplateNode[],
+    position: vscode.Position,
+    ctx: TemplateContext
+  ): { vars: Map<string, TemplateVar>; scopeStack: ScopeFrame[] } | null {
+    const enclosingBlock = this.findEnclosingBlockOrDefine(allNodes, position);
+    if (!enclosingBlock || !enclosingBlock.blockName) return null;
+
+    const callSite = this.findTemplateCallSite(allNodes, enclosingBlock.blockName);
+    if (!callSite) return null;
+
+    // Resolve the context arg at the call site
+    const contextArg = callSite.partialContext ?? '.';
+    const resolvedPath = this.parser.parseDotPath(contextArg);
+
+    if (contextArg === '.') {
+      // Passes the whole root scope through
+      return { vars: ctx.vars, scopeStack: [] };
+    }
+
+    const result = resolvePath(resolvedPath, ctx.vars, []);
+    if (!result.found || !result.fields) return null;
+
+    const syntheticFrame: ScopeFrame = {
+      key: '.',
+      typeStr: result.typeStr,
+      fields: result.fields,
+    };
+
+    // Build a vars map from the fields so resolvePath can find them
+    const partialVars = new Map<string, TemplateVar>();
+    for (const f of result.fields) {
+      partialVars.set(f.name, {
+        name: f.name,
+        type: f.type,
+        fields: f.fields,
+        isSlice: f.isSlice,
+        defFile: f.defFile,
+        defLine: f.defLine,
+        defCol: f.defCol,
+        doc: f.doc,
+      });
+    }
+
+    return { vars: partialVars, scopeStack: [syntheticFrame] };
+  }
+
+  /**
+   * Find the Go definition location for a variable node using the given vars/scope.
+   */
+  private findDefinitionInScope(
+    node: TemplateNode,
+    vars: Map<string, TemplateVar>,
+    scopeStack: ScopeFrame[],
+    ctx: TemplateContext
+  ): vscode.Location | null {
+    const topVarName = node.path[0] === '.' ? null : node.path[0];
+    if (!topVarName) return null;
+
+    // Check top-level vars
+    const topVar = vars.get(topVarName);
+    if (topVar) {
+      // Navigate to the specific field if path has more parts
+      if (node.path.length > 1) {
+        let fields = topVar.fields ?? [];
+        for (let i = 1; i < node.path.length; i++) {
+          const field = fields.find(f => f.name === node.path[i]);
+          if (!field) break;
+          if (i === node.path.length - 1 && field.defFile && field.defLine) {
+            let absGoFile: string | null = field.defFile;
+            if (!path.isAbsolute(absGoFile)) {
+              absGoFile = this.graphBuilder.resolveGoFilePath(absGoFile);
+            } else if (!fs.existsSync(absGoFile)) {
+              absGoFile = null;
+            }
+            if (absGoFile) {
+              return new vscode.Location(
+                vscode.Uri.file(absGoFile),
+                new vscode.Position(Math.max(0, field.defLine - 1), (field.defCol ?? 1) - 1)
+              );
+            }
+          }
+          fields = field.fields ?? [];
+        }
+      }
+
+      if (topVar.defFile && topVar.defLine) {
+        let absGoFile: string | null = topVar.defFile;
+        if (!path.isAbsolute(absGoFile)) {
+          absGoFile = this.graphBuilder.resolveGoFilePath(absGoFile);
+        } else if (!fs.existsSync(absGoFile)) {
+          absGoFile = null;
+        }
+        if (absGoFile) {
+          return new vscode.Location(
+            vscode.Uri.file(absGoFile),
+            new vscode.Position(Math.max(0, topVar.defLine - 1), (topVar.defCol ?? 1) - 1)
+          );
+        }
+      }
+    }
+
+    // Check scope stack dot frame
+    const dotFrame = scopeStack.slice().reverse().find(f => f.key === '.');
+    if (dotFrame?.fields) {
+      const field = dotFrame.fields.find(f => f.name === topVarName);
+      if (field?.defFile && field.defLine) {
+        let absGoFile: string | null = field.defFile;
+        if (!path.isAbsolute(absGoFile)) {
+          absGoFile = this.graphBuilder.resolveGoFilePath(absGoFile);
+        } else if (!fs.existsSync(absGoFile)) {
+          absGoFile = null;
+        }
+        if (absGoFile) {
+          return new vscode.Location(
+            vscode.Uri.file(absGoFile),
+            new vscode.Position(Math.max(0, field.defLine - 1), (field.defCol ?? 1) - 1)
+          );
+        }
+      }
     }
 
     return null;
@@ -621,7 +887,6 @@ export class TemplateValidator {
     position: vscode.Position,
     ctx: TemplateContext
   ): vscode.Location | null {
-    // Search for the assignment that defines this variable
     const varName = targetNode.path[0];
     if (!varName?.startsWith('$')) return null;
 
@@ -642,13 +907,10 @@ export class TemplateValidator {
     position: vscode.Position,
     ctx: TemplateContext
   ): vscode.Location | null {
-    // Check if this node is a variable assignment
     if (node.kind === 'variable' && node.rawText.includes(':=')) {
       const assignMatch = node.rawText.match(/\{\{\s*\$([\w]+)\s*:=\s*(.+?)\s*\}\}/);
       if (assignMatch && '$' + assignMatch[1] === varName) {
-        // This is the assignment - go to the right-hand side definition
         const rhs = assignMatch[2].trim();
-        // Create a temporary node to resolve the RHS
         const rhsNode: TemplateNode = {
           kind: 'variable',
           path: this.parser.parseDotPath(rhs),
@@ -656,12 +918,10 @@ export class TemplateValidator {
           line: node.line,
           col: node.col,
         };
-        // Try to find definition for the RHS
         return this.findVariableDefinition(rhsNode, ctx);
       }
     }
 
-    // Recurse into children
     if (node.children) {
       for (const child of node.children) {
         const result = this.findVariableAssignment(child, varName, position, ctx);
@@ -705,7 +965,6 @@ export class TemplateValidator {
 
   /**
    * Find definition for a variable assigned from a range element
-   * e.g., {{ $i, $v := range .Items }} ... {{ $v.Name }}
    */
   private findRangeAssignedVariable(
     node: TemplateNode,
@@ -715,12 +974,8 @@ export class TemplateValidator {
     const varName = node.path[0];
     if (!varName?.startsWith('$')) return null;
 
-    // Look through the scope stack for range contexts
-    // Check if this $variable is an iteration variable from a range
     for (const frame of scopeStack) {
       if (frame.isRange && frame.sourceVar) {
-        // This might be an iteration variable
-        // Go to the slice/array definition
         if (frame.sourceVar.defFile && frame.sourceVar.defLine) {
           let absGoFile: string | null = frame.sourceVar.defFile;
           if (!path.isAbsolute(absGoFile)) {
@@ -743,27 +998,21 @@ export class TemplateValidator {
 
   /**
    * Find definition for variables accessed inside range blocks
-   * e.g., {{ range .prescriptions }} ... {{ .DrugName }}
-   * When clicking on a field inside a range, goes to the specific struct field definition
    */
   private findRangeVariableDefinition(
     node: TemplateNode,
     scopeStack: ScopeFrame[],
     ctx: TemplateContext
   ): vscode.Location | null {
-    // If path doesn't start with a top-level var, it might be accessing range element
     if (node.path.length === 0 || node.path[0] === '.') return null;
 
     const firstFieldName = node.path[0];
 
-    // Look through scope stack for range contexts
     for (let i = scopeStack.length - 1; i >= 0; i--) {
       const frame = scopeStack[i];
       if (frame.isRange && frame.fields) {
-        // Check if the first path element is a field of this range element
         const field = frame.fields.find(f => f.name === firstFieldName);
         if (field) {
-          // Try to go to the specific field definition if available
           if (field.defFile && field.defLine) {
             let absGoFile: string | null = field.defFile;
             if (!path.isAbsolute(absGoFile)) {
@@ -779,7 +1028,6 @@ export class TemplateValidator {
             }
           }
 
-          // Fallback: go to the slice/array definition
           if (frame.sourceVar?.defFile && frame.sourceVar.defLine) {
             let absGoFile: string | null = frame.sourceVar.defFile;
             if (!path.isAbsolute(absGoFile)) {
@@ -803,29 +1051,26 @@ export class TemplateValidator {
 
   private findTemplateNameHover(nodes: TemplateNode[], position: vscode.Position): string | null {
     for (const node of nodes) {
-      if ((node.kind === 'partial' && node.partialName) || 
-          (node.kind === 'block' && node.blockName) || 
-          (node.kind === 'define' && node.blockName)) {
-        
+      if ((node.kind === 'partial' && node.partialName) ||
+        (node.kind === 'block' && node.blockName) ||
+        (node.kind === 'define' && node.blockName)) {
+
         const name = node.partialName || node.blockName!;
         const startLine = node.line - 1;
         const startCol = node.col - 1;
 
-        const keywordMatch = node.rawText.match(/\{\{\s*(template|block|define)\s+/);
-        if (keywordMatch) {
-          const nameMatch = node.rawText.match(new RegExp(`\\{\\{\\s*(template|block|define)\\s+"([^"]+)"`));
-          if (nameMatch && nameMatch[2] === name) {
-            const nameStartOffset = node.rawText.indexOf('"' + name + '"') + 1;
-            const nameStartCol = startCol + nameStartOffset;
-            const nameEndCol = nameStartCol + name.length;
+        const nameMatch = node.rawText.match(new RegExp(`\\{\\{\\s*(template|block|define)\\s+"([^"]+)"`));
+        if (nameMatch && nameMatch[2] === name) {
+          const nameStartOffset = node.rawText.indexOf('"' + name + '"') + 1;
+          const nameStartCol = startCol + nameStartOffset;
+          const nameEndCol = nameStartCol + name.length;
 
-            if (
-              position.line === startLine &&
-              position.character >= nameStartCol &&
-              position.character <= nameEndCol
-            ) {
-              return name;
-            }
+          if (
+            position.line === startLine &&
+            position.character >= nameStartCol &&
+            position.character <= nameEndCol
+          ) {
+            return name;
           }
         }
       }
@@ -839,8 +1084,7 @@ export class TemplateValidator {
   }
 
   /**
-   * Check if cursor is on a partial/template/block name in {{ template "name" . }}
-   * and return the location of the template file or define block.
+   * Check if cursor is on a partial/template/block name and return the definition location.
    */
   private async findPartialDefinitionAtPosition(
     nodes: TemplateNode[],
@@ -848,46 +1092,40 @@ export class TemplateValidator {
     ctx: TemplateContext
   ): Promise<vscode.Location | null> {
     for (const node of nodes) {
-      // Check if this is a partial, block, or define node
-      if ((node.kind === 'partial' && node.partialName) || 
-          (node.kind === 'block' && node.blockName) || 
-          (node.kind === 'define' && node.blockName)) {
-        
+      if ((node.kind === 'partial' && node.partialName) ||
+        (node.kind === 'block' && node.blockName) ||
+        (node.kind === 'define' && node.blockName)) {
+
         const name = node.partialName || node.blockName!;
         const startLine = node.line - 1;
         const startCol = node.col - 1;
 
-        const keywordMatch = node.rawText.match(/\{\{\s*(template|block|define)\s+/);
-        if (keywordMatch) {
-          const nameMatch = node.rawText.match(new RegExp(`\\{\\{\\s*(template|block|define)\\s+"([^"]+)"`));
-          if (nameMatch && nameMatch[2] === name) {
-            const nameStartOffset = node.rawText.indexOf('"' + name + '"') + 1;
-            const nameStartCol = startCol + nameStartOffset;
-            const nameEndCol = nameStartCol + name.length;
+        const nameMatch = node.rawText.match(new RegExp(`\\{\\{\\s*(template|block|define)\\s+"([^"]+)"`));
+        if (nameMatch && nameMatch[2] === name) {
+          const nameStartOffset = node.rawText.indexOf('"' + name + '"') + 1;
+          const nameStartCol = startCol + nameStartOffset;
+          const nameEndCol = nameStartCol + name.length;
 
-            // Check if cursor is on the template name
-            if (
-              position.line === startLine &&
-              position.character >= nameStartCol &&
-              position.character <= nameEndCol
-            ) {
-              if (isFileBasedPartial(name)) {
-                const templatePath = this.graphBuilder.resolveTemplatePath(name);
-                if (templatePath) {
-                  return new vscode.Location(
-                    vscode.Uri.file(templatePath),
-                    new vscode.Position(0, 0)
-                  );
-                }
-              } else {
-                return await this.findNamedBlockDefinition(name, ctx);
+          if (
+            position.line === startLine &&
+            position.character >= nameStartCol &&
+            position.character <= nameEndCol
+          ) {
+            if (isFileBasedPartial(name)) {
+              const templatePath = this.graphBuilder.resolveTemplatePath(name);
+              if (templatePath) {
+                return new vscode.Location(
+                  vscode.Uri.file(templatePath),
+                  new vscode.Position(0, 0)
+                );
               }
+            } else {
+              return await this.findNamedBlockDefinition(name, ctx);
             }
           }
         }
       }
 
-      // Recurse into children
       if (node.children) {
         const found = await this.findPartialDefinitionAtPosition(
           node.children,
@@ -907,7 +1145,6 @@ export class TemplateValidator {
 
     const defineRegex = new RegExp(`\\{\\{\\s*(?:define|block)\\s+"${name}"`);
 
-    // Prioritize current file
     const filesToSearch = [ctx.absolutePath];
     for (const [_, tctx] of graph.templates) {
       if (tctx.absolutePath !== ctx.absolutePath) {
@@ -925,7 +1162,7 @@ export class TemplateValidator {
           if (!fs.existsSync(filePath)) continue;
           content = await fs.promises.readFile(filePath, 'utf-8');
         }
-        
+
         if (!defineRegex.test(content)) continue;
 
         const nodes = this.parser.parse(content);
@@ -1009,26 +1246,48 @@ export class TemplateValidator {
     const callSite = this.findTemplateCallSite(allNodes, enclosingBlock.blockName);
     if (!callSite) return null;
 
-    // Mock position to be directly on the template call node
-    const callPos = new vscode.Position(callSite.line - 1, callSite.col);
-    const callStackHit = this.findNodeAtPosition(allNodes, callPos, ctx.vars, []);
-    if (!callStackHit) return null;
+    // Build scope from call site context arg
+    const contextArg = callSite.partialContext ?? '.';
+    const resolvedPath = this.parser.parseDotPath(contextArg);
 
-    const callResult = resolvePath(callSite.path, ctx.vars, callStackHit.stack);
+    let syntheticStack: ScopeFrame[] = [];
+
+    if (contextArg === '.') {
+      // Whole root scope — use ctx.vars directly, no synthetic frame needed
+      const result = resolvePath(varNode.path, ctx.vars, []);
+      if (result.found) {
+        return { result, stack: [] };
+      }
+      return null;
+    }
+
+    const callResult = resolvePath(resolvedPath, ctx.vars, []);
     if (!callResult.found) return null;
 
-    // Use the call context to evaluate the hovered variable!
     const syntheticFrame: ScopeFrame = {
       key: '.',
       typeStr: callResult.typeStr,
       fields: callResult.fields,
     };
+    syntheticStack = [syntheticFrame];
 
-    const syntheticStack = [...callStackHit.stack, syntheticFrame];
-    const result = resolvePath(varNode.path, ctx.vars, syntheticStack);
+    // Build vars from the fields of the context
+    const partialVars = new Map<string, TemplateVar>();
+    for (const f of callResult.fields ?? []) {
+      partialVars.set(f.name, {
+        name: f.name,
+        type: f.type,
+        fields: f.fields,
+        isSlice: f.isSlice,
+        defFile: f.defFile,
+        defLine: f.defLine,
+        defCol: f.defCol,
+        doc: f.doc,
+      });
+    }
 
+    const result = resolvePath(varNode.path, partialVars, syntheticStack);
     if (result.found) {
-      const varInfo = this.findVariableInfo(varNode.path, ctx.vars, syntheticStack);
       return { result, stack: syntheticStack };
     }
 
@@ -1083,18 +1342,14 @@ export class TemplateValidator {
         if ((node.kind === 'range' || node.kind === 'with') && node.path.length > 0 && node.path[0] !== '.') {
           const result = resolvePath(node.path, vars, scopeStack);
           if (result.found && result.fields) {
-            // Find the source variable for ranges (to enable go-to-definition)
             let sourceVar: TemplateVar | undefined;
             if (node.kind === 'range') {
-              // Try to find the source variable from top-level vars or scope
               sourceVar = vars.get(node.path[0]);
               if (!sourceVar && scopeStack.length > 0) {
-                // Check scope stack for the variable
                 const dotFrame = scopeStack.slice().reverse().find(f => f.key === '.');
                 if (dotFrame?.fields) {
                   const field = dotFrame.fields.find(f => f.name === node.path[0]);
                   if (field) {
-                    // Create a synthetic TemplateVar from field info
                     sourceVar = {
                       name: node.path[0],
                       type: field.type,
@@ -1114,7 +1369,19 @@ export class TemplateValidator {
             };
             childStack = [...scopeStack, frame];
           }
+        } else if (node.kind === 'block' && node.path.length > 0 && node.path[0] !== '.') {
+          // {{ block "name" .Expr }} — push scope for the expr
+          const result = resolvePath(node.path, vars, scopeStack);
+          if (result.found && result.fields) {
+            childStack = [...scopeStack, {
+              key: '.',
+              typeStr: result.typeStr,
+              fields: result.fields,
+            }];
+          }
         }
+        // For define nodes: scope is unknown at definition time; leave childStack as-is.
+        // tryResolveFromTemplateCalls handles hover inside define bodies.
 
         if (node.children) {
           const found = this.findNodeAtPosition(node.children, position, vars, childStack);
@@ -1136,8 +1403,6 @@ export class TemplateValidator {
   ): vscode.Location | null {
     const line = document.lineAt(position.line).text;
 
-    // Look for c.Render("template-path", ...) pattern
-    // Match the template string literal at cursor position
     const renderRegex = /\.Render\s*\(\s*"([^"]+)"/g;
     let match: RegExpExecArray | null;
 
@@ -1146,7 +1411,6 @@ export class TemplateValidator {
       const matchStart = match.index + '.Render("'.length;
       const matchEnd = matchStart + templatePath.length;
 
-      // Check if cursor is within the template path string
       if (position.character >= matchStart && position.character <= matchEnd) {
         const absPath = this.graphBuilder.resolveTemplatePath(templatePath);
         if (absPath) {
@@ -1170,14 +1434,12 @@ export class TemplateValidator {
   ): vscode.CompletionItem[] {
     const line = document.lineAt(position.line).text.slice(0, position.character);
 
-    // Match dot expression inside a template action: {{ .Foo.Bar| }}
     const dotMatch = line.match(/\{\{.*?\.([\w.]*)$/);
     if (!dotMatch) return [];
 
     const partial = dotMatch[1];
     const parts = partial.split('.');
 
-    // Single segment → suggest top-level vars
     if (parts.length <= 1) {
       const prefix = parts[0] ?? '';
       return [...ctx.vars.values()]
@@ -1190,7 +1452,6 @@ export class TemplateValidator {
         });
     }
 
-    // Multi-segment → resolve parent path and suggest its fields
     const parentPath = parts.slice(0, -1);
     const prefix = parts[parts.length - 1];
     const topVar = ctx.vars.get(parentPath[0]);
