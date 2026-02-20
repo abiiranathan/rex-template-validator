@@ -207,28 +207,30 @@ export class TemplateParser {
    * A single action may contain multiple refs: `eq .Name "foo"`, `not .IsLast`
    */
   private tryParseVariables(tok: Token): TemplateNode[] {
-    const inner = tok.inner;
+    let inner = tok.inner;
     const results: TemplateNode[] = [];
 
-    // Direct dot expression
-    if (inner.startsWith('.')) {
-      // Take only the path, stop at pipe or space
-      const pathStr = inner.split(/[\s|]/)[0];
-      results.push({
-        kind: 'variable',
-        path: this.parseDotPath(pathStr),
-        rawText: tok.raw,
-        line: tok.line,
-        col: tok.col,
-      });
-      return results;
+    // 1. Strip assignment LHS: $var := ... or $a, $b := ...
+    const assignMatch = inner.match(/^\s*(?:\$[\w\d_]+(?:\s*,\s*\$[\w\d_]+)?)\s*:=\s*(.*)/);
+    if (assignMatch) {
+       inner = assignMatch[1]; 
     }
 
-    // Pipelines and builtins that contain dot references
-    // e.g. "not .IsLast", "eq .Name .OtherName", "len .Items"
-    const dotRefs = inner.match(/(\.[A-Za-z_][A-Za-z0-9_.]*)/g);
-    if (dotRefs) {
-      for (const ref of dotRefs) {
+    // 2. Scan for references starting with . or $
+    // Matches: .Field, $Var, $.Field, ., $
+    const refs = inner.match(/((?:\$|\.)[\w\d_.]*)/g);
+    
+    if (refs) {
+      for (const ref of refs) {
+        // Filter out cases where regex matches inside a number (e.g. 1.23 -> .23) if necessary.
+        // But our regex starts with $ or . so 1.23 won't match .23 unless it is space separated?
+        // Actually .23 matches \.[\w\d_.]* 
+        // We can add a check if it looks like a number.
+        if (/^\.\d+$/.test(ref)) continue;
+
+        // Skip ellipsis "..."
+        if (ref === '...') continue;
+
         results.push({
           kind: 'variable',
           path: this.parseDotPath(ref),
@@ -261,7 +263,7 @@ export class TemplateParser {
     const pathPart = expr.split(/[\s|(),]/)[0];
 
     if (pathPart === '.' || pathPart === '') return ['.'];
-    if (!pathPart.startsWith('.')) return [];
+    if (!pathPart.startsWith('.') && !pathPart.startsWith('$')) return [];
 
     return pathPart.split('.').filter(p => p.length > 0);
   }
@@ -305,6 +307,21 @@ export function resolvePath(
     return { typeStr: 'context', found: true };
   }
 
+  // Handle $. explicitly - root context
+  if (path[0] === '$') {
+     // If just "$" -> root context itself (though unusual to use alone)
+     if (path.length === 1) return { typeStr: 'context', found: true, fields: [...vars.values()] as any };
+     
+     // $.Field -> resolve against root vars
+     const topVar = vars.get(path[1]);
+     if (!topVar) return { typeStr: 'unknown', found: false };
+     
+     if (path.length === 2) {
+         return { typeStr: topVar.type, found: true, fields: topVar.fields, isSlice: topVar.isSlice };
+     }
+     return resolveFields(path.slice(2), topVar.fields ?? []);
+  }
+
   // Path starts with explicit "$var"
   if (path[0].startsWith('$')) {
     for (let i = scopeStack.length - 1; i >= 0; i--) {
@@ -319,9 +336,13 @@ export function resolvePath(
 
   // Path inside a with/range scope → check dot frame fields first
   const dotFrame = findDotFrame(scopeStack);
-  if (dotFrame?.fields) {
-    const res = resolveFields(path, dotFrame.fields);
-    if (res.found) return res;
+  if (dotFrame) {
+    if (dotFrame.fields) {
+      const res = resolveFields(path, dotFrame.fields);
+      if (res.found) return res;
+    }
+    // If inside a scoped block, do NOT fall through to top-level vars for dot-paths.
+    return { typeStr: 'unknown', found: false };
   }
 
   // Fall through to top-level vars

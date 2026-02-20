@@ -86,6 +86,12 @@ export class TemplateValidator {
         if (node.path.length > 0 && node.path[0] !== '.') {
           const result = resolvePath(node.path, vars, scopeStack);
           if (!result.found) {
+            // Ignore if it looks like a local variable ($var but not $ or $.)
+            // because we don't track local assignments.
+            if (node.path[0].startsWith('$') && node.path[0] !== '$') {
+                break;
+            }
+
             errors.push({
               message: `Template variable ".${node.path.join('.')}" is not defined in the render context`,
               line: node.line,
@@ -1751,9 +1757,9 @@ export class TemplateValidator {
              // Fallback to all top-level vars if "." isn't resolved (shouldn't happen often)
              fields = [...ctx.vars.values()] as any; 
          }
-         
-         // Also include "$" vars from scope stack? 
-         // For now, let's stick to fields of dot.
+    } else if (lookupPath.length === 1 && lookupPath[0] === '$') {
+         // Resolve "$" (root scope) - suggest all top-level vars
+         fields = [...ctx.vars.values()] as any;
     } else {
         const res = resolvePath(lookupPath, ctx.vars, stack);
         if (res.found && res.fields) {
