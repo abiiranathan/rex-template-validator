@@ -5,6 +5,7 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -48,15 +49,9 @@ func AnalyzeDir(dir string) AnalysisResult {
 			if info == nil {
 				info = pkg.TypesInfo
 			} else {
-				for k, v := range pkg.TypesInfo.Types {
-					info.Types[k] = v
-				}
-				for k, v := range pkg.TypesInfo.Defs {
-					info.Defs[k] = v
-				}
-				for k, v := range pkg.TypesInfo.Uses {
-					info.Uses[k] = v
-				}
+				maps.Copy(info.Types, pkg.TypesInfo.Types)
+				maps.Copy(info.Defs, pkg.TypesInfo.Defs)
+				maps.Copy(info.Uses, pkg.TypesInfo.Uses)
 			}
 		}
 	}
@@ -91,6 +86,7 @@ func AnalyzeDir(dir string) AnalysisResult {
 			if !ok {
 				return true
 			}
+
 			if sel.Sel.Name != "Render" || len(call.Args) < 2 {
 				return true
 			}

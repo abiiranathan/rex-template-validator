@@ -185,6 +185,8 @@ export async function activate(context: vscode.ExtensionContext) {
         scheduleRebuild(workspaceRoot);      // re-run Go analyzer
       } else if (isTemplate(doc)) {
         scheduleValidate(doc);               // re-validate template against existing graph
+      } else {
+        scheduleRebuild(workspaceRoot); // default
       }
     })
   );

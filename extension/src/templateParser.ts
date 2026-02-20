@@ -122,22 +122,39 @@ export class TemplateParser {
       }
 
       if (inner.startsWith('block ')) {
+        const words = inner.slice(6).trim().split(/\s+/);
+        let blockName = '';
+        let blockExpr = '.';
+        if (words.length >= 1) {
+          blockName = words[0].replace(/^"|"$/g, '');
+        }
+        if (words.length >= 2) {
+          blockExpr = words.slice(1).join(' ');
+        }
+        
         const child = this.buildTree(tokens, pos + 1);
         nodes.push({
           kind: 'block',
-          path: [],
+          path: this.parseDotPath(blockExpr),
           rawText: tok.raw,
           line: tok.line,
           col: tok.col,
           endLine: child.endToken?.line,
           endCol: child.endToken?.col,
           children: child.nodes,
+          blockName,
         });
         pos = child.nextPos;
         continue;
       }
 
       if (inner.startsWith('define ')) {
+        const words = inner.slice(7).trim().split(/\s+/);
+        let blockName = '';
+        if (words.length >= 1) {
+          blockName = words[0].replace(/^"|"$/g, '');
+        }
+
         const child = this.buildTree(tokens, pos + 1);
         nodes.push({
           kind: 'define',
@@ -148,6 +165,7 @@ export class TemplateParser {
           endLine: child.endToken?.line,
           endCol: child.endToken?.col,
           children: child.nodes,
+          blockName,
         });
         pos = child.nextPos;
         continue;

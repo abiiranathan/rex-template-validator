@@ -33,13 +33,17 @@
 
     <h2>Billed Drugs</h2>
     {{ range .billedDrugs }}
-    <div>{{ .Name }}</div>
+    {{ template "billed-drug" . }}
     {{ end }}
 
     <a href="{{ .PathPrefix }}/new">New Entry</a>
 
     <!-- Include a partial -->
     {{ template "views/partials/footer.html" .visit }}
+
+    {{ block "billed-drug" }}
+    <div>{{ .Name }}</div>
+    {{ end }}
 </body>
 
 </html>

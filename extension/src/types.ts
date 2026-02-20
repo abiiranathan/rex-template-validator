@@ -81,6 +81,7 @@ export interface TemplateNode {
   children?: TemplateNode[];
   partialName?: string;   // for 'partial' kind
   partialContext?: string; // raw context arg, e.g. "." or ".User"
+  blockName?: string;     // for 'block' and 'define' kind
 }
 
 export interface ValidationError {

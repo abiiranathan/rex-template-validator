@@ -84,7 +84,8 @@ func extractNamedTemplatesFromContent(content, templateName string, registry map
 
 		first := words[0]
 
-		if first == "if" || first == "with" || first == "range" || first == "block" {
+		switch first {
+		case "if", "with", "range", "block":
 			if activeName != "" {
 				depth++
 			} else if first == "block" && len(words) >= 2 {
@@ -93,7 +94,7 @@ func extractNamedTemplatesFromContent(content, templateName string, registry map
 				startLine = countLines(content[:fullActionEnd]) + 1
 				depth = 1
 			}
-		} else if first == "define" {
+		case "define":
 			if activeName != "" {
 				depth++
 			} else if len(words) >= 2 {
@@ -102,7 +103,7 @@ func extractNamedTemplatesFromContent(content, templateName string, registry map
 				startLine = countLines(content[:fullActionEnd]) + 1
 				depth = 1
 			}
-		} else if first == "end" {
+		case "end":
 			if activeName != "" {
 				depth--
 				if depth == 0 {
@@ -225,9 +226,10 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 			}
 
 			if skipDepth > 0 {
-				if first == "if" || first == "with" || first == "range" || first == "block" {
+				switch first {
+				case "if", "with", "range", "block":
 					skipDepth++
-				} else if first == "end" {
+				case "end":
 					skipDepth--
 				}
 				continue
@@ -721,4 +723,23 @@ func extractVariablesFromAction(action string) []string {
 	}
 
 	return validVars
+}
+
+// ValidateTemplateFileStr exposes internal method for testing
+func ValidateTemplateFileStr(content string, vars []TemplateVar, templateName string, baseDir, templateRoot string, registry map[string]NamedTemplate) []ValidationResult {
+	varMap := make(map[string]TemplateVar)
+	for _, v := range vars {
+		varMap[v.Name] = v
+	}
+	return validateTemplateContent(string(content), varMap, templateName, baseDir, templateRoot, 1, registry)
+}
+
+// ParseAllNamedTemplates exposes for testing
+func ParseAllNamedTemplates(baseDir, templateRoot string) map[string]NamedTemplate {
+	return parseAllNamedTemplates(baseDir, templateRoot)
+}
+
+// ExtractNamedTemplatesFromContent exposes for testing
+func ExtractNamedTemplatesFromContent(content, templateName string, registry map[string]NamedTemplate) {
+	extractNamedTemplatesFromContent(content, templateName, registry)
 }

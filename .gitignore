@@ -29,3 +29,5 @@ extension/dist/
 # Go
 analyzer/analyzer
 analyzer/rex-analyzer
+.opencode
+prompt*.txt

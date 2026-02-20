@@ -348,16 +348,25 @@ export class TemplateValidator {
     if (!hit) return null;
 
     const { node, stack } = hit;
-    const result = resolvePath(node.path, ctx.vars, stack);
+    let result = resolvePath(node.path, ctx.vars, stack);
+    let resolvedStack = stack;
+    let varInfo = this.findVariableInfo(node.path, ctx.vars, stack);
 
-    if (!result.found) return null;
+    if (!result.found) {
+      // If we couldn't resolve it, check if we are inside a define or block and try to infer 
+      // the context from a template call in the same file!
+      const fallback = this.tryResolveFromTemplateCalls(node, nodes, position, ctx);
+      if (fallback) {
+        result = fallback.result;
+        resolvedStack = fallback.stack;
+      } else {
+        return null;
+      }
+    }
 
     const varName = node.path[0] === '.' ? '.' : '.' + node.path.join('.');
     const md = new vscode.MarkdownString();
     md.isTrusted = true;
-
-    // Find the variable info to get documentation
-    const varInfo = this.findVariableInfo(node.path, ctx.vars, stack);
 
     // Build hover content similar to gopls
     md.appendCodeblock(`${varName}: ${result.typeStr}`, 'go');
@@ -832,6 +841,85 @@ export class TemplateValidator {
         );
         if (found) return found;
       }
+    }
+
+    return null;
+  }
+
+  // ── Block/Define Context Inference ──────────────────────────────────────────
+
+  private findEnclosingBlockOrDefine(nodes: TemplateNode[], position: vscode.Position): TemplateNode | null {
+    for (const node of nodes) {
+      if (node.endLine !== undefined) {
+        const startLine = node.line - 1;
+        const startCol = node.col - 1;
+        const endLine = node.endLine - 1;
+
+        const afterStart = position.line > startLine ||
+          (position.line === startLine && position.character >= startCol);
+        const beforeEnd = position.line < endLine ||
+          (position.line === endLine && position.character <= (node.endCol ?? 0) - 1);
+
+        if (afterStart && beforeEnd) {
+          if (node.kind === 'block' || node.kind === 'define') {
+            const deeper = this.findEnclosingBlockOrDefine(node.children ?? [], position);
+            return deeper || node;
+          } else if (node.children) {
+            const found = this.findEnclosingBlockOrDefine(node.children, position);
+            if (found) return found;
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  private findTemplateCallSite(nodes: TemplateNode[], partialName: string): TemplateNode | null {
+    for (const node of nodes) {
+      if (node.kind === 'partial' && node.partialName === partialName) {
+        return node;
+      }
+      if (node.children) {
+        const found = this.findTemplateCallSite(node.children, partialName);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
+  private tryResolveFromTemplateCalls(
+    varNode: TemplateNode,
+    allNodes: TemplateNode[],
+    position: vscode.Position,
+    ctx: TemplateContext
+  ): { result: ResolveResult; stack: ScopeFrame[]; varInfo?: FieldInfo | TemplateVar } | null {
+    const enclosingBlock = this.findEnclosingBlockOrDefine(allNodes, position);
+    if (!enclosingBlock || !enclosingBlock.blockName) return null;
+
+    const callSite = this.findTemplateCallSite(allNodes, enclosingBlock.blockName);
+    if (!callSite) return null;
+
+    // Mock position to be directly on the template call node
+    const callPos = new vscode.Position(callSite.line - 1, callSite.col);
+    const callStackHit = this.findNodeAtPosition(allNodes, callPos, ctx.vars, []);
+    if (!callStackHit) return null;
+
+    const callResult = resolvePath(callSite.path, ctx.vars, callStackHit.stack);
+    if (!callResult.found) return null;
+
+    // Use the call context to evaluate the hovered variable!
+    const syntheticFrame: ScopeFrame = {
+      key: '.',
+      typeStr: callResult.typeStr,
+      fields: callResult.fields,
+    };
+
+    const syntheticStack = [...callStackHit.stack, syntheticFrame];
+    const result = resolvePath(varNode.path, ctx.vars, syntheticStack);
+
+    if (result.found) {
+      const varInfo = this.findVariableInfo(varNode.path, ctx.vars, syntheticStack);
+      return { result, stack: syntheticStack };
     }
 
     return null;
