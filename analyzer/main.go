@@ -15,6 +15,7 @@ func main() {
 	templateRoot := flag.String("template-root", "", "Root directory for templates (relative to template-base-dir)")
 	templateBaseDir := flag.String("template-base-dir", "", "Base directory for template-root (defaults to -dir if not set)")
 	validate := flag.Bool("validate", false, "Validate templates against render calls")
+	contextFile := flag.String("context-file", "", "Path to JSON file with additional context variables")
 	flag.Parse()
 
 	absDir := mustAbs(*dir)
@@ -25,7 +26,7 @@ func main() {
 		templateBase = mustAbs(*templateBaseDir)
 	}
 
-	result := validator.AnalyzeDir(absDir)
+	result := validator.AnalyzeDir(absDir, *contextFile)
 	result.Errors = filterImportErrors(result.Errors)
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")

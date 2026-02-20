@@ -44,6 +44,11 @@ type Drug struct {
 	Price    float64
 }
 
+// User represents a user
+type User struct {
+	Name string
+}
+
 // Prescription represents a prescription
 type Prescription struct {
 	// Drug name

@@ -4,7 +4,7 @@ import { GoAnalyzer } from './analyzer';
 import { KnowledgeGraphBuilder } from './knowledgeGraph';
 import { TemplateValidator } from './validator';
 import { KnowledgeGraphPanel } from './graphPanel';
-import { AnalysisResult, KnowledgeGraph, GoValidationError } from './types';
+import { KnowledgeGraph, GoValidationError } from './types';
 import * as fs from 'fs';
 
 const TEMPLATE_SELECTOR: vscode.DocumentSelector = [
@@ -51,18 +51,18 @@ export async function activate(context: vscode.ExtensionContext) {
   // ── Commands ───────────────────────────────────────────────────────────────
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('rexTemplateValidator.validate', async () => {
+    vscode.commands.registerCommand('rexAnalyzer.validate', async () => {
       const doc = vscode.window.activeTextEditor?.document;
       if (doc && isTemplate(doc)) {
         await validateDocument(doc);
       }
     }),
 
-    vscode.commands.registerCommand('rexTemplateValidator.rebuildIndex', async () => {
+    vscode.commands.registerCommand('rexAnalyzer.rebuildIndex', async () => {
       await rebuildIndex(workspaceRoot);
     }),
 
-    vscode.commands.registerCommand('rexTemplateValidator.showKnowledgeGraph', () => {
+    vscode.commands.registerCommand('rexAnalyzer.showKnowledgeGraph', () => {
       if (currentGraph) {
         KnowledgeGraphPanel.show(context, currentGraph);
       } else {
@@ -199,7 +199,7 @@ export async function activate(context: vscode.ExtensionContext) {
   // Config changes → rebuild so new sourceDir/templateRoot take effect
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration('rexTemplateValidator')) {
+      if (e.affectsConfiguration('rex-analyzer')) {
         outputChannel.appendLine('[Rex] Configuration changed, rebuilding index...');
         scheduleRebuild(workspaceRoot);
       }
@@ -239,7 +239,7 @@ async function rebuildIndex(workspaceRoot: string) {
   statusBarItem.text = '$(sync~spin) Rex: Analyzing...';
   statusBarItem.show();
 
-  const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+  const config = vscode.workspace.getConfiguration('rex-analyzer');
   const sourceDir: string = config.get('sourceDir') ?? '.';
   const templateRoot: string = config.get('templateRoot') ?? '';
   const templateBaseDir: string = config.get('templateBaseDir') ?? '';
@@ -354,7 +354,7 @@ async function applyAnalyzerDiagnostics(
 
     } else {
       // For other validation errors, point to the template file itself
-      const baseDir = templateBaseDir === '' ? workspaceRoot : path.join(workspaceRoot, templateBaseDir);
+      const baseDir = templateBaseDir ? path.join(workspaceRoot, templateBaseDir) : path.join(workspaceRoot, sourceDir);
       diagnosticFilePath = path.join(baseDir, templateRoot, err.template);
       diagnosticLine = Math.max(0, err.line - 1);
       diagnosticCol = Math.max(0, err.column - 1);
@@ -425,7 +425,7 @@ async function validateDocument(doc: vscode.TextDocument) {
 // ── Debounce helpers ───────────────────────────────────────────────────────────
 
 function scheduleRebuild(workspaceRoot: string) {
-  const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+  const config = vscode.workspace.getConfiguration('rex-analyzer');
   const debounceMs = config.get<number>('debounceMs') ?? 1500;
 
   if (rebuildTimer) clearTimeout(rebuildTimer);
@@ -433,7 +433,7 @@ function scheduleRebuild(workspaceRoot: string) {
 }
 
 function scheduleValidate(doc: vscode.TextDocument) {
-  const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+  const config = vscode.workspace.getConfiguration('rex-analyzer');
   const debounceMs = config.get<number>('debounceMs') ?? 1500;
 
   if (validateTimer) clearTimeout(validateTimer);

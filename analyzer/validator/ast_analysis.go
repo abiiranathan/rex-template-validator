@@ -1,6 +1,7 @@
 package validator
 
 import (
+	"encoding/json"
 	"fmt"
 	"go/ast"
 	"go/token"
@@ -19,7 +20,7 @@ func getExprColumnRange(fset *token.FileSet, expr ast.Expr) (startCol, endCol in
 	return pos.Column, endPos.Column
 }
 
-func AnalyzeDir(dir string) AnalysisResult {
+func AnalyzeDir(dir string, contextFile string) AnalysisResult {
 	result := AnalysisResult{}
 	fset := token.NewFileSet()
 
@@ -181,7 +182,106 @@ func AnalyzeDir(dir string) AnalysisResult {
 		})
 	}
 
+	if contextFile != "" {
+		result.RenderCalls = enrichRenderCallsWithContext(result.RenderCalls, contextFile, pkgs, structIndex)
+	}
+
 	return result
+}
+
+func enrichRenderCallsWithContext(calls []RenderCall, contextFile string, pkgs []*packages.Package, structIndex map[string]structIndexEntry) []RenderCall {
+	data, err := os.ReadFile(contextFile)
+	if err != nil {
+		return calls
+	}
+	var config map[string]map[string]string
+	if err := json.Unmarshal(data, &config); err != nil {
+		return calls
+	}
+
+	typeMap := make(map[string]types.Type)
+	for _, pkg := range pkgs {
+		if pkg.Types != nil {
+			scope := pkg.Types.Scope()
+			for _, name := range scope.Names() {
+				obj := scope.Lookup(name)
+				if typeName, ok := obj.(*types.TypeName); ok {
+					key := pkg.Types.Name() + "." + name
+					typeMap[key] = typeName.Type()
+				}
+			}
+		}
+	}
+
+	globalVars := buildTemplateVars(config["global"], typeMap, structIndex)
+
+	seenTpls := make(map[string]bool)
+
+	for i, call := range calls {
+		seenTpls[call.Template] = true
+		var newVars []TemplateVar
+		newVars = append(newVars, globalVars...)
+		if tplVars, ok := config[call.Template]; ok {
+			newVars = append(newVars, buildTemplateVars(tplVars, typeMap, structIndex)...)
+		}
+		newVars = append(newVars, call.Vars...)
+		calls[i].Vars = newVars
+	}
+
+	for tplName, tplVars := range config {
+		if tplName == "global" {
+			continue
+		}
+		if !seenTpls[tplName] {
+			var newVars []TemplateVar
+			newVars = append(newVars, globalVars...)
+			newVars = append(newVars, buildTemplateVars(tplVars, typeMap, structIndex)...)
+			calls = append(calls, RenderCall{
+				File:     "context-file",
+				Line:     1,
+				Template: tplName,
+				Vars:     newVars,
+			})
+		}
+	}
+
+	return calls
+}
+
+func buildTemplateVars(varDefs map[string]string, typeMap map[string]types.Type, structIndex map[string]structIndexEntry) []TemplateVar {
+	var vars []TemplateVar
+	for name, typeStr := range varDefs {
+		tv := TemplateVar{Name: name, TypeStr: typeStr}
+
+		baseTypeStr := typeStr
+		isSlice := false
+		for strings.HasPrefix(baseTypeStr, "[]") || strings.HasPrefix(baseTypeStr, "*") {
+			if strings.HasPrefix(baseTypeStr, "[]") {
+				isSlice = true
+				baseTypeStr = baseTypeStr[2:]
+			} else {
+				baseTypeStr = baseTypeStr[1:]
+			}
+		}
+
+		if t, ok := typeMap[baseTypeStr]; ok {
+			seen := make(map[string]bool)
+			fields, doc := extractFieldsWithDocs(t, structIndex, seen)
+			tv.Fields = fields
+			tv.Doc = doc
+			if isSlice {
+				tv.IsSlice = true
+				tv.ElemType = baseTypeStr
+			}
+		} else {
+			if isSlice {
+				tv.IsSlice = true
+				tv.ElemType = baseTypeStr
+			}
+		}
+		vars = append(vars, tv)
+	}
+	return vars
 }
 
 // structKey returns a stable map key for a named type, qualified by package

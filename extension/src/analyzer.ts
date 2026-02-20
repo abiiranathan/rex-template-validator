@@ -14,7 +14,7 @@ export class GoAnalyzer {
   }
 
   private resolveAnalyzerPath(context: vscode.ExtensionContext): string {
-    const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+    const config = vscode.workspace.getConfiguration('rex-analyzer');
     const configPath = config.get<string>('goAnalyzerPath');
 
     if (configPath && fs.existsSync(configPath)) {
@@ -35,16 +35,22 @@ export class GoAnalyzer {
    *
    * The analyzer is invoked with:
    *   -dir <workspaceRoot/sourceDir>   (absolute path to Go source)
-   *   -template-root <templateRoot>     (relative to -dir)
+   *   -template-root <templateRoot>     (relative to -dir or -template-base-dir)
    *   -validate
    *
    * cwd is set to workspaceRoot so relative paths in output stay predictable.
    */
   async analyzeWorkspace(workspaceRoot: string): Promise<AnalysisResult> {
-    const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+    const config = vscode.workspace.getConfiguration('rex-analyzer');
     const sourceDir: string = config.get('sourceDir') ?? '.';
     const templateRoot: string = config.get('templateRoot') ?? '';
     const templateBaseDir: string = config.get('templateBaseDir') ?? '';
+    const contextFile: string = config.get('contextFile') ?? '';
+
+    this.outputChannel.appendLine(`SourceDir: ${sourceDir}`)
+    this.outputChannel.appendLine(`templateRoot: ${templateRoot}`)
+    this.outputChannel.appendLine(`templateBaseDir: ${templateBaseDir}`)
+    this.outputChannel.appendLine(`contextFile: ${contextFile}`)
 
     // Resolve the Go source directory to an absolute path
     const absSourceDir = path.resolve(workspaceRoot, sourceDir);
@@ -55,10 +61,23 @@ export class GoAnalyzer {
     }
 
     const args = ['-dir', absSourceDir, '-validate'];
-    args.push('-template-base-dir', templateBaseDir || workspaceRoot);
+
+    // Only pass template-base-dir if explicitly set, otherwise let Go analyzer default to sourceDir
+    if (templateBaseDir) {
+      args.push('-template-base-dir', templateBaseDir || workspaceRoot);
+    }
 
     if (templateRoot) {
       args.push('-template-root', templateRoot);
+    }
+
+    if (contextFile) {
+      const absContextFile = path.resolve(workspaceRoot, contextFile);
+      if (fs.existsSync(absContextFile)) {
+        args.push('-context-file', absContextFile);
+      } else {
+        this.outputChannel.appendLine(`[Analyzer] Context file not found: ${absContextFile}`);
+      }
     }
 
     this.outputChannel.appendLine(`[Analyzer] Running: ${this.analyzerPath} ${args.join(' ')}`);

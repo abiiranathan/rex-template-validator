@@ -1,9 +1,9 @@
 {
-  "name": "rex-template-validator",
-  "displayName": "Rex Template Validator",
-  "description": "Validates Go template variables in .html/.tmpl files used with the rex framework",
+  "name": "rex-analyzer",
+  "displayName": "Golang Template Validator and Language Server",
+  "description": "Validates Go template variables in .html/.tmpl files used with the rex web framework",
   "version": "0.2.0",
-  "publisher": "Nabiizy",
+  "publisher": "Dr. Abiira Nathan",
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -17,10 +17,12 @@
     "template",
     "html",
     "rex",
-    "validation"
+    "validation",
+    "Html Language Server"
   ],
   "activationEvents": [
     "workspaceContains:**/*.go",
+    "workspaceContains:**/go.mod",
     "onLanguage:html",
     "onLanguage:go-template"
   ],
@@ -28,24 +30,24 @@
   "contributes": {
     "commands": [
       {
-        "command": "rexTemplateValidator.validate",
+        "command": "rexAnalyzer.validate",
         "title": "Rex: Validate Template Variables",
         "icon": "$(check-all)"
       },
       {
-        "command": "rexTemplateValidator.rebuildIndex",
+        "command": "rexAnalyzer.rebuildIndex",
         "title": "Rex: Rebuild Template Index",
         "icon": "$(refresh)"
       },
       {
-        "command": "rexTemplateValidator.showKnowledgeGraph",
+        "command": "rexAnalyzer.showKnowledgeGraph",
         "title": "Rex: Show Template Knowledge Graph"
       }
     ],
     "menus": {
       "editor/title": [
         {
-          "command": "rexTemplateValidator.validate",
+          "command": "rexAnalyzer.validate",
           "when": "resourceExtname == .html || resourceExtname == .tmpl",
           "group": "navigation"
         }
@@ -54,32 +56,37 @@
     "configuration": {
       "title": "Rex Template Validator",
       "properties": {
-        "rexTemplateValidator.goAnalyzerPath": {
+        "rex-analyzer.goAnalyzerPath": {
           "type": "string",
           "default": "",
           "description": "Path to the rex-analyzer binary. Leave empty to use the bundled binary."
         },
-        "rexTemplateValidator.sourceDir": {
+        "rex-analyzer.sourceDir": {
           "type": "string",
           "default": ".",
           "description": "Go source directory relative to the workspace root, passed as the -dir flag to the CLI (e.g. 'sample' if your Go files live in a subdirectory)."
         },
-        "rexTemplateValidator.templateRoot": {
+        "rex-analyzer.templateRoot": {
           "type": "string",
           "default": "",
           "description": "Root directory for templates, relative to sourceDir, passed as the -template-root flag (e.g. 'templates')."
         },
-        "rexTemplateValidator.templateBaseDir": {
+        "rex-analyzer.templateBaseDir": {
           "type": "string",
           "default": "",
           "description": "Base directory for templates, relative to the workspace root, used as the -template-base-dir flag. If empty, defaults to the workspace root."
         },
-        "rexTemplateValidator.debounceMs": {
+        "rex-analyzer.contextFile": {
+          "type": "string",
+          "default": "",
+          "description": "Path to a JSON file containing additional context variables (e.g. injected by middleware). Can be absolute or relative to workspace root."
+        },
+        "rex-analyzer.debounceMs": {
           "type": "number",
           "default": 1500,
           "description": "Debounce delay in milliseconds before re-validating on file change."
         },
-        "rexTemplateValidator.enableAutoValidate": {
+        "rex-analyzer.enableAutoValidate": {
           "type": "boolean",
           "default": true,
           "description": "Automatically validate templates on save."

@@ -25,16 +25,32 @@ export class KnowledgeGraphBuilder {
     this.outputChannel = outputChannel;
   }
 
+  /**
+   * Resolves the base directory for templates by combining workspaceRoot, 
+   * sourceDir, templateBaseDir, and templateRoot correctly.
+   */
+  private getTemplateBase(): string {
+    const config = vscode.workspace.getConfiguration('rex-analyzer');
+    const sourceDir: string = config.get('sourceDir') ?? '.';
+    const templateBaseDir: string = config.get('templateBaseDir') ?? '';
+    const templateRoot: string = config.get('templateRoot') ?? '';
+
+    // If templateBaseDir is not set, default to sourceDir (matching Go analyzer behavior)
+    const baseDir = templateBaseDir
+      ? path.resolve(this.workspaceRoot, templateBaseDir)
+      : path.resolve(this.workspaceRoot, sourceDir);
+
+    return path.join(baseDir, templateRoot);
+  }
+
   build(analysisResult: AnalysisResult): KnowledgeGraph {
     const templates = new Map<string, TemplateContext>();
-    const config = vscode.workspace.getConfiguration('rexTemplateValidator');
-    const sourceDir: string = config.get('sourceDir') ?? '.';
-    const templateRoot: string = config.get('templateRoot') ?? '';
+    const templateBase = this.getTemplateBase();
 
     for (const rc of analysisResult.renderCalls ?? []) {
       const logicalPath = rc.template.replace(/^\.\//, '');
 
-      const absPath = path.join(this.workspaceRoot, sourceDir, templateRoot, logicalPath);
+      const absPath = path.join(templateBase, logicalPath);
 
       let ctx = templates.get(logicalPath);
       if (!ctx) {
@@ -83,11 +99,7 @@ export class KnowledgeGraphBuilder {
    * Handles templateRoot stripping and fuzzy suffix matching.
    */
   findContextForFile(absolutePath: string): TemplateContext | undefined {
-    const config = vscode.workspace.getConfiguration('rexTemplateValidator');
-    const sourceDir: string = config.get('sourceDir') ?? '.';
-    const templateRoot: string = config.get('templateRoot') ?? '';
-
-    const templateBase = path.join(this.workspaceRoot, sourceDir, templateRoot);
+    const templateBase = this.getTemplateBase();
     let rel = path.relative(templateBase, absolutePath).replace(/\\/g, '/');
 
     if (this.graph.templates.has(rel)) {
@@ -124,11 +136,7 @@ export class KnowledgeGraphBuilder {
       }
     }
 
-    const config = vscode.workspace.getConfiguration('rexTemplateValidator');
-    const sourceDir: string = config.get('sourceDir') ?? '.';
-    const templateRoot: string = config.get('templateRoot') ?? '';
-
-    const templateBase = path.join(this.workspaceRoot, sourceDir, templateRoot);
+    const templateBase = this.getTemplateBase();
     const candidates = [
       path.join(path.dirname(currentFile), partialName),
       path.join(templateBase, partialName),
@@ -155,11 +163,7 @@ export class KnowledgeGraphBuilder {
    * and what context they pass to it, then resolves the correct vars.
    */
   findContextForFileAsPartial(absolutePath: string): TemplateContext | undefined {
-    const config = vscode.workspace.getConfiguration('rexTemplateValidator');
-    const sourceDir: string = config.get('sourceDir') ?? '.';
-    const templateRoot: string = config.get('templateRoot') ?? '';
-
-    const templateBase = path.join(this.workspaceRoot, sourceDir, templateRoot);
+    const templateBase = this.getTemplateBase();
     let partialRelPath = path.relative(templateBase, absolutePath).replace(/\\/g, '/');
     const partialBasename = path.basename(absolutePath);
 
@@ -318,7 +322,7 @@ export class KnowledgeGraphBuilder {
    * Resolve a Go source file path (relative to sourceDir) to an absolute path.
    */
   resolveGoFilePath(relativeFile: string): string | null {
-    const config = vscode.workspace.getConfiguration('rexTemplateValidator');
+    const config = vscode.workspace.getConfiguration('rex-analyzer');
     const sourceDir: string = config.get('sourceDir') ?? '.';
 
     const abs = path.join(this.workspaceRoot, sourceDir, relativeFile);
@@ -329,10 +333,6 @@ export class KnowledgeGraphBuilder {
    * Resolve a template path to an absolute file path.
    */
   resolveTemplatePath(templatePath: string): string | null {
-    const config = vscode.workspace.getConfiguration('rexTemplateValidator');
-    const sourceDir: string = config.get('sourceDir') ?? '.';
-    const templateRoot: string = config.get('templateRoot') ?? '';
-
     const ctx = this.graph.templates.get(templatePath);
     if (ctx?.absolutePath && fs.existsSync(ctx.absolutePath)) {
       return ctx.absolutePath;
@@ -346,7 +346,10 @@ export class KnowledgeGraphBuilder {
       }
     }
 
-    const templateBase = path.join(this.workspaceRoot, sourceDir, templateRoot);
+    const templateBase = this.getTemplateBase();
+    const config = vscode.workspace.getConfiguration('rex-analyzer');
+    const sourceDir: string = config.get('sourceDir') ?? '.';
+
     const candidates = [
       path.join(templateBase, templatePath),
       path.join(this.workspaceRoot, templatePath),
