@@ -17,8 +17,8 @@ export class TemplateValidator {
 
   // ── Public API ─────────────────────────────────────────────────────────────
 
-  async validateDocument(document: vscode.TextDocument): Promise<vscode.Diagnostic[]> {
-    const ctx = this.graphBuilder.findContextForFile(document.uri.fsPath);
+  async validateDocument(document: vscode.TextDocument, providedCtx?: TemplateContext): Promise<vscode.Diagnostic[]> {
+    const ctx = providedCtx || this.graphBuilder.findContextForFile(document.uri.fsPath);
 
     if (!ctx) {
       return [
@@ -268,7 +268,13 @@ export class TemplateValidator {
     );
 
     try {
-      const content = fs.readFileSync(partialCtx.absolutePath, 'utf8');
+      let content = '';
+      const openDoc = vscode.workspace.textDocuments.find(d => d.uri.fsPath === partialCtx.absolutePath);
+      if (openDoc) {
+        content = openDoc.getText();
+      } else {
+        content = fs.readFileSync(partialCtx.absolutePath, 'utf8');
+      }
       const partialErrors = this.validate(content, { ...partialCtx, vars: partialVars }, partialCtx.absolutePath);
       for (const e of partialErrors) {
         errors.push({
@@ -336,13 +342,21 @@ export class TemplateValidator {
 
   // ── Hover ──────────────────────────────────────────────────────────────────
 
-  getHoverInfo(
+  async getHoverInfo(
     document: vscode.TextDocument,
     position: vscode.Position,
     ctx: TemplateContext
-  ): vscode.Hover | null {
+  ): Promise<vscode.Hover | null> {
     const content = document.getText();
     const nodes = this.parser.parse(content);
+
+    // Check if hovering over a block/define/partial name
+    const blockHover = this.findTemplateNameHover(nodes, position);
+    if (blockHover) {
+      const md = new vscode.MarkdownString();
+      md.appendMarkdown(`**Template Block:** \`${blockHover}\`\n`);
+      return new vscode.Hover(md);
+    }
 
     const hit = this.findNodeAtPosition(nodes, position, ctx.vars, []);
     if (!hit) return null;
@@ -456,16 +470,16 @@ export class TemplateValidator {
    * - Template variables → jumps to c.Render() call in Go code
    * - Partial template names → jumps to the template file
    */
-  getDefinitionLocation(
+  async getDefinitionLocation(
     document: vscode.TextDocument,
     position: vscode.Position,
     ctx: TemplateContext
-  ): vscode.Location | null {
+  ): Promise<vscode.Location | null> {
     const content = document.getText();
     const nodes = this.parser.parse(content);
 
     // First, check if cursor is on a partial/template name
-    const partialLocation = this.findPartialDefinitionAtPosition(
+    const partialLocation = await this.findPartialDefinitionAtPosition(
       nodes,
       position,
       ctx
@@ -787,54 +801,95 @@ export class TemplateValidator {
     return null;
   }
 
-  /**
-   * Check if cursor is on a partial/template name in {{ template "name" . }}
-   * and return the location of the template file.
-   */
-  private findPartialDefinitionAtPosition(
-    nodes: TemplateNode[],
-    position: vscode.Position,
-    ctx: TemplateContext
-  ): vscode.Location | null {
+  private findTemplateNameHover(nodes: TemplateNode[], position: vscode.Position): string | null {
     for (const node of nodes) {
-      // Check if this is a partial node
-      if (node.kind === 'partial' && node.partialName) {
+      if ((node.kind === 'partial' && node.partialName) || 
+          (node.kind === 'block' && node.blockName) || 
+          (node.kind === 'define' && node.blockName)) {
+        
+        const name = node.partialName || node.blockName!;
         const startLine = node.line - 1;
         const startCol = node.col - 1;
 
-        // Calculate where the template name appears in the raw text
-        // {{ template "name" . }}
-        // The name is inside quotes after "template "
-        const templateKeywordMatch = node.rawText.match(/\{\{\s*template\s+/);
-        if (!templateKeywordMatch) continue;
+        const keywordMatch = node.rawText.match(/\{\{\s*(template|block|define)\s+/);
+        if (keywordMatch) {
+          const nameMatch = node.rawText.match(new RegExp(`\\{\\{\\s*(template|block|define)\\s+"([^"]+)"`));
+          if (nameMatch && nameMatch[2] === name) {
+            const nameStartOffset = node.rawText.indexOf('"' + name + '"') + 1;
+            const nameStartCol = startCol + nameStartOffset;
+            const nameEndCol = nameStartCol + name.length;
 
-        const nameMatch = node.rawText.match(/\{\{\s*template\s+"([^"]+)"/);
-        if (!nameMatch) continue;
+            if (
+              position.line === startLine &&
+              position.character >= nameStartCol &&
+              position.character <= nameEndCol
+            ) {
+              return name;
+            }
+          }
+        }
+      }
 
-        const nameStartOffset = node.rawText.indexOf('"' + nameMatch[1] + '"') + 1;
-        const nameStartCol = startCol + nameStartOffset;
-        const nameEndCol = nameStartCol + nameMatch[1].length;
+      if (node.children) {
+        const found = this.findTemplateNameHover(node.children, position);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
 
-        // Check if cursor is on the template name
-        if (
-          position.line === startLine &&
-          position.character >= nameStartCol &&
-          position.character <= nameEndCol
-        ) {
-          // Resolve the template name to a file
-          const templatePath = this.graphBuilder.resolveTemplatePath(node.partialName);
-          if (templatePath) {
-            return new vscode.Location(
-              vscode.Uri.file(templatePath),
-              new vscode.Position(0, 0)
-            );
+  /**
+   * Check if cursor is on a partial/template/block name in {{ template "name" . }}
+   * and return the location of the template file or define block.
+   */
+  private async findPartialDefinitionAtPosition(
+    nodes: TemplateNode[],
+    position: vscode.Position,
+    ctx: TemplateContext
+  ): Promise<vscode.Location | null> {
+    for (const node of nodes) {
+      // Check if this is a partial, block, or define node
+      if ((node.kind === 'partial' && node.partialName) || 
+          (node.kind === 'block' && node.blockName) || 
+          (node.kind === 'define' && node.blockName)) {
+        
+        const name = node.partialName || node.blockName!;
+        const startLine = node.line - 1;
+        const startCol = node.col - 1;
+
+        const keywordMatch = node.rawText.match(/\{\{\s*(template|block|define)\s+/);
+        if (keywordMatch) {
+          const nameMatch = node.rawText.match(new RegExp(`\\{\\{\\s*(template|block|define)\\s+"([^"]+)"`));
+          if (nameMatch && nameMatch[2] === name) {
+            const nameStartOffset = node.rawText.indexOf('"' + name + '"') + 1;
+            const nameStartCol = startCol + nameStartOffset;
+            const nameEndCol = nameStartCol + name.length;
+
+            // Check if cursor is on the template name
+            if (
+              position.line === startLine &&
+              position.character >= nameStartCol &&
+              position.character <= nameEndCol
+            ) {
+              if (isFileBasedPartial(name)) {
+                const templatePath = this.graphBuilder.resolveTemplatePath(name);
+                if (templatePath) {
+                  return new vscode.Location(
+                    vscode.Uri.file(templatePath),
+                    new vscode.Position(0, 0)
+                  );
+                }
+              } else {
+                return await this.findNamedBlockDefinition(name, ctx);
+              }
+            }
           }
         }
       }
 
       // Recurse into children
       if (node.children) {
-        const found = this.findPartialDefinitionAtPosition(
+        const found = await this.findPartialDefinitionAtPosition(
           node.children,
           position,
           ctx
@@ -843,6 +898,61 @@ export class TemplateValidator {
       }
     }
 
+    return null;
+  }
+
+  private async findNamedBlockDefinition(name: string, ctx: TemplateContext): Promise<vscode.Location | null> {
+    const graph = this.graphBuilder.getGraph();
+    if (!graph) return null;
+
+    const defineRegex = new RegExp(`\\{\\{\\s*(?:define|block)\\s+"${name}"`);
+
+    // Prioritize current file
+    const filesToSearch = [ctx.absolutePath];
+    for (const [_, tctx] of graph.templates) {
+      if (tctx.absolutePath !== ctx.absolutePath) {
+        filesToSearch.push(tctx.absolutePath);
+      }
+    }
+
+    for (const filePath of filesToSearch) {
+      try {
+        let content = '';
+        const openDoc = vscode.workspace.textDocuments.find(d => d.uri.fsPath === filePath);
+        if (openDoc) {
+          content = openDoc.getText();
+        } else {
+          if (!fs.existsSync(filePath)) continue;
+          content = await fs.promises.readFile(filePath, 'utf-8');
+        }
+        
+        if (!defineRegex.test(content)) continue;
+
+        const nodes = this.parser.parse(content);
+        const defNode = this.findDefineNodeInAST(nodes, name);
+        if (defNode) {
+          return new vscode.Location(
+            vscode.Uri.file(filePath),
+            new vscode.Position(defNode.line - 1, defNode.col - 1)
+          );
+        }
+      } catch (err) {
+        // ignore
+      }
+    }
+    return null;
+  }
+
+  private findDefineNodeInAST(nodes: TemplateNode[], name: string): TemplateNode | null {
+    for (const node of nodes) {
+      if ((node.kind === 'define' || node.kind === 'block') && node.blockName === name) {
+        return node;
+      }
+      if (node.children) {
+        const found = this.findDefineNodeInAST(node.children, name);
+        if (found) return found;
+      }
+    }
     return null;
   }
 

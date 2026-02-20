@@ -77,7 +77,7 @@ export async function activate(context: vscode.ExtensionContext) {
   // Hover
   context.subscriptions.push(
     vscode.languages.registerHoverProvider(TEMPLATE_SELECTOR, {
-      provideHover(document, position) {
+      async provideHover(document, position) {
         if (!validator || !graphBuilder) return;
         let ctx = graphBuilder.findContextForFile(document.uri.fsPath);
         // If this file has no render calls or wasn't found, it might be a partial used by other templates
@@ -89,7 +89,7 @@ export async function activate(context: vscode.ExtensionContext) {
           }
         }
         if (!ctx) return;
-        return validator.getHoverInfo(document, position, ctx);
+        return await validator.getHoverInfo(document, position, ctx);
       },
     })
   );
@@ -121,7 +121,7 @@ export async function activate(context: vscode.ExtensionContext) {
   // Go to Definition — jumps from template variable to the c.Render() call in Go
   context.subscriptions.push(
     vscode.languages.registerDefinitionProvider(TEMPLATE_SELECTOR, {
-      provideDefinition(document, position) {
+      async provideDefinition(document, position) {
         if (!validator || !graphBuilder) return;
         let ctx = graphBuilder.findContextForFile(document.uri.fsPath);
         // If this file has no render calls or wasn't found, it might be a partial used by other templates
@@ -133,7 +133,7 @@ export async function activate(context: vscode.ExtensionContext) {
           }
         }
         if (!ctx) return;
-        return validator.getDefinitionLocation(document, position, ctx);
+        return await validator.getDefinitionLocation(document, position, ctx);
       },
     })
   );
@@ -174,10 +174,14 @@ export async function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // Validate on open/save
+  // Validate on open/change/save
   context.subscriptions.push(
     vscode.workspace.onDidOpenTextDocument((doc) => {
       if (isTemplate(doc)) scheduleValidate(doc);
+    }),
+
+    vscode.workspace.onDidChangeTextDocument((e) => {
+      if (isTemplate(e.document)) scheduleValidate(e.document);
     }),
 
     vscode.workspace.onDidSaveTextDocument((doc) => {
@@ -348,7 +352,7 @@ async function validateDocument(doc: vscode.TextDocument) {
     return;
   }
 
-  const diagnostics = await validator.validateDocument(doc);
+  const diagnostics = await validator.validateDocument(doc, ctx);
   editorCollection.set(doc.uri, diagnostics);
 }
 
