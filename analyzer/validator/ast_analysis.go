@@ -88,15 +88,65 @@ func AnalyzeDir(dir string) AnalysisResult {
 			if !ok {
 				return true
 			}
-			sel, ok := call.Fun.(*ast.SelectorExpr)
-			if !ok {
+
+			// Determine the function name and the argument index of the template path.
+			//
+			// We support two calling conventions:
+			//   1. Method call:  c.Render("tmpl.html", data)
+			//                    c.ExecuteTemplate(w, "tmpl.html", data)
+			//      The function is a SelectorExpr; the template path is Args[0].
+			//
+			//   2. Plain function call: Render(w, "tmpl.html", data)
+			//      The function is an Ident; we look for a string literal among
+			//      Args to identify the template path argument.
+			//
+			// In both cases we require at least 2 arguments total.
+
+			funcName := ""
+			templateArgIdx := 0 // index of the template path string in call.Args
+
+			switch fn := call.Fun.(type) {
+			case *ast.SelectorExpr:
+				funcName = fn.Sel.Name
+				// Method call: first arg is the template path.
+				templateArgIdx = 0
+			case *ast.Ident:
+				funcName = fn.Name
+				// Plain function call: the template path may be the first or second
+				// argument (e.g. Render(w, "tmpl.html", data)). Find the first
+				// string-literal argument and use that as the template path, taking
+				// the argument immediately after it as the data argument.
+				templateArgIdx = -1 // will be resolved below
+			}
+
+			if funcName != "Render" && funcName != "ExecuteTemplate" {
 				return true
 			}
 
-			if (sel.Sel.Name != "Render" && sel.Sel.Name != "ExecuteTemplate") || len(call.Args) < 2 {
+			if len(call.Args) < 2 {
 				return true
 			}
-			templatePathExpr := call.Args[0]
+
+			// For plain function calls, find the first string-literal argument.
+			if templateArgIdx == -1 {
+				for i, arg := range call.Args {
+					if lit, ok := arg.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+						templateArgIdx = i
+						break
+					}
+				}
+				if templateArgIdx == -1 {
+					return true // no string literal found — not a recognized pattern
+				}
+			}
+
+			// Ensure we have a data argument after the template path.
+			dataArgIdx := templateArgIdx + 1
+			if dataArgIdx >= len(call.Args) {
+				return true
+			}
+
+			templatePathExpr := call.Args[templateArgIdx]
 			templatePath := extractString(templatePathExpr)
 
 			tplNameStartCol, tplNameEndCol := getExprColumnRange(fset, templatePathExpr)
@@ -109,7 +159,7 @@ func AnalyzeDir(dir string) AnalysisResult {
 				return true
 			}
 
-			vars := extractMapVars(call.Args[1], info, fset, structIndex)
+			vars := extractMapVars(call.Args[dataArgIdx], info, fset, structIndex)
 
 			pos := fset.Position(call.Pos())
 			relFile := pos.Filename
@@ -248,14 +298,21 @@ func extractMapVars(expr ast.Expr, info *types.Info, fset *token.FileSet, struct
 
 		if typeInfo, ok := info.Types[kv.Value]; ok {
 			tv.TypeStr = normalizeTypeStr(typeInfo.Type.String())
-			// seen guards against infinite recursion on self-referential types.
+
+			// Create a fresh seen map per top-level variable so that the same
+			// struct type can appear under different variable names without being
+			// suppressed. Cycles within a single variable's type tree are still
+			// prevented — the same type key cannot appear twice in one path.
 			seen := make(map[string]bool)
 			tv.Fields, tv.Doc = extractFieldsWithDocs(typeInfo.Type, structIndex, seen)
 
 			if elemType := getElementType(typeInfo.Type); elemType != nil {
 				tv.IsSlice = true
 				tv.ElemType = normalizeTypeStr(elemType.String())
-				elemFields, elemDoc := extractFieldsWithDocs(elemType, structIndex, seen)
+				// Create a fresh seen map for element type extraction — the slice
+				// element type may be the same struct that appears elsewhere.
+				elemSeen := make(map[string]bool)
+				elemFields, elemDoc := extractFieldsWithDocs(elemType, structIndex, elemSeen)
 				tv.Fields = elemFields
 				if elemDoc != "" {
 					tv.Doc = elemDoc
@@ -328,6 +385,8 @@ func normalizeTypeStr(s string) string {
 	}
 }
 
+// getElementType unwraps slices (and pointer-to-slice) to return the element
+// type. Returns nil for non-slice types.
 func getElementType(t types.Type) types.Type {
 	switch v := t.(type) {
 	case *types.Slice:
@@ -340,6 +399,9 @@ func getElementType(t types.Type) types.Type {
 	return nil
 }
 
+// extractFieldsWithDocs recursively extracts exported fields (and their nested
+// fields) from a named struct type. The seen map prevents infinite loops on
+// self-referential types; callers should pass a fresh map per extraction root.
 func extractFieldsWithDocs(t types.Type, structIndex map[string]structIndexEntry, seen map[string]bool) ([]FieldInfo, string) {
 	if t == nil {
 		return nil, ""
@@ -353,7 +415,8 @@ func extractFieldsWithDocs(t types.Type, structIndex map[string]structIndexEntry
 		return nil, ""
 	}
 
-	// Cycle guard: if we've already started processing this type, stop.
+	// Cycle guard: if we've already started processing this type in the current
+	// extraction tree, stop to prevent infinite recursion.
 	key := structKey(named)
 	if seen[key] {
 		return nil, ""
@@ -394,10 +457,20 @@ func extractFieldsWithDocs(t types.Type, structIndex map[string]structIndexEntry
 		if ptr, ok := ft.(*types.Pointer); ok {
 			ft = ptr.Elem()
 		}
+
 		if slice, ok := ft.(*types.Slice); ok {
+			// Slice field — extract element type's fields.
+			// Use a copy of seen so that processing sibling slices of the same
+			// type doesn't suppress each other.
 			fi.IsSlice = true
-			fi.Fields, _ = extractFieldsWithDocs(slice.Elem(), structIndex, seen)
+			elemSeen := copySeenMap(seen)
+			fi.Fields, _ = extractFieldsWithDocs(slice.Elem(), structIndex, elemSeen)
 		} else {
+			// Non-slice field — recurse into the field's type.
+			// Pass the shared seen map so the cycle guard works across the whole
+			// current path, but siblings of the same type can still be processed
+			// independently (they would each have been added to seen on their own
+			// path, not on a sibling path).
 			fi.Fields, _ = extractFieldsWithDocs(ft, structIndex, seen)
 		}
 
@@ -420,6 +493,16 @@ func extractFieldsWithDocs(t types.Type, structIndex map[string]structIndexEntry
 	}
 
 	return fields, entry.doc
+}
+
+// copySeenMap creates a shallow copy of a seen map so that an independent
+// traversal branch can track its own cycle detection without affecting siblings.
+func copySeenMap(src map[string]bool) map[string]bool {
+	dst := make(map[string]bool, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
 }
 
 type fieldInfo struct {

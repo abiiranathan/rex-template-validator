@@ -131,7 +131,7 @@ export class TemplateParser {
         if (words.length >= 2) {
           blockExpr = words.slice(1).join(' ');
         }
-        
+
         const child = this.buildTree(tokens, pos + 1);
         nodes.push({
           kind: 'block',
@@ -213,19 +213,16 @@ export class TemplateParser {
     // 1. Strip assignment LHS: $var := ... or $a, $b := ...
     const assignMatch = inner.match(/^\s*(?:\$[\w\d_]+(?:\s*,\s*\$[\w\d_]+)?)\s*:=\s*(.*)/);
     if (assignMatch) {
-       inner = assignMatch[1]; 
+      inner = assignMatch[1];
     }
 
     // 2. Scan for references starting with . or $
     // Matches: .Field, $Var, $.Field, ., $
     const refs = inner.match(/((?:\$|\.)[\w\d_.]*)/g);
-    
+
     if (refs) {
       for (const ref of refs) {
-        // Filter out cases where regex matches inside a number (e.g. 1.23 -> .23) if necessary.
-        // But our regex starts with $ or . so 1.23 won't match .23 unless it is space separated?
-        // Actually .23 matches \.[\w\d_.]* 
-        // We can add a check if it looks like a number.
+        // Skip purely numeric decimals like .23
         if (/^\.\d+$/.test(ref)) continue;
 
         // Skip ellipsis "..."
@@ -250,6 +247,7 @@ export class TemplateParser {
    * ".Visit.Doctor.Name" → ["Visit", "Doctor", "Name"]
    * "."                  → ["."]   (bare dot = current scope)
    * ".Items"             → ["Items"]
+   * "$.User.Name"        → ["$", "User", "Name"]
    */
   parseDotPath(expr: string): string[] {
     // Strip variable assignment prefix "$v := "
@@ -265,6 +263,22 @@ export class TemplateParser {
     if (pathPart === '.' || pathPart === '') return ['.'];
     if (!pathPart.startsWith('.') && !pathPart.startsWith('$')) return [];
 
+    // Handle "$." root access — becomes ["$", ...rest]
+    if (pathPart.startsWith('$.')) {
+      const rest = pathPart.slice(2).split('.').filter(p => p.length > 0);
+      return ['$', ...rest];
+    }
+
+    // Handle bare "$" — root context reference
+    if (pathPart === '$') return ['$'];
+
+    // Handle "$varName" (local variable, not root access)
+    if (pathPart.startsWith('$')) {
+      const parts = pathPart.split('.');
+      return parts.filter(p => p.length > 0);
+    }
+
+    // Normal dot path: ".A.B.C" → ["A", "B", "C"]
     return pathPart.split('.').filter(p => p.length > 0);
   }
 }
@@ -290,6 +304,12 @@ export interface ResolveResult {
  *
  * Scope stack is innermost-last. The topmost frame with key "." represents
  * the current implicit dot (inside range/with blocks).
+ *
+ * Path semantics:
+ *   ["."]              → bare dot, current scope
+ *   ["$"]              → root context
+ *   ["$", "User", ...] → root-anchored access via $.User...
+ *   ["User", "Profile", "Address", "City"] → traverse vars then fields
  */
 export function resolvePath(
   path: string[],
@@ -307,45 +327,36 @@ export function resolvePath(
     return { typeStr: 'context', found: true };
   }
 
-  // Handle $. explicitly - root context
+  // Root context "$" — exposes all top-level vars
+  if (path[0] === '$' && path.length === 1) {
+    return { typeStr: 'context', found: true };
+  }
+
+  // Root-anchored path "$." → resolve against root vars, bypassing scope stack
   if (path[0] === '$') {
-     // If just "$" -> root context itself (though unusual to use alone)
-     if (path.length === 1) return { typeStr: 'context', found: true, fields: [...vars.values()] as any };
-     
-     // $.Field -> resolve against root vars
-     const topVar = vars.get(path[1]);
-     if (!topVar) return { typeStr: 'unknown', found: false };
-     
-     if (path.length === 2) {
-         return { typeStr: topVar.type, found: true, fields: topVar.fields, isSlice: topVar.isSlice };
-     }
-     return resolveFields(path.slice(2), topVar.fields ?? []);
-  }
-
-  // Path starts with explicit "$var"
-  if (path[0].startsWith('$')) {
-    for (let i = scopeStack.length - 1; i >= 0; i--) {
-      const frame = scopeStack[i];
-      if (frame.key === path[0]) {
-        if (path.length === 1) return { typeStr: frame.typeStr, found: true, fields: frame.fields };
-        return resolveFields(path.slice(1), frame.fields ?? []);
-      }
+    const remaining = path.slice(1); // e.g. ["User", "Name"]
+    const topVar = vars.get(remaining[0]);
+    if (!topVar) return { typeStr: 'unknown', found: false };
+    if (remaining.length === 1) {
+      return { typeStr: topVar.type, found: true, fields: topVar.fields, isSlice: topVar.isSlice };
     }
-    return { typeStr: 'unknown', found: false };
+    return resolveFields(remaining.slice(1), topVar.fields ?? []);
   }
 
-  // Path inside a with/range scope → check dot frame fields first
+  // Path inside a with/range scope → check the active dot frame first.
+  // Only fall through to top-level vars for explicit "$"-prefixed paths.
   const dotFrame = findDotFrame(scopeStack);
   if (dotFrame) {
     if (dotFrame.fields) {
-      const res = resolveFields(path, dotFrame.fields);
+      const res = resolveFieldsDeep(path, dotFrame.fields);
       if (res.found) return res;
     }
-    // If inside a scoped block, do NOT fall through to top-level vars for dot-paths.
+    // Not found in dot frame — do NOT silently fall through to root vars.
+    // This correctly surfaces errors for unknown fields inside scoped blocks.
     return { typeStr: 'unknown', found: false };
   }
 
-  // Fall through to top-level vars
+  // Root scope: resolve against top-level vars
   const topVar = vars.get(path[0]);
   if (!topVar) {
     return { typeStr: 'unknown', found: false };
@@ -365,23 +376,54 @@ function findDotFrame(scopeStack: ScopeFrame[]): ScopeFrame | undefined {
   return undefined;
 }
 
+/**
+ * Walk a field path (no leading var name) through a fields array.
+ * Handles arbitrary depth: ["Profile", "Address", "City"] against User's fields.
+ */
 function resolveFields(
   parts: string[],
   fields: FieldInfo[]
 ): ResolveResult {
-  let current = fields;
+  return resolveFieldsDeep(parts, fields);
+}
 
-  for (let i = 0; i < parts.length; i++) {
-    const part = parts[i];
-    const field = current.find(f => f.name === part);
-    if (!field) {
-      return { typeStr: 'unknown', found: false };
-    }
-    if (i === parts.length - 1) {
-      return { typeStr: field.type, found: true, fields: field.fields, isSlice: field.isSlice };
-    }
-    current = field.fields ?? [];
+/**
+ * Core recursive field resolver — supports unlimited nesting depth.
+ *
+ * Each element of `parts` is a field name to traverse. When the final
+ * part is reached, the field's type info is returned.
+ */
+function resolveFieldsDeep(
+  parts: string[],
+  fields: FieldInfo[]
+): ResolveResult {
+  if (parts.length === 0) {
+    return { typeStr: 'unknown', found: false };
   }
 
-  return { typeStr: 'unknown', found: false };
+  const [head, ...tail] = parts;
+  const field = fields.find(f => f.name === head);
+
+  if (!field) {
+    return { typeStr: 'unknown', found: false };
+  }
+
+  // Reached the target field
+  if (tail.length === 0) {
+    return {
+      typeStr: field.type,
+      found: true,
+      fields: field.fields,
+      isSlice: field.isSlice,
+    };
+  }
+
+  // Need to go deeper — recurse into this field's own fields
+  const nextFields = field.fields ?? [];
+  if (nextFields.length === 0) {
+    // Field has no sub-fields (primitive type or empty struct) — path is invalid
+    return { typeStr: 'unknown', found: false };
+  }
+
+  return resolveFieldsDeep(tail, nextFields);
 }

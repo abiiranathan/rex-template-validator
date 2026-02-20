@@ -4,10 +4,10 @@ import * as vscode from 'vscode';
 import {
   AnalysisResult,
   KnowledgeGraph,
-  RenderCall,
   TemplateContext,
   TemplateVar,
   TemplateNode,
+  FieldInfo,
 } from './types';
 import { TemplateParser, resolvePath } from './templateParser';
 
@@ -34,7 +34,6 @@ export class KnowledgeGraphBuilder {
     for (const rc of analysisResult.renderCalls ?? []) {
       const logicalPath = rc.template.replace(/^\.\//, '');
 
-      // Absolute path on disk: workspaceRoot / sourceDir / templateRoot / template
       const absPath = path.join(this.workspaceRoot, sourceDir, templateRoot, logicalPath);
 
       let ctx = templates.get(logicalPath);
@@ -52,7 +51,10 @@ export class KnowledgeGraphBuilder {
 
       for (const v of rc.vars ?? []) {
         const existing = ctx.vars.get(v.name);
-        if (!existing || (v.fields && v.fields.length > 0)) {
+        // Prefer the entry with the most complete field information (deepest nesting).
+        // This ensures that if the same template is rendered from multiple call sites,
+        // we keep whichever has richer type information.
+        if (!existing || isMoreComplete(v, existing)) {
           ctx.vars.set(v.name, v);
         }
       }
@@ -85,23 +87,19 @@ export class KnowledgeGraphBuilder {
     const sourceDir: string = config.get('sourceDir') ?? '.';
     const templateRoot: string = config.get('templateRoot') ?? '';
 
-    // Compute path relative to: workspaceRoot / sourceDir / templateRoot
     const templateBase = path.join(this.workspaceRoot, sourceDir, templateRoot);
     let rel = path.relative(templateBase, absolutePath).replace(/\\/g, '/');
 
-    // Direct match
     if (this.graph.templates.has(rel)) {
       return this.graph.templates.get(rel);
     }
 
-    // Suffix match — the render call path may be a suffix of the relative path
     for (const [tplPath, ctx] of this.graph.templates) {
       if (rel.endsWith(tplPath) || tplPath.endsWith(rel)) {
         return ctx;
       }
     }
 
-    // Basename match as last resort
     const base = path.basename(absolutePath);
     for (const [, ctx] of this.graph.templates) {
       if (path.basename(ctx.templatePath) === base) {
@@ -116,7 +114,6 @@ export class KnowledgeGraphBuilder {
    * Find a partial template context by name, searching the graph and filesystem.
    */
   findPartialContext(partialName: string, currentFile: string): TemplateContext | undefined {
-    // 1. Check graph first
     for (const [tplPath, ctx] of this.graph.templates) {
       if (
         tplPath === partialName ||
@@ -127,7 +124,6 @@ export class KnowledgeGraphBuilder {
       }
     }
 
-    // 2. Search filesystem
     const config = vscode.workspace.getConfiguration('rexTemplateValidator');
     const sourceDir: string = config.get('sourceDir') ?? '.';
     const templateRoot: string = config.get('templateRoot') ?? '';
@@ -155,7 +151,7 @@ export class KnowledgeGraphBuilder {
 
   /**
    * Find the context for a file when it's being used as a partial.
-   * This walks the graph to find which parent templates include this partial
+   * Walks the graph to find which parent templates include this partial
    * and what context they pass to it, then resolves the correct vars.
    */
   findContextForFileAsPartial(absolutePath: string): TemplateContext | undefined {
@@ -163,33 +159,18 @@ export class KnowledgeGraphBuilder {
     const sourceDir: string = config.get('sourceDir') ?? '.';
     const templateRoot: string = config.get('templateRoot') ?? '';
 
-    // Compute the relative path for the partial file
     const templateBase = path.join(this.workspaceRoot, sourceDir, templateRoot);
     let partialRelPath = path.relative(templateBase, absolutePath).replace(/\\/g, '/');
-
-    // Also check basename for matching
     const partialBasename = path.basename(absolutePath);
 
     this.outputChannel.appendLine(
       `[KnowledgeGraph] Looking for partial: ${partialRelPath} (basename: ${partialBasename})`
     );
-    this.outputChannel.appendLine(
-      `[KnowledgeGraph] Template base: ${templateBase}, Graph has ${this.graph.templates.size} templates`
-    );
 
     const parser = new TemplateParser();
 
-    // Search through all templates in the graph to find calls to this partial
     for (const [parentTplPath, parentCtx] of this.graph.templates) {
-      this.outputChannel.appendLine(
-        `[KnowledgeGraph] Checking parent template: ${parentTplPath} at ${parentCtx.absolutePath}`
-      );
-      
-      // Read and parse the parent template
       if (!parentCtx.absolutePath || !fs.existsSync(parentCtx.absolutePath)) {
-        this.outputChannel.appendLine(
-          `[KnowledgeGraph] Skipping ${parentTplPath}: file not found at ${parentCtx.absolutePath}`
-        );
         continue;
       }
 
@@ -197,25 +178,21 @@ export class KnowledgeGraphBuilder {
         const content = fs.readFileSync(parentCtx.absolutePath, 'utf8');
         const nodes = parser.parse(content);
 
-        // Search for partial nodes that reference this file
         const partialCall = this.findPartialCall(nodes, partialRelPath, partialBasename);
         if (partialCall) {
           this.outputChannel.appendLine(
             `[KnowledgeGraph] Found partial call in ${parentTplPath}: template "${partialCall.partialName}" ${partialCall.partialContext}`
           );
-          // Found a call to this partial - resolve the context argument
+
           const partialVars = this.resolvePartialVars(
             partialCall.partialContext ?? '.',
-            parentCtx.vars,
-            [],
-            parentCtx
+            parentCtx.vars
           );
 
           this.outputChannel.appendLine(
             `[KnowledgeGraph] Resolved partial vars: ${[...partialVars.keys()].join(', ')}`
           );
 
-          // Track which parent variable was passed to this partial for go-to-definition
           const partialSourceVar = this.findPartialSourceVar(
             partialCall.partialContext ?? '.',
             parentCtx.vars
@@ -225,12 +202,11 @@ export class KnowledgeGraphBuilder {
             templatePath: partialRelPath,
             absolutePath: absolutePath,
             vars: partialVars,
-            renderCalls: parentCtx.renderCalls, // Inherit parent's render calls for go-to-def
-            partialSourceVar, // Track the source variable passed to this partial
+            renderCalls: parentCtx.renderCalls,
+            partialSourceVar,
           };
         }
       } catch {
-        // Ignore read/parse errors
         continue;
       }
     }
@@ -241,9 +217,6 @@ export class KnowledgeGraphBuilder {
     return undefined;
   }
 
-  /**
-   * Recursively search for a partial call in the AST that matches the given partial path.
-   */
   private findPartialCall(
     nodes: TemplateNode[],
     partialRelPath: string,
@@ -251,11 +224,7 @@ export class KnowledgeGraphBuilder {
   ): TemplateNode | undefined {
     for (const node of nodes) {
       if (node.kind === 'partial' && node.partialName) {
-        // Check if this partial call matches our target
         const name = node.partialName;
-        this.outputChannel.appendLine(
-          `[KnowledgeGraph] Found partial call: "${name}" (looking for: ${partialRelPath} or ${partialBasename})`
-        );
         if (
           name === partialRelPath ||
           name === partialBasename ||
@@ -266,7 +235,6 @@ export class KnowledgeGraphBuilder {
         }
       }
 
-      // Recurse into children
       if (node.children) {
         const found = this.findPartialCall(node.children, partialRelPath, partialBasename);
         if (found) return found;
@@ -276,43 +244,25 @@ export class KnowledgeGraphBuilder {
   }
 
   /**
-   * Given the context arg passed to a partial (e.g. ".", ".User", ".User.Address"),
+   * Given the context arg passed to a partial (e.g. ".", ".User", ".User.Profile.Address"),
    * build the vars map that the partial will see as its root scope.
+   *
+   * Supports unlimited nesting depth. For ".User.Profile.Address", the partial
+   * will see Address's fields (Street, City, Zip) as its top-level variables.
    */
   private resolvePartialVars(
     contextArg: string,
-    vars: Map<string, TemplateVar>,
-    scopeStack: { key: string; typeStr: string; fields?: { name: string; type: string; fields?: any[]; isSlice: boolean; defFile?: string; defLine?: number; defCol?: number; doc?: string }[] }[],
-    ctx: TemplateContext
+    vars: Map<string, TemplateVar>
   ): Map<string, TemplateVar> {
-    // "." → pass through all current vars + current dot scope
-    if (contextArg === '.') {
-      // If we're in a scoped block, expose the dot frame's fields as top-level vars
-      const dotFrame = scopeStack.slice().reverse().find(f => f.key === '.');
-      if (dotFrame?.fields) {
-        const result = new Map<string, TemplateVar>();
-        for (const f of dotFrame.fields) {
-          result.set(f.name, {
-            name: f.name,
-            type: f.type,
-            fields: f.fields,
-            isSlice: f.isSlice ?? false,
-            defFile: f.defFile,
-            defLine: f.defLine,
-            defCol: f.defCol,
-            doc: f.doc,
-          });
-        }
-        return result;
-      }
-      // Root scope: pass through all vars (preserve all metadata)
+    if (contextArg === '.' || contextArg === '$') {
       return new Map(vars);
     }
 
-    // ".SomePath" → resolve that path and expose its fields
     const parser = new TemplateParser();
-    const path = parser.parseDotPath(contextArg);
-    const result = resolvePath(path, vars, scopeStack);
+    const parsedPath = parser.parseDotPath(contextArg);
+
+    // resolvePath with empty scopeStack → resolves against top-level vars
+    const result = resolvePath(parsedPath, vars, []);
 
     if (!result.found || !result.fields) {
       return new Map();
@@ -320,16 +270,7 @@ export class KnowledgeGraphBuilder {
 
     const partialVars = new Map<string, TemplateVar>();
     for (const f of result.fields) {
-      partialVars.set(f.name, {
-        name: f.name,
-        type: f.type,
-        fields: f.fields,
-        isSlice: f.isSlice,
-        defFile: f.defFile,
-        defLine: f.defLine,
-        defCol: f.defCol,
-        doc: f.doc,
-      });
+      partialVars.set(f.name, fieldInfoToTemplateVar(f));
     }
     return partialVars;
   }
@@ -337,60 +278,44 @@ export class KnowledgeGraphBuilder {
   /**
    * Find the source variable that was passed to a partial.
    * For {{ template "partial" .User }}, returns the "User" TemplateVar.
+   * For {{ template "partial" .User.Profile }}, returns a synthetic TemplateVar
+   * for Profile with its fields.
    */
   private findPartialSourceVar(
     contextArg: string,
     vars: Map<string, TemplateVar>
   ): TemplateVar | undefined {
-    // "." means all vars passed - no single source
     if (contextArg === '.' || contextArg === '') {
       return undefined;
     }
 
-    // Parse path like ".User" or ".User.Address"
     const parser = new TemplateParser();
-    const path = parser.parseDotPath(contextArg);
-    if (path.length === 0) {
+    const parsedPath = parser.parseDotPath(contextArg);
+    if (parsedPath.length === 0 || parsedPath[0] === '.') {
       return undefined;
     }
 
-    // Find the top-level variable
-    const topVar = vars.get(path[0]);
-    if (!topVar) {
-      return undefined;
-    }
+    // Resolve the full path to get type info for the passed context
+    const result = resolvePath(parsedPath, vars, []);
+    if (!result.found) return undefined;
 
-    // If it's just a single path component, return that var
-    if (path.length === 1) {
+    // Return a synthetic TemplateVar representing the resolved context
+    const topVar = vars.get(parsedPath[0]);
+    if (parsedPath.length === 1 && topVar) {
       return topVar;
     }
 
-    // Navigate through fields to find the nested type
-    let currentVar = topVar;
-    for (let i = 1; i < path.length; i++) {
-      const field = currentVar.fields?.find(f => f.name === path[i]);
-      if (!field) {
-        return undefined;
-      }
-      // Create a synthetic TemplateVar from the field
-      currentVar = {
-        name: field.name,
-        type: field.type,
-        fields: field.fields,
-        isSlice: field.isSlice ?? false,
-        defFile: field.defFile,
-        defLine: field.defLine,
-        defCol: field.defCol,
-        doc: field.doc,
-      };
-    }
-
-    return currentVar;
+    // Navigate to nested field and return as synthetic var
+    return {
+      name: parsedPath[parsedPath.length - 1],
+      type: result.typeStr,
+      fields: result.fields,
+      isSlice: result.isSlice ?? false,
+    };
   }
 
   /**
    * Resolve a Go source file path (relative to sourceDir) to an absolute path.
-   * Used for go-to-definition.
    */
   resolveGoFilePath(relativeFile: string): string | null {
     const config = vscode.workspace.getConfiguration('rexTemplateValidator');
@@ -401,21 +326,18 @@ export class KnowledgeGraphBuilder {
   }
 
   /**
-   * Resolve a template path (e.g., "views/partial.html") to an absolute file path.
-   * Searches the graph and filesystem for the template.
+   * Resolve a template path to an absolute file path.
    */
   resolveTemplatePath(templatePath: string): string | null {
     const config = vscode.workspace.getConfiguration('rexTemplateValidator');
     const sourceDir: string = config.get('sourceDir') ?? '.';
     const templateRoot: string = config.get('templateRoot') ?? '';
 
-    // 1. Check if it's already in the graph
     const ctx = this.graph.templates.get(templatePath);
     if (ctx?.absolutePath && fs.existsSync(ctx.absolutePath)) {
       return ctx.absolutePath;
     }
 
-    // 2. Search by suffix match in the graph
     for (const [tplPath, tplCtx] of this.graph.templates) {
       if (tplPath.endsWith(templatePath) || templatePath.endsWith(tplPath)) {
         if (tplCtx.absolutePath && fs.existsSync(tplCtx.absolutePath)) {
@@ -424,7 +346,6 @@ export class KnowledgeGraphBuilder {
       }
     }
 
-    // 3. Search filesystem at common locations
     const templateBase = path.join(this.workspaceRoot, sourceDir, templateRoot);
     const candidates = [
       path.join(templateBase, templatePath),
@@ -453,4 +374,43 @@ export class KnowledgeGraphBuilder {
     }
     return obj;
   }
+}
+
+/**
+ * Convert a FieldInfo to a TemplateVar, preserving all nested fields recursively.
+ */
+function fieldInfoToTemplateVar(f: FieldInfo): TemplateVar {
+  return {
+    name: f.name,
+    type: f.type,
+    fields: f.fields, // preserve full nested field tree
+    isSlice: f.isSlice,
+    defFile: f.defFile,
+    defLine: f.defLine,
+    defCol: f.defCol,
+    doc: f.doc,
+  };
+}
+
+/**
+ * Returns true if `a` has more complete field information than `b`.
+ * Used to prefer richer type data when merging vars from multiple render calls.
+ */
+function isMoreComplete(a: TemplateVar, b: TemplateVar): boolean {
+  const depthA = maxFieldDepth(a.fields ?? []);
+  const depthB = maxFieldDepth(b.fields ?? []);
+  return depthA > depthB;
+}
+
+/**
+ * Compute the maximum nesting depth of a FieldInfo array.
+ */
+function maxFieldDepth(fields: FieldInfo[]): number {
+  if (fields.length === 0) return 0;
+  let max = 0;
+  for (const f of fields) {
+    const d = 1 + maxFieldDepth(f.fields ?? []);
+    if (d > max) max = d;
+  }
+  return max;
 }

@@ -52,12 +52,12 @@ type Prescription struct {
 	// Quantity
 	Quantity int
 	Dosage   string // Dosage
+	Drug     Drug   // The drug object
 }
 
 // Management represents a management entry
 type Management struct {
-	Name   string
-	Dosage string
+	Prescription Prescription
 }
 
 // Handler holds service dependencies

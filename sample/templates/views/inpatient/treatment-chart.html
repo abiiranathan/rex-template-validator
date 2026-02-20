@@ -12,13 +12,12 @@
         {{ if not .IsLast }} / {{ end }}
         {{ end }}
     </nav>
-
     <h1>{{ upper .Title }}</h1>
     <p>Patient: {{ .visit.Patient.Name }}</p>
     <p>Doctor: {{ .doctor }}</p>
     <h2>Management</h2>
     {{ range .management }}
-    <div>{{ .Name }}: {{ .Dosage }}</div>
+    <div>{{ .Prescription.Drug.Name }}</div>
     {{ $.Title }}
     {{ end }}
 
@@ -29,7 +28,6 @@
         <span>{{ $name }}</span>
         <span>{{ .Quantity }}</span>
         <span>{{ .Dosage }}</span>
-        <span>{{ . }}</span>
     </div>
     {{ end }}
 
