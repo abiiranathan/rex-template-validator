@@ -3,6 +3,7 @@ package validator
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -370,9 +371,7 @@ func buildPartialVarMap(contextArg string, partialScope ScopeType, scopeStack []
 		if len(scopeStack) > 0 {
 			currentScope := scopeStack[len(scopeStack)-1]
 			if currentScope.IsRoot {
-				for k, v := range varMap {
-					result[k] = v
-				}
+				maps.Copy(result, varMap)
 			} else {
 				for _, f := range currentScope.Fields {
 					result[f.Name] = TemplateVar{

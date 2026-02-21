@@ -482,63 +482,48 @@ func enrichRenderCallsWithContext(
 		return calls
 	}
 
-	// ── Concurrent BFS over the import graph ─────────────────────────────────
-	// Populate typeMap using a sync.Map so multiple goroutines can write
-	// concurrently without a mutex bottleneck.
-	var typeMapSync sync.Map // map[string]*types.TypeName
+	// ── Walk the import graph and collect all named types ────────────────────
+	// We do a sequential BFS. The previous concurrent-channel approach deadlocked
+	// because worker goroutines tried to send to a fixed-capacity channel that was
+	// already full (deep import graphs have far more nodes than len(pkgs)*8), while
+	// the main goroutine was blocked in bfsWg.Wait() — a classic send-on-full +
+	// wait deadlock with no reader running.
+	//
+	// Sequential BFS is correct, safe, and plenty fast: type-scope iteration is
+	// pure in-memory work and the import graph is walked exactly once.
+	typeMap := make(map[string]*types.TypeName, len(pkgs)*32)
+	{
+		visited := make(map[string]bool, len(pkgs)*32)
+		queue := make([]*packages.Package, 0, len(pkgs)*8)
 
-	var (
-		visitedMu sync.Mutex
-		visited   = make(map[string]bool, len(pkgs)*4)
-		queue     = make(chan *packages.Package, len(pkgs)*8)
-		bfsWg     sync.WaitGroup
-	)
-
-	enqueue := func(p *packages.Package) {
-		visitedMu.Lock()
-		if !visited[p.ID] {
-			visited[p.ID] = true
-			visitedMu.Unlock()
-			bfsWg.Add(1)
-			queue <- p
-		} else {
-			visitedMu.Unlock()
+		for _, pkg := range pkgs {
+			if !visited[pkg.ID] {
+				visited[pkg.ID] = true
+				queue = append(queue, pkg)
+			}
 		}
-	}
 
-	bfsWorkers := max(runtime.NumCPU(), 1)
-	for range bfsWorkers {
-		go func() {
-			for p := range queue {
-				if p.Types != nil {
-					scope := p.Types.Scope()
-					for _, name := range scope.Names() {
-						if typeName, ok := scope.Lookup(name).(*types.TypeName); ok {
-							key := p.Types.Name() + "." + name
-							typeMapSync.Store(key, typeName)
-						}
+		for len(queue) > 0 {
+			p := queue[0]
+			queue = queue[1:]
+
+			if p.Types != nil {
+				scope := p.Types.Scope()
+				for _, name := range scope.Names() {
+					if typeName, ok := scope.Lookup(name).(*types.TypeName); ok {
+						typeMap[p.Types.Name()+"."+name] = typeName
 					}
 				}
-				for _, imp := range p.Imports {
-					enqueue(imp)
-				}
-				bfsWg.Done()
 			}
-		}()
-	}
 
-	for _, pkg := range pkgs {
-		enqueue(pkg)
+			for _, imp := range p.Imports {
+				if !visited[imp.ID] {
+					visited[imp.ID] = true
+					queue = append(queue, imp)
+				}
+			}
+		}
 	}
-	bfsWg.Wait()
-	close(queue)
-
-	// Convert sync.Map to a plain map for O(1) reads during var building.
-	typeMap := make(map[string]*types.TypeName, len(pkgs)*16)
-	typeMapSync.Range(func(k, v any) bool {
-		typeMap[k.(string)] = v.(*types.TypeName)
-		return true
-	})
 
 	globalVars := buildTemplateVars(contextConfig[config.GlobalTemplateName], typeMap, structIndex, fc, fset)
 
@@ -761,8 +746,7 @@ func extractFieldsWithDocs(
 	if !ok {
 		// Interface or other named type: expose exported methods only.
 		var fields []FieldInfo
-		for i := range named.NumMethods() {
-			m := named.Method(i)
+		for m := range named.Methods() {
 			if !m.Exported() {
 				continue
 			}
@@ -782,8 +766,8 @@ func extractFieldsWithDocs(
 	entry := structIndex[handle]
 	fields := make([]FieldInfo, 0, strct.NumFields())
 
-	for i := range strct.NumFields() {
-		f := strct.Field(i)
+	for f := range strct.Fields() {
+		f := f
 		if !f.Exported() {
 			continue
 		}
@@ -834,8 +818,7 @@ func extractFieldsWithDocs(
 	}
 
 	// Append exported methods after fields.
-	for i := range named.NumMethods() {
-		m := named.Method(i)
+	for m := range named.Methods() {
 		if !m.Exported() {
 			continue
 		}

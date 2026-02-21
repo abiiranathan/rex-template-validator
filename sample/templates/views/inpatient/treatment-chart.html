@@ -46,9 +46,7 @@
     {{ $.currentUser }}
 
     <!-- Map -->
-    {{ range $k, $v := .roles }}
-    {{ $k }}: {{ $v }}
-    {{ end }}
+    {{ template "roles" .roles }}
 </body>
 
 </html>

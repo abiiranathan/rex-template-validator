@@ -90,6 +90,10 @@ func (h *Handler) RenderTreatmentChart(inpatient bool) rex.HandlerFunc {
 			label = "OPD"
 		}
 
+		// Analyzer also detects calls to c.Set and updated the index.
+		c.Set("currentUser", newuser)
+
+		// Magic happens here. Try renaming template name to something not found!
 		return c.Render("views/inpatient/treatment-chart.html", rex.Map{
 			"management":    management,
 			"visit":         visit,

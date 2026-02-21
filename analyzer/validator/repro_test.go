@@ -455,7 +455,7 @@ func findField(fields []FieldInfo, name string) *FieldInfo {
 	return nil
 }
 
-func debugJSON(t *testing.T, v interface{}) {
+func debugJSON(t *testing.T, v any) {
 	b, _ := json.MarshalIndent(v, "", "  ")
 	t.Logf("Debug JSON:\n%s", string(b))
 }
