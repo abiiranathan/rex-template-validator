@@ -44,8 +44,22 @@
     <!-- Passed through a context-file -->
     {{ $.newuser.Name }}
     {{ $.currentUser }}
-    <!-- Map -->
+
+
+    <!-- Pass a Map to a cross-file template -->
     {{ template "roles" .roles }}
+    <!-- Same-file block -->
+
+    {{ block "user-msg" .currentUser }}
+    <h1>Hello: {{ .Name }}</h1>
+    {{ end }}
+
+    {{ template "messages" . }}
+
+    {{ define "messages" }}
+    {{ $msg := index .prescriptions 0 }}
+    <h1>{{ $msg }}</h1>
+    {{ end}}
 </body>
 
 </html>

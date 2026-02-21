@@ -770,10 +770,17 @@ export class TemplateValidator {
 
     const partialCtx = this.graphBuilder.findPartialContext(node.partialName, filePath);
     if (!partialCtx) {
+      let errCol = node.col;
+      if (node.rawText && node.partialName) {
+        const nameIdx = node.rawText.indexOf(`"${node.partialName}"`);
+        if (nameIdx !== -1) {
+          errCol = node.col + nameIdx + 1;
+        }
+      }
       errors.push({
         message: `Partial template "${node.partialName}" could not be found`,
         line: node.line,
-        col: node.col,
+        col: errCol,
         severity: 'warning',
         variable: node.partialName,
       });
@@ -948,7 +955,24 @@ export class TemplateValidator {
       else return;
 
       const blockNode = this.findDefineNodeInAST(this.parser.parse(content), callNode.partialName);
-      if (!blockNode?.children) return;
+      if (!blockNode) {
+        let errCol = callNode.col;
+        if (callNode.rawText && callNode.partialName) {
+          const nameIdx = callNode.rawText.indexOf(`"${callNode.partialName}"`);
+          if (nameIdx !== -1) {
+            errCol = callNode.col + nameIdx + 1;
+          }
+        }
+        errors.push({
+          message: `Template "${callNode.partialName}" not found`,
+          line: callNode.line,
+          col: errCol,
+          severity: 'error',
+          variable: callNode.partialName,
+        });
+        return;
+      }
+      if (!blockNode.children) return;
 
       let childStack: ScopeFrame[];
       if (contextArg === '.' || contextArg === '$') {

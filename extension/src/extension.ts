@@ -26,11 +26,14 @@ let graphBuilder: KnowledgeGraphBuilder | undefined;
 let validator: TemplateValidator | undefined;
 let currentGraph: KnowledgeGraph | undefined;
 let analyzer: GoAnalyzer | undefined;
+let statusBarItem: vscode.StatusBarItem;
 
 let rebuildTimer: NodeJS.Timeout | undefined;
-let validateTimer: NodeJS.Timeout | undefined;
+let validateAllTimer: NodeJS.Timeout | undefined;
 
 export async function activate(context: vscode.ExtensionContext) {
+  statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
+  context.subscriptions.push(statusBarItem);
   outputChannel = vscode.window.createOutputChannel('Rex Template Validator');
   analyzerCollection = vscode.languages.createDiagnosticCollection('rex-analyzer');
   editorCollection = vscode.languages.createDiagnosticCollection('rex-editor');
@@ -150,12 +153,12 @@ export async function activate(context: vscode.ExtensionContext) {
     tplWatcher,
     tplWatcher.onDidChange(async (uri) => {
       // A template file changed: rebuild named-block registry first (fast), then
-      // re-validate the changed file and any file that might reference its blocks.
+      // re-validate all open templates since parent/partial relationships may have changed.
       if (graphBuilder) graphBuilder.rebuildNamedBlocks();
       applyNamedBlockDiagnostics();
-      const doc = await vscode.workspace.openTextDocument(uri);
-      if (isTemplate(doc)) scheduleValidate(doc);
+      scheduleValidateAllOpenTemplates();
     }),
+
     tplWatcher.onDidCreate(() => {
       scheduleRebuild(workspaceRoot);
     }),
@@ -167,22 +170,20 @@ export async function activate(context: vscode.ExtensionContext) {
 
   context.subscriptions.push(
     vscode.workspace.onDidOpenTextDocument((doc) => {
-      if (isTemplate(doc)) scheduleValidate(doc);
+      if (isTemplate(doc)) scheduleValidateAllOpenTemplates();
     }),
 
     vscode.workspace.onDidChangeTextDocument((e) => {
-      if (isTemplate(e.document)) scheduleValidate(e.document);
+      if (isTemplate(e.document)) scheduleValidateAllOpenTemplates();
     }),
 
     vscode.workspace.onDidSaveTextDocument((doc) => {
-      if (doc.fileName.endsWith('.go')) {
+      if (doc.fileName.endsWith('.go') || doc.fileName.endsWith('go.mod') || doc.fileName.endsWith('.json')) {
         scheduleRebuild(workspaceRoot);
       } else if (isTemplate(doc)) {
         if (graphBuilder) graphBuilder.rebuildNamedBlocks();
         applyNamedBlockDiagnostics();
-        scheduleValidate(doc);
-      } else {
-        scheduleRebuild(workspaceRoot);
+        scheduleValidateAllOpenTemplates();
       }
     })
   );
@@ -207,7 +208,6 @@ export async function activate(context: vscode.ExtensionContext) {
   }
 
   outputChannel.appendLine('[Rex] Ready');
-  vscode.window.setStatusBarMessage('$(check) Rex templates indexed', 3000);
 }
 
 // ── Template detection ─────────────────────────────────────────────────────────
@@ -224,7 +224,6 @@ function isTemplate(doc: vscode.TextDocument): boolean {
 async function rebuildIndex(workspaceRoot: string) {
   if (!analyzer || !graphBuilder) return;
 
-  const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
   statusBarItem.text = '$(sync~spin) Rex: Analyzing...';
   statusBarItem.show();
 
@@ -305,7 +304,7 @@ async function rebuildIndex(workspaceRoot: string) {
     outputChannel.appendLine(`[Rex] Rebuild failed: ${err}`);
     statusBarItem.text = '$(error) Rex: Analysis failed';
   } finally {
-    setTimeout(() => statusBarItem.dispose(), 5000);
+    setTimeout(() => statusBarItem.hide(), 5000);
   }
 }
 
@@ -479,19 +478,25 @@ function scheduleRebuild(workspaceRoot: string) {
   rebuildTimer = setTimeout(() => rebuildIndex(workspaceRoot), debounceMs * 2);
 }
 
-function scheduleValidate(doc: vscode.TextDocument) {
+function scheduleValidateAllOpenTemplates() {
   const config = vscode.workspace.getConfiguration('rex-analyzer');
   const debounceMs = config.get<number>('debounceMs') ?? 1500;
 
-  if (validateTimer) clearTimeout(validateTimer);
-  validateTimer = setTimeout(() => validateDocument(doc), debounceMs);
+  if (validateAllTimer) clearTimeout(validateAllTimer);
+  validateAllTimer = setTimeout(() => {
+    for (const doc of vscode.workspace.textDocuments) {
+      if (isTemplate(doc)) {
+        validateDocument(doc);
+      }
+    }
+  }, debounceMs);
 }
 
 // ── Deactivation ───────────────────────────────────────────────────────────────
 
 export function deactivate() {
   if (rebuildTimer) clearTimeout(rebuildTimer);
-  if (validateTimer) clearTimeout(validateTimer);
+  if (validateAllTimer) clearTimeout(validateAllTimer);
   analyzerCollection?.dispose();
   editorCollection?.dispose();
   namedBlockCollection?.dispose();
