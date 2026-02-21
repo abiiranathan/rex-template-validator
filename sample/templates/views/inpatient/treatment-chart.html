@@ -45,7 +45,6 @@
     {{ $.newuser.Name }}
     {{ $.currentUser }}
 
-
     <!-- Pass a Map to a cross-file template -->
     {{ template "roles" .roles }}
     <!-- Same-file block -->
@@ -59,6 +58,8 @@
     {{ $msg := index .prescriptions 0 }}
     <h1>{{ $msg }}</h1>
     {{ end}}
+
+    {{ $large := gt .billedDrugs.Quantity 10 }}
 </body>
 
 </html>

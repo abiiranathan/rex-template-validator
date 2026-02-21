@@ -119,7 +119,7 @@ export class KnowledgeGraphBuilder {
     const toScan = new Set<string>();
 
     for (const ctx of templates.values()) {
-      if (ctx.absolutePath) toScan.add(ctx.absolutePath);
+      if (ctx.absolutePath) toScan.add(path.normalize(ctx.absolutePath));
     }
 
     // Also walk the template base directory for any files not in the render graph
@@ -173,7 +173,7 @@ export class KnowledgeGraphBuilder {
     try {
       const entries = fs.readdirSync(dir, { withFileTypes: true });
       for (const entry of entries) {
-        const full = path.join(dir, entry.name);
+        const full = path.normalize(path.join(dir, entry.name));
         if (entry.isDirectory()) {
           this.walkTemplateDir(full, toScan);
         } else if (isTemplateFile(entry.name)) {
@@ -272,7 +272,11 @@ export class KnowledgeGraphBuilder {
       return this.graph.templates.get(rel);
     }
 
+    const normalizedAbsPath = path.normalize(absolutePath).toLowerCase();
     for (const [tplPath, ctx] of this.graph.templates) {
+      if (ctx.absolutePath && path.normalize(ctx.absolutePath).toLowerCase() === normalizedAbsPath) {
+        return ctx;
+      }
       if (rel.endsWith(tplPath) || tplPath.endsWith(rel)) {
         return ctx;
       }
@@ -336,11 +340,12 @@ export class KnowledgeGraphBuilder {
     );
 
     const parser = new TemplateParser();
+    const normalizedTargetAbsPath = path.normalize(absolutePath).toLowerCase();
 
     const definedBlocksInFile = new Set<string>();
     for (const [blockName, entries] of this.graph.namedBlocks) {
       for (const entry of entries) {
-        if (entry.absolutePath === absolutePath) {
+        if (path.normalize(entry.absolutePath).toLowerCase() === normalizedTargetAbsPath) {
           definedBlocksInFile.add(blockName);
         }
       }
@@ -352,7 +357,11 @@ export class KnowledgeGraphBuilder {
       }
 
       try {
-        const content = fs.readFileSync(parentCtx.absolutePath, 'utf8');
+        const normalizedParentAbsPath = path.normalize(parentCtx.absolutePath).toLowerCase();
+        const openDoc = vscode.workspace.textDocuments.find(
+          d => path.normalize(d.uri.fsPath).toLowerCase() === normalizedParentAbsPath
+        );
+        const content = openDoc ? openDoc.getText() : fs.readFileSync(parentCtx.absolutePath, 'utf8');
         const nodes = parser.parse(content);
 
         const partialCall = this.findPartialCall(nodes, partialRelPath, partialBasename, definedBlocksInFile);
@@ -361,13 +370,13 @@ export class KnowledgeGraphBuilder {
             `[KnowledgeGraph] Found partial call in ${parentTplPath}: template "${partialCall.partialName}" ${partialCall.partialContext}`
           );
 
-          const partialVars = this.resolvePartialVars(
+          const resolved = this.resolvePartialVars(
             partialCall.partialContext ?? '.',
             parentCtx.vars
           );
 
           this.outputChannel.appendLine(
-            `[KnowledgeGraph] Resolved partial vars: ${[...partialVars.keys()].join(', ')}`
+            `[KnowledgeGraph] Resolved partial vars: ${[...resolved.vars.keys()].join(', ')}`
           );
 
           const partialSourceVar = this.findPartialSourceVar(
@@ -378,9 +387,14 @@ export class KnowledgeGraphBuilder {
           return {
             templatePath: partialRelPath,
             absolutePath: absolutePath,
-            vars: partialVars,
+            vars: resolved.vars,
             renderCalls: parentCtx.renderCalls,
             partialSourceVar,
+            isMap: resolved.isMap,
+            keyType: resolved.keyType,
+            elemType: resolved.elemType,
+            isSlice: resolved.isSlice,
+            rootTypeStr: resolved.rootTypeStr
           };
         }
       } catch {
@@ -425,24 +439,34 @@ export class KnowledgeGraphBuilder {
   private resolvePartialVars(
     contextArg: string,
     vars: Map<string, TemplateVar>
-  ): Map<string, TemplateVar> {
+  ): { vars: Map<string, TemplateVar>; isMap?: boolean; keyType?: string; elemType?: string; isSlice?: boolean; rootTypeStr?: string } {
     if (contextArg === '.' || contextArg === '$') {
-      return new Map(vars);
+      return { vars: new Map(vars) };
     }
 
     const parser = new TemplateParser();
     const parsedPath = parser.parseDotPath(contextArg);
     const result = resolvePath(parsedPath, vars, []);
 
-    if (!result.found || !result.fields) {
-      return new Map();
+    if (!result.found) {
+      return { vars: new Map() };
     }
 
     const partialVars = new Map<string, TemplateVar>();
-    for (const f of result.fields) {
-      partialVars.set(f.name, fieldInfoToTemplateVar(f));
+    if (result.fields) {
+      for (const f of result.fields) {
+        partialVars.set(f.name, fieldInfoToTemplateVar(f));
+      }
     }
-    return partialVars;
+
+    return {
+      vars: partialVars,
+      isMap: result.isMap,
+      keyType: result.keyType,
+      elemType: result.elemType,
+      isSlice: result.isSlice,
+      rootTypeStr: result.typeStr
+    };
   }
 
   private findPartialSourceVar(

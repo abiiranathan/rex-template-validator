@@ -97,6 +97,13 @@ export interface TemplateContext {
   renderCalls: RenderCall[];
   // For partials: tracks which parent variable was passed as context (e.g., "User" from {{ template "partial" .User }})
   partialSourceVar?: TemplateVar;
+
+  // Metadata for when the root context itself is a map or slice
+  isMap?: boolean;
+  keyType?: string;
+  elemType?: string;
+  isSlice?: boolean;
+  rootTypeStr?: string;
 }
 
 export interface KnowledgeGraph {

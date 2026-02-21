@@ -25,14 +25,13 @@ import {
 } from './types';
 import { TemplateParser, resolvePath } from './templateParser';
 import { KnowledgeGraphBuilder } from './knowledgeGraph';
+import { inferExpressionType } from './compiler/expressionParser';
 
 export class TemplateValidator {
   private parser = new TemplateParser();
-  private outputChannel: vscode.OutputChannel;
   private graphBuilder: KnowledgeGraphBuilder;
 
   constructor(outputChannel: vscode.OutputChannel, graphBuilder: KnowledgeGraphBuilder) {
-    this.outputChannel = outputChannel;
     this.graphBuilder = graphBuilder;
   }
 
@@ -78,7 +77,21 @@ export class TemplateValidator {
   validate(content: string, ctx: TemplateContext, filePath: string): ValidationError[] {
     const errors: ValidationError[] = [];
     const nodes = this.parser.parse(content);
-    this.validateNodes(nodes, ctx.vars, [], errors, ctx, filePath);
+
+    const rootScope: ScopeFrame[] = [];
+    if (ctx.isMap || ctx.isSlice || ctx.rootTypeStr) {
+      rootScope.push({
+        key: '.',
+        typeStr: ctx.rootTypeStr ?? 'context',
+        fields: [...ctx.vars.values()] as unknown as FieldInfo[],
+        isMap: ctx.isMap,
+        keyType: ctx.keyType,
+        elemType: ctx.elemType,
+        isSlice: ctx.isSlice
+      });
+    }
+
+    this.validateNodes(nodes, ctx.vars, rootScope, errors, ctx, filePath);
     return errors;
   }
 
@@ -205,7 +218,6 @@ export class TemplateValidator {
       };
     }
 
-
     if (node.kind === 'block' && node.path.length > 0) {
       const result = resolvePath(node.path, vars, []);
       if (result.found) {
@@ -312,36 +324,6 @@ export class TemplateValidator {
     return elemScope;
   }
 
-  private buildRangeScope(
-    rangePath: string[],
-    vars: Map<string, TemplateVar>,
-    scopeStack: ScopeFrame[],
-    _ctx: TemplateContext,
-    blockLocals?: Map<string, TemplateVar>
-  ): ScopeFrame | null {
-    const result = resolvePath(rangePath, vars, scopeStack, blockLocals);
-    if (!result.found) return null;
-
-    let typeStr = result.typeStr;
-    if (result.isSlice && typeStr.startsWith('[]')) typeStr = typeStr.slice(2);
-    else if (result.isMap && result.elemType) typeStr = result.elemType;
-
-    let sourceVar: TemplateVar | undefined;
-    if (rangePath[0].startsWith('$') && rangePath[0] !== '$') {
-      sourceVar =
-        blockLocals?.get(rangePath[0]) ||
-        scopeStack
-          .slice()
-          .reverse()
-          .find(f => f.locals?.has(rangePath[0]))
-          ?.locals?.get(rangePath[0]);
-    } else {
-      sourceVar = vars.get(rangePath[0]);
-    }
-
-    return { key: '.', typeStr, fields: result.fields ?? [], isRange: true, sourceVar };
-  }
-
   private applyAssignmentLocals(
     assignVars: string[],
     result: ReturnType<typeof resolvePath>,
@@ -427,7 +409,22 @@ export class TemplateValidator {
         if (node.path[0] === '.') break;
         if (node.path[0] === '$' && node.path.length === 1) break;
 
-        if (!resolvePath(node.path, vars, scopeStack, blockLocals).found) {
+        let pathResolved = resolvePath(node.path, vars, scopeStack, blockLocals).found;
+
+        // Try expression parser for complex expressions (e.g., function calls)
+        if (!pathResolved && node.rawText) {
+          try {
+            const cleanExpr = node.rawText.replace(/^\{\{-?\s*/, '').replace(/\s*-?\}\}$/, '');
+            const exprType = inferExpressionType(cleanExpr, vars, scopeStack, blockLocals);
+            if (exprType) {
+              pathResolved = true;
+            }
+          } catch {
+            // Expression parsing failed, continue with error
+          }
+        }
+
+        if (!pathResolved) {
           const displayPath =
             node.path[0] === '$'
               ? '$.' + node.path.slice(1).join('.')
@@ -789,7 +786,7 @@ export class TemplateValidator {
 
     if (!fs.existsSync(partialCtx.absolutePath)) return;
 
-    const partialVars = this.resolvePartialVars(contextArg, vars, scopeStack, blockLocals);
+    const resolved = this.resolvePartialVars(contextArg, vars, scopeStack, blockLocals);
     try {
       const openDoc = vscode.workspace.textDocuments.find(
         d => d.uri.fsPath === partialCtx.absolutePath
@@ -799,7 +796,15 @@ export class TemplateValidator {
         : fs.readFileSync(partialCtx.absolutePath, 'utf8');
       const partialErrors = this.validate(
         content,
-        { ...partialCtx, vars: partialVars },
+        {
+          ...partialCtx,
+          vars: resolved.vars,
+          isMap: resolved.isMap,
+          keyType: resolved.keyType,
+          elemType: resolved.elemType,
+          isSlice: resolved.isSlice,
+          rootTypeStr: resolved.rootTypeStr
+        },
         partialCtx.absolutePath
       );
       for (const e of partialErrors) {
@@ -850,7 +855,8 @@ export class TemplateValidator {
 
     // Read the file that contains the block definition.
     const contextArg = callNode.partialContext ?? '.';
-    const partialVars = this.resolvePartialVars(contextArg, vars, scopeStack, blockLocals);
+    const resolved = this.resolvePartialVars(contextArg, vars, scopeStack, blockLocals);
+    const partialVars = resolved.vars;
 
     let childStack: ScopeFrame[];
     if (contextArg === '.' || contextArg === '$') {
@@ -945,7 +951,8 @@ export class TemplateValidator {
     if (!callNode.partialName) return;
 
     const contextArg = callNode.partialContext ?? '.';
-    const partialVars = this.resolvePartialVars(contextArg, vars, scopeStack, blockLocals);
+    const resolved = this.resolvePartialVars(contextArg, vars, scopeStack, blockLocals);
+    const partialVars = resolved.vars;
 
     try {
       const openDoc = vscode.workspace.textDocuments.find(d => d.uri.fsPath === filePath);
@@ -1020,15 +1027,24 @@ export class TemplateValidator {
     vars: Map<string, TemplateVar>,
     scopeStack: ScopeFrame[],
     blockLocals: Map<string, TemplateVar>
-  ): Map<string, TemplateVar> {
+  ): { vars: Map<string, TemplateVar>; isMap?: boolean; keyType?: string; elemType?: string; isSlice?: boolean; rootTypeStr?: string } {
     if (contextArg === '.' || contextArg === '$') {
       const dotFrame = scopeStack.slice().reverse().find(f => f.key === '.');
-      if (dotFrame?.fields) {
+      if (dotFrame) {
         const result = new Map<string, TemplateVar>();
-        for (const f of dotFrame.fields) result.set(f.name, fieldInfoToTemplateVar(f));
-        return result;
+        if (dotFrame.fields) {
+          for (const f of dotFrame.fields) result.set(f.name, fieldInfoToTemplateVar(f));
+        }
+        return {
+          vars: result,
+          isMap: dotFrame.isMap,
+          keyType: dotFrame.keyType,
+          elemType: dotFrame.elemType,
+          isSlice: dotFrame.isSlice,
+          rootTypeStr: dotFrame.typeStr
+        };
       }
-      return new Map(vars);
+      return { vars: new Map(vars) };
     }
 
     const result = resolvePath(
@@ -1037,11 +1053,20 @@ export class TemplateValidator {
       scopeStack,
       blockLocals
     );
-    if (!result.found || !result.fields) return new Map();
 
     const partialVars = new Map<string, TemplateVar>();
-    for (const f of result.fields) partialVars.set(f.name, fieldInfoToTemplateVar(f));
-    return partialVars;
+    if (result.found && result.fields) {
+      for (const f of result.fields) partialVars.set(f.name, fieldInfoToTemplateVar(f));
+    }
+
+    return {
+      vars: partialVars,
+      isMap: result.isMap,
+      keyType: result.keyType,
+      elemType: result.elemType,
+      isSlice: result.isSlice,
+      rootTypeStr: result.typeStr
+    };
   }
 
   // ── Hover ──────────────────────────────────────────────────────────────────
@@ -1097,7 +1122,30 @@ export class TemplateValidator {
       node.kind === 'partial' && (node.partialContext ?? '.') === '.';
     if (isBareVarDot || isPartialDotCtx) return this.buildDotHover(stack, hitVars);
 
-    const result = resolvePath(node.path, hitVars, stack, hitLocals);
+    //  Try to evaluate the expression
+    let result = resolvePath(node.path, hitVars, stack, hitLocals);
+
+    // Fallback to expression parser for complex expressions
+    if (!result.found && node.rawText) {
+      try {
+        const cleanExpr = node.rawText.replace(/^\{\{-?\s*/, '').replace(/\s*-?\}\}$/, '');
+        const exprType = inferExpressionType(cleanExpr, hitVars, stack, hitLocals);
+        if (exprType) {
+          result = {
+            typeStr: exprType.typeStr,
+            found: true,
+            fields: exprType.fields,
+            isSlice: exprType.isSlice,
+            isMap: exprType.isMap,
+            elemType: exprType.elemType,
+            keyType: exprType.keyType,
+          };
+        }
+      } catch (err) {
+        // Silently fall back to existing behavior
+      }
+    }
+
     if (!result.found) return null;
 
     const varName =
@@ -2034,6 +2082,39 @@ export class TemplateValidator {
     };
 
     const linePrefix = document.lineAt(position.line).text.slice(0, position.character);
+
+    // Check if we're inside a function call or pipeline
+    const inComplexExpr = /\(\s*[^)]*$|\|\s*[^|}]*$/.test(linePrefix);
+
+    if (inComplexExpr) {
+      const match = linePrefix.match(/(?:\(|\|)\s*(.*)$/);
+      if (match) {
+        const partialExpr = match[1].trim();
+
+        // Try to infer type of the partial expression
+        try {
+          const exprType = inferExpressionType(partialExpr, ctx.vars, stack, locals);
+
+          if (exprType?.fields) {
+            // Return field completions based on inferred type
+            return exprType.fields.map(f => {
+              const item = new vscode.CompletionItem(
+                f.name,
+                vscode.CompletionItemKind.Field
+              );
+              item.detail = f.isSlice ? `[]${f.type}` : f.type;
+              if (f.doc) {
+                item.documentation = new vscode.MarkdownString(f.doc);
+              }
+              return item;
+            });
+          }
+        } catch {
+          // Expression parsing failed, fall through to existing logic
+        }
+      }
+    }
+
     const match = linePrefix.match(/(?:\$|\.)[\w.]*$/);
     if (!match) return [];
 
