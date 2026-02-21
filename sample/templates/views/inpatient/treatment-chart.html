@@ -33,6 +33,7 @@
 
     <h2>Billed Drugs</h2>
     {{ range .billedDrugs }}
+    {{ $title := $.Title }}
     {{ template "billed-drug" . }}
     {{ end }}
     <a href="{{ .PathPrefix }}/new">New Entry</a>
@@ -48,18 +49,12 @@
     <!-- Pass a Map to a cross-file template -->
     {{ template "roles" .roles }}
     <!-- Same-file block -->
-
     {{ block "user-msg" .currentUser }}
     <h1>Hello: {{ .Name }}</h1>
     {{ end }}
 
-    {{ template "messages" . }}
-    {{ define "messages" }}
-    {{ $msg := index .prescriptions 0 }}
-    <h1>{{ $msg }}</h1>
-    {{ end}}
+    {{ $large := index $.billedDrugs 0 }}
 
-    {{ $large := gt .billedDrugs.Quantity 10 }}
 </body>
 
 </html>

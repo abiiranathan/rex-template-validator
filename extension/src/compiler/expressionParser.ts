@@ -902,7 +902,6 @@ export function inferExpressionType(
   scopeStack: ScopeFrame[],
   blockLocals?: Map<string, TemplateVar>
 ): TypeResult | null {
-  console.log(vars, scopeStack, blockLocals)
   const inferencer = new TypeInferencer(vars, scopeStack, blockLocals);
   return inferencer.inferType(expr);
 }

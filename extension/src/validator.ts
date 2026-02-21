@@ -23,15 +23,17 @@ import {
   TemplateVar,
   ValidationError,
 } from './types';
-import { TemplateParser, resolvePath } from './templateParser';
+import { TemplateParser, resolvePath, ResolveResult } from './templateParser';
 import { KnowledgeGraphBuilder } from './knowledgeGraph';
-import { inferExpressionType } from './compiler/expressionParser';
+import { inferExpressionType, TypeResult } from './compiler/expressionParser';
 
 export class TemplateValidator {
   private parser = new TemplateParser();
   private graphBuilder: KnowledgeGraphBuilder;
+  private outputChannel: vscode.OutputChannel;
 
   constructor(outputChannel: vscode.OutputChannel, graphBuilder: KnowledgeGraphBuilder) {
+    this.outputChannel = outputChannel;
     this.graphBuilder = graphBuilder;
   }
 
@@ -97,11 +99,6 @@ export class TemplateValidator {
 
   // ── Named block registry helpers ───────────────────────────────────────────
 
-  /**
-   * Look up a named block from the cross-file registry.
-   * Returns the entry or undefined.
-   * Also checks for duplicate errors and returns them via the `duplicateError` field.
-   */
   private resolveNamedBlock(name: string): {
     entry: NamedBlockEntry | undefined;
     isDuplicate: boolean;
@@ -185,15 +182,6 @@ export class TemplateValidator {
     }
   }
 
-  /**
-   * Build scope for a named block body.
-   *
-   * Resolution order:
-   * 1. Find the {{ template "name" .Ctx }} call site anywhere in rootNodes.
-   * 2. If not found (e.g. this is a `define` with no inline call), fall back
-   *    to the block's own context argument (for `block` nodes).
-   * 3. As a last resort fall back to the full root-level vars.
-   */
   private buildNamedBlockScope(
     node: TemplateNode,
     vars: Map<string, TemplateVar>,
@@ -326,7 +314,7 @@ export class TemplateValidator {
 
   private applyAssignmentLocals(
     assignVars: string[],
-    result: ReturnType<typeof resolvePath>,
+    result: TypeResult | ResolveResult,
     blockLocals: Map<string, TemplateVar>
   ) {
     if (assignVars.length === 1) {
@@ -362,6 +350,48 @@ export class TemplateValidator {
     }
   }
 
+  /**
+   * Helper to process assignments in various traversal contexts (validation, hover, completion).
+   * It attempts to infer the type of the expression; failing that, it falls back to path resolution.
+   */
+  private processAssignment(
+    node: TemplateNode,
+    vars: Map<string, TemplateVar>,
+    scopeStack: ScopeFrame[],
+    blockLocals: Map<string, TemplateVar>
+  ) {
+    if (node.kind !== 'assignment') return;
+
+    let resolvedType: TypeResult | ResolveResult | null = null;
+
+    // 1. Try expression inference
+    try {
+      if (node.assignExpr) {
+        const exprType = inferExpressionType(node.assignExpr, vars, scopeStack, blockLocals);
+        if (exprType) resolvedType = exprType;
+      }
+    } catch { }
+
+    // 2. Fallback to path resolution
+    if (!resolvedType) {
+      const result = resolvePath(node.path, vars, scopeStack, blockLocals);
+      // We only accept empty-path resolution (which returns context) if the expression is explicitly "." or "$"
+      const isExplicitContext = node.assignExpr === '.' || node.assignExpr === '$';
+      const isValidPath =
+        (node.path.length > 0 &&
+          !(node.path.length === 1 && node.path[0] === '.' && !isExplicitContext)) ||
+        isExplicitContext;
+
+      if (result.found && isValidPath) {
+        resolvedType = result;
+      }
+    }
+
+    if (resolvedType && node.assignVars?.length) {
+      this.applyAssignmentLocals(node.assignVars, resolvedType, blockLocals);
+    }
+  }
+
   // ── Validation ─────────────────────────────────────────────────────────────
 
   private validateNodes(
@@ -389,17 +419,50 @@ export class TemplateValidator {
   ) {
     switch (node.kind) {
       case 'assignment': {
-        const result = resolvePath(node.path, vars, scopeStack, blockLocals);
-        if (!result.found) {
+        this.outputChannel.appendLine(`Validating assignment: "${node.assignExpr}" at ${node.line}:${node.col}`);
+
+        let resolvedType: TypeResult | ResolveResult | null = null;
+
+        // 1. Try expression evaluation first
+        try {
+          if (node.assignExpr) {
+            const exprType = inferExpressionType(node.assignExpr, vars, scopeStack, blockLocals);
+            if (exprType) {
+              resolvedType = exprType;
+              this.outputChannel.appendLine(`  Assignment expression inferred: ${JSON.stringify(exprType)}`);
+            }
+          }
+        } catch (e) {
+          this.outputChannel.appendLine(`  Assignment inference error: ${e}`);
+        }
+
+        // 2. Fallback to path resolution (only if expression eval failed)
+        if (!resolvedType) {
+          const result = resolvePath(node.path, vars, scopeStack, blockLocals);
+          const isExplicitContext = node.assignExpr === '.' || node.assignExpr === '$';
+          const isValidPath = (node.path.length > 0 && !(node.path.length === 1 && node.path[0] === '.' && !isExplicitContext)) || isExplicitContext;
+
+          if (result.found && isValidPath) {
+            resolvedType = result;
+            this.outputChannel.appendLine(`  Assignment resolved via path: ${JSON.stringify(result)}`);
+          } else {
+            this.outputChannel.appendLine(`  Assignment path resolution ignored (empty path or invalid).`);
+          }
+        }
+
+        if (resolvedType) {
+          if (node.assignVars?.length) {
+            this.applyAssignmentLocals(node.assignVars, resolvedType, blockLocals);
+          }
+        } else {
+          this.outputChannel.appendLine(`  Assignment validation failed.`);
           errors.push({
-            message: `Expression "${node.assignExpr}" is not defined`,
+            message: `Expression "${node.assignExpr}" is invalid or undefined`,
             line: node.line,
             col: node.col,
-            severity: 'warning',
+            severity: 'error',
             variable: node.assignExpr,
           });
-        } else if (node.assignVars?.length) {
-          this.applyAssignmentLocals(node.assignVars, result, blockLocals);
         }
         break;
       }
@@ -409,30 +472,98 @@ export class TemplateValidator {
         if (node.path[0] === '.') break;
         if (node.path[0] === '$' && node.path.length === 1) break;
 
-        let pathResolved = resolvePath(node.path, vars, scopeStack, blockLocals).found;
+        const cleanExpr = node.rawText ? node.rawText.replace(/^\{\{-?\s*/, '').replace(/\s*-?\}\}$/, '') : '';
 
-        // Try expression parser for complex expressions (e.g., function calls)
-        if (!pathResolved && node.rawText) {
-          try {
-            const cleanExpr = node.rawText.replace(/^\{\{-?\s*/, '').replace(/\s*-?\}\}$/, '');
-            const exprType = inferExpressionType(cleanExpr, vars, scopeStack, blockLocals);
-            if (exprType) {
-              pathResolved = true;
-            }
-          } catch {
-            // Expression parsing failed, continue with error
+        this.outputChannel.appendLine(`Validating variable/expression: "${cleanExpr}" at ${node.line}:${node.col}`);
+
+        // 1. Always attempt expression evaluation first
+        let exprType = null;
+        try {
+          if (cleanExpr) {
+            this.outputChannel.appendLine(`  Attempting inferExpressionType for: "${cleanExpr}"`);
+            exprType = inferExpressionType(cleanExpr, vars, scopeStack, blockLocals);
+            this.outputChannel.appendLine(`  inferExpressionType result: ${exprType ? JSON.stringify(exprType) : 'null'}`);
           }
+        } catch (e) {
+          this.outputChannel.appendLine(`  inferExpressionType threw error: ${e}`);
         }
 
-        if (!pathResolved) {
-          const displayPath =
-            node.path[0] === '$'
-              ? '$.' + node.path.slice(1).join('.')
-              : node.path[0].startsWith('$')
-                ? node.path.join('.')
-                : '.' + node.path.join('.');
+        if (exprType) {
+          // Expression is valid
+          this.outputChannel.appendLine(`  Expression valid.`);
+          break;
+        }
+
+        this.outputChannel.appendLine(`  Expression inference failed. Checking for sub-variables...`);
+
+        // 2. If expression failed, check for specific missing sub-variables
+        if (cleanExpr) {
+          const refs = cleanExpr.match(/(\(index\s+(?:\$|\.)[\w\d_.]+\s+[^)]+\)(?:\.[\w\d_.]+)*|(?:\$|\.)[\w\d_.[\]]*)/g);
+
+          let subVarError = false;
+          if (refs) {
+            for (const ref of refs) {
+              if (/^\.\d+$/.test(ref)) continue;
+              if (ref === '...') continue;
+
+              const subPath = this.parser.parseDotPath(ref);
+              if (subPath.length === 0 || (subPath.length === 1 && (subPath[0] === '.' || subPath[0] === '$'))) continue;
+
+              const subResult = resolvePath(subPath, vars, scopeStack, blockLocals);
+              this.outputChannel.appendLine(`  Checking sub-variable "${ref}" -> Found: ${subResult.found}`);
+
+              if (!subResult.found) {
+                let errCol = node.col;
+                const refIdx = node.rawText.indexOf(ref);
+                if (refIdx !== -1) errCol = node.col + refIdx;
+
+                const displayPath = subPath[0] === '$'
+                  ? '$.' + subPath.slice(1).join('.')
+                  : subPath[0].startsWith('$')
+                    ? subPath.join('.')
+                    : '.' + subPath.join('.');
+
+                const errMsg = `Template variable "${displayPath}" is not defined in the render context`;
+                this.outputChannel.appendLine(`    Error: ${errMsg}`);
+
+                errors.push({
+                  message: errMsg,
+                  line: node.line,
+                  col: errCol,
+                  severity: 'error',
+                  variable: ref,
+                });
+                subVarError = true;
+              }
+            }
+          }
+          if (subVarError) break;
+        }
+
+        // 3. Fallback: check if it's a simple path that failed evaluation for some reason
+        const pathResolved = resolvePath(node.path, vars, scopeStack, blockLocals).found;
+        this.outputChannel.appendLine(`  Fallback pathResolved: ${pathResolved} (path: ${node.path.join('.')})`);
+
+        const isComplex = cleanExpr && /[\s|()]/.test(cleanExpr);
+
+        if (!pathResolved || isComplex) {
+          this.outputChannel.appendLine(`  Validation FAILED. isComplex: ${isComplex}`);
+
+          let message = `Template variable "${cleanExpr}" is not defined in the render context`;
+          if (isComplex) {
+            message = `Invalid expression or function call: "${cleanExpr}"`;
+          } else {
+            const displayPath =
+              node.path[0] === '$'
+                ? '$.' + node.path.slice(1).join('.')
+                : node.path[0].startsWith('$')
+                  ? node.path.join('.')
+                  : '.' + node.path.join('.');
+            message = `Template variable "${displayPath}" is not defined in the render context`;
+          }
+
           errors.push({
-            message: `Template variable "${displayPath}" is not defined in the render context`,
+            message: message,
             line: node.line,
             col: node.col,
             severity: 'error',
@@ -443,14 +574,11 @@ export class TemplateValidator {
       }
 
       case 'range': {
-        // Handle both named-path ranges (.Items, $.Roles) and bare-dot ranges
-        // (range $k, $v := .) — the latter iterates over the current dot context.
         const isBareDotsRange =
           node.path.length === 0 ||
           (node.path.length === 1 && node.path[0] === '.');
 
         if (!isBareDotsRange) {
-          // Named path: validate that the target exists.
           const result = resolvePath(node.path, vars, scopeStack, blockLocals);
           if (!result.found) {
             errors.push({
@@ -460,12 +588,10 @@ export class TemplateValidator {
               severity: 'error',
               variable: node.path[0],
             });
-            break; // still fall through to children traversal below
+            break;
           }
         }
 
-        // Build elem scope (handles both bare-dot and named-path, and injects
-        // $k/$v locals when the range uses variable assignment).
         const elemScope = this.buildRangeElemScope(node, vars, scopeStack, blockLocals);
         if (elemScope && node.children) {
           this.validateNodes(
@@ -550,9 +676,6 @@ export class TemplateValidator {
         return;
       }
 
-      // `block` and `define` — defer child validation to the cross-file registry
-      // path so we always validate them with the correct caller-provided scope.
-      // Skip inline child traversal here; it is handled in validateNamedBlockBody.
       case 'block':
       case 'define': {
         this.validateNamedBlockBody(node, vars, scopeStack, blockLocals, errors, ctx, filePath);
@@ -565,16 +688,6 @@ export class TemplateValidator {
     }
   }
 
-  /**
-   * Validate the body of a {{ define }} or {{ block }} node.
-   *
-   * Steps:
-   * 1. Look up the block in the cross-file registry.
-   * 2. Surface a duplicate error if it exists.
-   * 3. Resolve scope from the call site ({{ template "name" .Ctx }}) or
-   *    the block tag's own context arg.
-   * 4. Walk children with that resolved scope.
-   */
   private validateNamedBlockBody(
     node: TemplateNode,
     vars: Map<string, TemplateVar>,
@@ -595,13 +708,10 @@ export class TemplateValidator {
         severity: 'error',
         variable: node.blockName,
       });
-      // Still validate with best-guess scope so other errors aren't silenced.
     }
 
     if (!node.children || node.children.length === 0) return;
 
-    // Find the scope from the rootNodes of THIS file (current validate call).
-    // We need to search all template files for a {{ template "name" ... }} call.
     const childScope = this.resolveNamedBlockChildScope(
       node,
       vars,
@@ -620,15 +730,10 @@ export class TemplateValidator {
         filePath
       );
     } else {
-      // No call site found — validate with current scope (best effort)
       this.validateNodes(node.children, vars, scopeStack, errors, ctx, filePath);
     }
   }
 
-  /**
-   * Resolve the child scope for a named block body by searching for a
-   * {{ template "name" .Ctx }} call across all template files in the graph.
-   */
   private resolveNamedBlockChildScope(
     node: TemplateNode,
     vars: Map<string, TemplateVar>,
@@ -638,8 +743,6 @@ export class TemplateValidator {
   ): { childVars: Map<string, TemplateVar>; childStack: ScopeFrame[] } | null {
     const name = node.blockName!;
 
-    // --- Phase 1: search the current file's AST (already parsed) -----------
-    // We re-parse the current file to get rootNodes for call-site search.
     let currentFileNodes: TemplateNode[] = [];
     try {
       const openDoc = vscode.workspace.textDocuments.find(
@@ -669,7 +772,6 @@ export class TemplateValidator {
       };
     }
 
-    // --- Phase 2: search all other template files in the graph --------------
     const graph = this.graphBuilder.getGraph();
     for (const [, templateCtx] of graph.templates) {
       if (!templateCtx.absolutePath || templateCtx.absolutePath === currentFilePath) continue;
@@ -704,7 +806,6 @@ export class TemplateValidator {
       } catch { /* ignore */ }
     }
 
-    // --- Phase 3: for `block` nodes, fall back to the block's own context ---
     if (node.kind === 'block' && node.path.length > 0) {
       const result = resolvePath(node.path, vars, scopeStack, blockLocals);
       if (result.found) {
@@ -759,7 +860,6 @@ export class TemplateValidator {
       }
     }
 
-    // Named block (no file extension / path separator) → cross-file registry lookup
     if (!isFileBasedPartial(node.partialName)) {
       this.validateNamedBlockCallSite(node, vars, scopeStack, blockLocals, errors, ctx, filePath);
       return;
@@ -813,13 +913,6 @@ export class TemplateValidator {
     } catch { /* ignore read errors */ }
   }
 
-  /**
-   * Validate a {{ template "named-block" .Ctx }} call against the cross-file registry.
-   *
-   * - Checks for duplicate declarations and surfaces an error.
-   * - Finds the block's AST node (possibly in another file).
-   * - Validates the block's children with the resolved scope.
-   */
   private validateNamedBlockCallSite(
     callNode: TemplateNode,
     vars: Map<string, TemplateVar>,
@@ -841,19 +934,15 @@ export class TemplateValidator {
         severity: 'error',
         variable: callNode.partialName,
       });
-      // Continue validation with whatever block we found (first one).
     }
 
     if (!entry) {
-      // Block not found in registry — it may be defined in the same file below
-      // the call site, so try the current file as a fallback.
       this.validateNamedBlockFromCurrentFile(
         callNode, vars, scopeStack, blockLocals, errors, ctx, filePath
       );
       return;
     }
 
-    // Read the file that contains the block definition.
     const contextArg = callNode.partialContext ?? '.';
     const resolved = this.resolvePartialVars(contextArg, vars, scopeStack, blockLocals);
     const partialVars = resolved.vars;
@@ -883,7 +972,6 @@ export class TemplateValidator {
 
     if (!entry.node.children || entry.node.children.length === 0) return;
 
-    // If the block is in the same file, validate directly (avoid re-reading).
     if (entry.absolutePath === filePath) {
       const blockErrors: ValidationError[] = [];
       this.validateNodes(entry.node.children, partialVars, childStack, blockErrors, ctx, filePath);
@@ -896,7 +984,6 @@ export class TemplateValidator {
       return;
     }
 
-    // Block is in another file — validate with the resolved context.
     try {
       const openDoc = vscode.workspace.textDocuments.find(
         d => d.uri.fsPath === entry.absolutePath
@@ -905,7 +992,6 @@ export class TemplateValidator {
         ? openDoc.getText()
         : fs.readFileSync(entry.absolutePath, 'utf8');
 
-      // Re-parse to get a fresh AST with correct line numbers.
       const blockFileNodes = this.parser.parse(blockFileContent);
       const freshBlockNode = this.findDefineNodeInAST(blockFileNodes, callNode.partialName);
       if (!freshBlockNode?.children) return;
@@ -935,10 +1021,6 @@ export class TemplateValidator {
     } catch { /* ignore */ }
   }
 
-  /**
-   * Fallback: search the current file's AST for the named block definition
-   * when the registry lookup found nothing (e.g. the file hasn't been indexed yet).
-   */
   private validateNamedBlockFromCurrentFile(
     callNode: TemplateNode,
     vars: Map<string, TemplateVar>,
@@ -1088,7 +1170,6 @@ export class TemplateValidator {
 
     const hit = this.findNodeAtPosition(nodes, position, ctx.vars, [], nodes);
     if (!hit) {
-      // Try to find scope inside a define/block that might be in this file.
       const enclosing = this.findEnclosingBlockOrDefine(nodes, position);
       if (enclosing?.blockName) {
         const callCtx = this.resolveNamedBlockCallCtxForHover(
@@ -1117,15 +1198,30 @@ export class TemplateValidator {
 
     const { node, stack, vars: hitVars, locals: hitLocals } = hit;
 
+    if (node.rawText) {
+      const cursorOffset = position.character - (node.col - 1);
+      const subPathStr = this.extractPathAtCursor(node.rawText, cursorOffset);
+
+      if (subPathStr) {
+        const parts = this.parser.parseDotPath(subPathStr);
+        if (parts.length > 0 && !(parts.length === 1 && parts[0] === '.' && subPathStr !== '.')) {
+          const subResult = resolvePath(parts, hitVars, stack, hitLocals);
+          if (subResult.found) {
+            return this.buildHoverForPath(parts, subResult, hitVars, stack, hitLocals);
+          }
+        }
+      }
+    }
+
     const isBareVarDot = node.kind === 'variable' && node.path.length === 1 && node.path[0] === '.';
     const isPartialDotCtx =
       node.kind === 'partial' && (node.partialContext ?? '.') === '.';
     if (isBareVarDot || isPartialDotCtx) return this.buildDotHover(stack, hitVars);
 
-    //  Try to evaluate the expression
     let result = resolvePath(node.path, hitVars, stack, hitLocals);
+    let isExpressionFallback = false;
+    let exprText = node.rawText;
 
-    // Fallback to expression parser for complex expressions
     if (!result.found && node.rawText) {
       try {
         const cleanExpr = node.rawText.replace(/^\{\{-?\s*/, '').replace(/\s*-?\}\}$/, '');
@@ -1140,28 +1236,62 @@ export class TemplateValidator {
             elemType: exprType.elemType,
             keyType: exprType.keyType,
           };
+          isExpressionFallback = true;
+          exprText = cleanExpr;
         }
-      } catch (err) {
-        // Silently fall back to existing behavior
-      }
+      } catch (err) { }
     }
 
     if (!result.found) return null;
 
-    const varName =
-      node.path[0] === '.'
+    const pathToUse = isExpressionFallback ? ['expression'] : node.path;
+    return this.buildHoverForPath(pathToUse, result, hitVars, stack, hitLocals, exprText);
+  }
+
+  private extractPathAtCursor(text: string, offset: number): string | null {
+    const allowedChars = /[a-zA-Z0-9_$.]/;
+
+    let start = offset;
+    while (start > 0 && allowedChars.test(text[start - 1])) {
+      start--;
+    }
+
+    let end = offset;
+    while (end < text.length && allowedChars.test(text[end])) {
+      end++;
+    }
+
+    if (start >= end) return null;
+
+    const candidate = text.substring(start, end);
+    if (!candidate.includes('.') && !candidate.includes('$')) return null;
+
+    return candidate;
+  }
+
+  private buildHoverForPath(
+    path: string[],
+    result: ResolveResult | TypeResult,
+    vars: Map<string, TemplateVar>,
+    stack: ScopeFrame[],
+    locals?: Map<string, TemplateVar>,
+    rawText?: string
+  ): vscode.Hover {
+    const varName = rawText && path.length === 1 && (path[0] === 'expression' || path[0] === 'unknown')
+      ? rawText
+      : path[0] === '.'
         ? '.'
-        : node.path[0] === '$'
-          ? '$.' + node.path.slice(1).join('.')
-          : node.path[0].startsWith('$')
-            ? node.path.join('.')
-            : '.' + node.path.join('.');
+        : path[0] === '$'
+          ? '$.' + path.slice(1).join('.')
+          : path[0].startsWith('$')
+            ? path.join('.')
+            : '.' + path.join('.');
 
     const md = new vscode.MarkdownString();
     md.isTrusted = true;
     md.appendCodeblock(`${varName}: ${result.typeStr}`, 'go');
 
-    const varInfo = this.findVariableInfo(node.path, hitVars, stack, hitLocals);
+    const varInfo = this.findVariableInfo(path, vars, stack, locals);
     if (varInfo?.doc) {
       md.appendMarkdown('\n\n---\n\n');
       md.appendMarkdown(varInfo.doc);
@@ -1179,21 +1309,15 @@ export class TemplateValidator {
     return new vscode.Hover(md);
   }
 
-  /**
-   * Resolve the call-site context for a named block from the cross-file registry
-   * (used by hover when cursor is inside a define/block body).
-   */
   private resolveNamedBlockCallCtxForHover(
     blockName: string,
     vars: Map<string, TemplateVar>,
     currentFileNodes: TemplateNode[],
     currentFilePath: string
   ): { typeStr: string; fields?: FieldInfo[]; isMap?: boolean; keyType?: string; elemType?: string; isSlice?: boolean } | null {
-    // 1. Search current file first.
     const localCtx = this.findCallSiteContext(currentFileNodes, blockName, vars, []);
     if (localCtx) return localCtx;
 
-    // 2. Search all other files.
     const graph = this.graphBuilder.getGraph();
     for (const [, templateCtx] of graph.templates) {
       if (!templateCtx.absolutePath || templateCtx.absolutePath === currentFilePath) continue;
@@ -1315,42 +1439,26 @@ export class TemplateValidator {
     const hit = this.findNodeAtPosition(nodes, position, ctx.vars, [], nodes);
     if (!hit) return null;
 
-    const { node, stack, vars: hitVars } = hit;
+    const { node, stack, vars: hitVars, locals: hitLocals } = hit;
 
-    let hoveredIndex = node.path.length - 1;
+    let targetPath: string[] = [];
+
     if (node.rawText) {
       const cursorOffset = position.character - (node.col - 1);
-      const pathStr =
-        node.path[0] === '$'
-          ? '$.' + node.path.slice(1).join('.')
-          : node.path[0].startsWith('$')
-            ? node.path.join('.')
-            : '.' + node.path.join('.');
-      const pathStart = node.rawText.indexOf(pathStr);
-      if (pathStart !== -1) {
-        const offsetInPath = cursorOffset - pathStart;
-        if (offsetInPath >= 0 && offsetInPath <= pathStr.length) {
-          let currentLen = 0;
-          const segments = pathStr.split('.');
-          for (let i = 0; i < segments.length; i++) {
-            currentLen += segments[i].length + 1;
-            if (offsetInPath <= currentLen) {
-              hoveredIndex =
-                node.path[0] === '$'
-                  ? i
-                  : node.path[0].startsWith('$')
-                    ? i
-                    : i === 0
-                      ? 0
-                      : i - 1;
-              break;
-            }
-          }
-        }
+      const subPathStr = this.extractPathAtCursor(node.rawText, cursorOffset);
+      if (subPathStr) {
+        targetPath = this.parser.parseDotPath(subPathStr);
       }
     }
 
-    const targetPath = node.path.slice(0, hoveredIndex + 1);
+    if (targetPath.length === 0) {
+      if (node.path.length > 0 && (node.path[0] === '.' || node.path[0].startsWith('$'))) {
+        targetPath = node.path;
+      } else {
+        return null;
+      }
+    }
+
     let pathForDef = targetPath;
     let topVarName = pathForDef[0];
     if (topVarName === '$' && pathForDef.length > 1) {
@@ -1361,7 +1469,7 @@ export class TemplateValidator {
 
     if (topVarName.startsWith('$') && topVarName !== '$') {
       const declaredVar = this.findDeclaredVariableDefinition(
-        node,
+        { ...node, path: targetPath },
         nodes,
         position,
         ctx,
@@ -1369,7 +1477,7 @@ export class TemplateValidator {
         hit.locals
       );
       if (declaredVar) return declaredVar;
-      const rangeVar = this.findRangeAssignedVariable(node, stack, ctx);
+      const rangeVar = this.findRangeAssignedVariable({ ...node, path: targetPath }, stack, ctx);
       if (rangeVar) return rangeVar;
     }
 
@@ -1731,15 +1839,10 @@ export class TemplateValidator {
     return null;
   }
 
-  /**
-   * Find the definition location of a named block by consulting the cross-file
-   * registry first, then falling back to scanning files.
-   */
   private async findNamedBlockDefinitionLocation(
     name: string,
     ctx: TemplateContext
   ): Promise<vscode.Location | null> {
-    // 1. Cross-file registry lookup (fast path)
     const { entry } = this.resolveNamedBlock(name);
     if (entry) {
       return new vscode.Location(
@@ -1748,7 +1851,6 @@ export class TemplateValidator {
       );
     }
 
-    // 2. Legacy scan fallback (for files not yet in the registry)
     const graph = this.graphBuilder.getGraph();
     const defineRegex = new RegExp(`\\{\\{\\s*(?:define|block)\\s+"${name}"`);
     const filesToSearch = [
@@ -1833,12 +1935,7 @@ export class TemplateValidator {
     blockLocals: Map<string, TemplateVar> = new Map()
   ): { typeStr: string; fields?: FieldInfo[]; isMap?: boolean; keyType?: string; elemType?: string; isSlice?: boolean } | null {
     for (const node of nodes) {
-      if (node.kind === 'assignment') {
-        const result = resolvePath(node.path, vars, scopeStack, blockLocals);
-        if (result.found && node.assignVars) {
-          this.applyAssignmentLocals(node.assignVars, result, blockLocals);
-        }
-      }
+      this.processAssignment(node, vars, scopeStack, blockLocals);
 
       const isTemplateCall = node.kind === 'partial' && node.partialName === blockName;
       const isBlockDecl = node.kind === 'block' && node.blockName === blockName;
@@ -1944,11 +2041,7 @@ export class TemplateValidator {
       const startLine = node.line - 1;
       const startCol = node.col - 1;
 
-      if (node.kind === 'assignment') {
-        const result = resolvePath(node.path, vars, scopeStack, blockLocals);
-        if (result.found && node.assignVars)
-          this.applyAssignmentLocals(node.assignVars, result, blockLocals);
-      }
+      this.processAssignment(node, vars, scopeStack, blockLocals);
 
       if (node.kind === 'variable') {
         const endCol = startCol + node.rawText.length;
@@ -1983,7 +2076,6 @@ export class TemplateValidator {
         (position.line === endLine && position.character <= (node.endCol ?? 0) - 1);
       if (!afterStart || !beforeEnd) continue;
 
-      // Cursor on opening tag
       if (
         position.line === startLine &&
         position.character <= startCol + node.rawText.length
@@ -1991,18 +2083,15 @@ export class TemplateValidator {
         return { node, stack: scopeStack, vars, locals: blockLocals };
       }
 
-      // For define/block nodes, we need to search across files for the correct scope.
-      // Build scope using the cross-file registry so hover works in any file.
       let childVars = vars;
       let childStack = scopeStack;
 
       if ((node.kind === 'define' || node.kind === 'block') && node.blockName) {
-        // Prefer cross-file call-site context for block/define bodies.
         const callCtx = this.resolveNamedBlockCallCtxForHover(
           node.blockName,
           vars,
           rootNodes,
-          '' // no current file path needed here; it will search all files
+          ''
         );
         if (callCtx) {
           childVars = this.fieldsToVarMap(callCtx.fields ?? []);
@@ -2083,7 +2172,6 @@ export class TemplateValidator {
 
     const linePrefix = document.lineAt(position.line).text.slice(0, position.character);
 
-    // Check if we're inside a function call or pipeline
     const inComplexExpr = /\(\s*[^)]*$|\|\s*[^|}]*$/.test(linePrefix);
 
     if (inComplexExpr) {
@@ -2091,12 +2179,10 @@ export class TemplateValidator {
       if (match) {
         const partialExpr = match[1].trim();
 
-        // Try to infer type of the partial expression
         try {
           const exprType = inferExpressionType(partialExpr, ctx.vars, stack, locals);
 
           if (exprType?.fields) {
-            // Return field completions based on inferred type
             return exprType.fields.map(f => {
               const item = new vscode.CompletionItem(
                 f.name,
@@ -2109,9 +2195,7 @@ export class TemplateValidator {
               return item;
             });
           }
-        } catch {
-          // Expression parsing failed, fall through to existing logic
-        }
+        } catch { }
       }
     }
 
@@ -2174,11 +2258,7 @@ export class TemplateValidator {
     const blockLocals = new Map<string, TemplateVar>();
 
     for (const node of nodes) {
-      if (node.kind === 'assignment') {
-        const result = resolvePath(node.path, vars, scopeStack, blockLocals);
-        if (result.found && node.assignVars)
-          this.applyAssignmentLocals(node.assignVars, result, blockLocals);
-      }
+      this.processAssignment(node, vars, scopeStack, blockLocals);
 
       if (node.endLine === undefined) continue;
 
@@ -2192,7 +2272,6 @@ export class TemplateValidator {
         (position.line === endLine && position.character <= (node.endCol ?? 0));
 
       if (afterStart && beforeEnd) {
-        // For define/block, resolve scope from cross-file registry.
         if ((node.kind === 'define' || node.kind === 'block') && node.blockName) {
           const callCtx = this.resolveNamedBlockCallCtxForHover(
             node.blockName,

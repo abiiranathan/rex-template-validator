@@ -234,25 +234,16 @@ export class TemplateParser {
         assignVars,
         assignExpr,
       });
-      inner = assignExpr;
+      return results;
     }
 
-    const refs = inner.match(/(\(index\s+(?:\$|\.)[\w\d_.]+\s+[^)]+\)(?:\.[\w\d_.]+)*|(?:\$|\.)[\w\d_.[\]]*)/g);
-
-    if (refs) {
-      for (const ref of refs) {
-        if (/^\.\d+$/.test(ref)) continue;
-        if (ref === '...') continue;
-
-        results.push({
-          kind: 'variable',
-          path: this.parseDotPath(ref),
-          rawText: tok.raw,
-          line: tok.line,
-          col: tok.col,
-        });
-      }
-    }
+    results.push({
+      kind: 'variable',
+      path: this.parseDotPath(inner),
+      rawText: tok.raw,
+      line: tok.line,
+      col: tok.col,
+    });
 
     return results;
   }
