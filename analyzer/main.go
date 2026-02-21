@@ -26,7 +26,7 @@ func main() {
 		templateBase = mustAbs(*templateBaseDir)
 	}
 
-	result := validator.AnalyzeDir(absDir, *contextFile)
+	result := validator.AnalyzeDir(absDir, *contextFile, validator.DefaultConfig)
 	result.Errors = filterImportErrors(result.Errors)
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")

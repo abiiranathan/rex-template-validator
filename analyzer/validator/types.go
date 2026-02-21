@@ -77,3 +77,26 @@ type ScopeType struct {
 	IsSlice  bool
 	IsMap    bool
 }
+
+// AnalysisConfig defines the customizable function and type names for analysis
+type AnalysisConfig struct {
+	// RenderFunctionName is the name of the function/method used to render templates (default: "Render")
+	RenderFunctionName string
+	// ExecuteTemplateFunctionName is an alternative rendering method (default: "ExecuteTemplate")
+	ExecuteTemplateFunctionName string
+	// SetFunctionName is the name of the method used to set context variables (default: "Set")
+	SetFunctionName string
+	// ContextTypeName is the name of the Context type (default: "Context")
+	ContextTypeName string
+	// GlobalTemplateName is the key used in context file for global variables (default: "global")
+	GlobalTemplateName string
+}
+
+// DefaultConfig provides the default configuration for Rex framework
+var DefaultConfig = AnalysisConfig{
+	RenderFunctionName:          "Render",
+	ExecuteTemplateFunctionName: "ExecuteTemplate",
+	SetFunctionName:             "Set",
+	ContextTypeName:             "Context",
+	GlobalTemplateName:          "global",
+}

@@ -20,7 +20,7 @@ func getExprColumnRange(fset *token.FileSet, expr ast.Expr) (startCol, endCol in
 	return pos.Column, endPos.Column
 }
 
-func AnalyzeDir(dir string, contextFile string) AnalysisResult {
+func AnalyzeDir(dir string, contextFile string, config AnalysisConfig) AnalysisResult {
 	result := AnalysisResult{}
 	fset := token.NewFileSet()
 
@@ -82,7 +82,7 @@ func AnalyzeDir(dir string, contextFile string) AnalysisResult {
 	structIndex := buildStructIndex(fset, filesMap)
 
 	// Collect scopes (local functions) and analyze their Sets and Renders
-	scopes := collectFuncScopes(allFiles, info, fset, structIndex)
+	scopes := collectFuncScopes(allFiles, info, fset, structIndex, config)
 
 	// Identify global implicit variables (from scopes with Sets but NO Renders)
 	var globalImplicitVars []TemplateVar
@@ -169,7 +169,7 @@ func AnalyzeDir(dir string, contextFile string) AnalysisResult {
 	}
 
 	if contextFile != "" {
-		result.RenderCalls = enrichRenderCallsWithContext(result.RenderCalls, contextFile, pkgs, structIndex, fset)
+		result.RenderCalls = enrichRenderCallsWithContext(result.RenderCalls, contextFile, pkgs, structIndex, fset, config)
 	}
 
 	return result
@@ -181,7 +181,7 @@ type FuncScope struct {
 	RenderNodes []*ast.CallExpr
 }
 
-func collectFuncScopes(files []*ast.File, info *types.Info, fset *token.FileSet, structIndex map[string]structIndexEntry) []FuncScope {
+func collectFuncScopes(files []*ast.File, info *types.Info, fset *token.FileSet, structIndex map[string]structIndexEntry, config AnalysisConfig) []FuncScope {
 	var scopes []FuncScope
 
 	// Helper to process a function node (FuncDecl or FuncLit)
@@ -203,12 +203,12 @@ func collectFuncScopes(files []*ast.File, info *types.Info, fset *token.FileSet,
 			}
 
 			// Check for Render call
-			if isRenderCall(call) {
+			if isRenderCall(call, config) {
 				scope.RenderNodes = append(scope.RenderNodes, call)
 			}
 
 			// Check for Set call
-			if setVar := extractSetCallVar(call, info, fset, structIndex); setVar != nil {
+			if setVar := extractSetCallVar(call, info, fset, structIndex, config); setVar != nil {
 				scope.SetVars = append(scope.SetVars, *setVar)
 			}
 
@@ -231,7 +231,7 @@ func collectFuncScopes(files []*ast.File, info *types.Info, fset *token.FileSet,
 	return scopes
 }
 
-func isRenderCall(call *ast.CallExpr) bool {
+func isRenderCall(call *ast.CallExpr, config AnalysisConfig) bool {
 	funcName := ""
 	switch fn := call.Fun.(type) {
 	case *ast.SelectorExpr:
@@ -239,17 +239,17 @@ func isRenderCall(call *ast.CallExpr) bool {
 	case *ast.Ident:
 		funcName = fn.Name
 	}
-	return (funcName == "Render" || funcName == "ExecuteTemplate") && len(call.Args) >= 2
+	return (funcName == config.RenderFunctionName || funcName == config.ExecuteTemplateFunctionName) && len(call.Args) >= 2
 }
 
-func extractSetCallVar(call *ast.CallExpr, info *types.Info, fset *token.FileSet, structIndex map[string]structIndexEntry) *TemplateVar {
+func extractSetCallVar(call *ast.CallExpr, info *types.Info, fset *token.FileSet, structIndex map[string]structIndexEntry, config AnalysisConfig) *TemplateVar {
 	// Look for c.Set("key", value)
 	sel, ok := call.Fun.(*ast.SelectorExpr)
 	if !ok {
 		return nil
 	}
 
-	if sel.Sel.Name != "Set" {
+	if sel.Sel.Name != config.SetFunctionName {
 		return nil
 	}
 
@@ -261,7 +261,7 @@ func extractSetCallVar(call *ast.CallExpr, info *types.Info, fset *token.FileSet
 				t = ptr.Elem()
 			}
 			if named, ok := t.(*types.Named); ok {
-				if named.Obj().Name() != "Context" {
+				if named.Obj().Name() != config.ContextTypeName {
 					return nil
 				}
 			} else {
@@ -320,13 +320,13 @@ func extractSetCallVar(call *ast.CallExpr, info *types.Info, fset *token.FileSet
 	return &tv
 }
 
-func enrichRenderCallsWithContext(calls []RenderCall, contextFile string, pkgs []*packages.Package, structIndex map[string]structIndexEntry, fset *token.FileSet) []RenderCall {
+func enrichRenderCallsWithContext(calls []RenderCall, contextFile string, pkgs []*packages.Package, structIndex map[string]structIndexEntry, fset *token.FileSet, config AnalysisConfig) []RenderCall {
 	data, err := os.ReadFile(contextFile)
 	if err != nil {
 		return calls
 	}
-	var config map[string]map[string]string
-	if err := json.Unmarshal(data, &config); err != nil {
+	var contextConfig map[string]map[string]string
+	if err := json.Unmarshal(data, &contextConfig); err != nil {
 		return calls
 	}
 
@@ -363,7 +363,7 @@ func enrichRenderCallsWithContext(calls []RenderCall, contextFile string, pkgs [
 		walkPkg(pkg)
 	}
 
-	globalVars := buildTemplateVars(config["global"], typeMap, structIndex, fset)
+	globalVars := buildTemplateVars(contextConfig[config.GlobalTemplateName], typeMap, structIndex, fset)
 
 	seenTpls := make(map[string]bool)
 
@@ -371,7 +371,7 @@ func enrichRenderCallsWithContext(calls []RenderCall, contextFile string, pkgs [
 		seenTpls[call.Template] = true
 		var newVars []TemplateVar
 		newVars = append(newVars, globalVars...)
-		if tplVars, ok := config[call.Template]; ok {
+		if tplVars, ok := contextConfig[call.Template]; ok {
 			newVars = append(newVars, buildTemplateVars(tplVars, typeMap, structIndex, fset)...)
 		}
 		newVars = append(newVars, call.Vars...)
@@ -379,8 +379,8 @@ func enrichRenderCallsWithContext(calls []RenderCall, contextFile string, pkgs [
 	}
 
 	// Add synthetic render calls for templates defined in the JSON but not found in Go AST
-	for tplName, tplVars := range config {
-		if tplName == "global" {
+	for tplName, tplVars := range contextConfig {
+		if tplName == config.GlobalTemplateName {
 			continue
 		}
 		if !seenTpls[tplName] {

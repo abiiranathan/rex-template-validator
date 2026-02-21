@@ -65,7 +65,7 @@ go 1.21
 		t.Fatalf("failed to write go.mod: %v", err)
 	}
 
-	result := AnalyzeDir(tmpDir, "")
+	result := AnalyzeDir(tmpDir, "", DefaultConfig)
 
 	if len(result.RenderCalls) == 0 {
 		t.Fatal("expected at least one RenderCall, got 0")
@@ -180,7 +180,7 @@ func main() {
 		t.Fatalf("failed to write go.mod: %v", err)
 	}
 
-	result := AnalyzeDir(tmpDir, "")
+	result := AnalyzeDir(tmpDir, "", DefaultConfig)
 	if len(result.RenderCalls) == 0 {
 		t.Fatal("expected at least one RenderCall")
 	}
@@ -267,7 +267,7 @@ func main() {
 		t.Fatalf("failed to write go.mod: %v", err)
 	}
 
-	result := AnalyzeDir(tmpDir, "")
+	result := AnalyzeDir(tmpDir, "", DefaultConfig)
 	if len(result.RenderCalls) == 0 {
 		t.Fatal("expected at least one RenderCall")
 	}
@@ -340,7 +340,7 @@ func main() {
 	}
 
 	// Should not panic or hang
-	result := AnalyzeDir(tmpDir, "")
+	result := AnalyzeDir(tmpDir, "", DefaultConfig)
 	if len(result.RenderCalls) == 0 {
 		t.Fatal("expected at least one RenderCall")
 	}
@@ -398,7 +398,7 @@ func main() {
 		t.Fatalf("failed to write go.mod: %v", err)
 	}
 
-	result := AnalyzeDir(tmpDir, "")
+	result := AnalyzeDir(tmpDir, "", DefaultConfig)
 	if len(result.RenderCalls) == 0 {
 		t.Fatal("expected at least one RenderCall")
 	}
