@@ -9,16 +9,72 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
+	"unique"
 
 	"golang.org/x/tools/go/packages"
 )
+
+// ── Interned key type ────────────────────────────────────────────────────────
+// unique.Handle gives O(1) pointer-equality comparisons and eliminates
+// repeated string hashing on the hot structIndex lookup path.
+type structKeyHandle = unique.Handle[string]
+
+func makeStructKey(named *types.Named) structKeyHandle {
+	return unique.Make(rawStructKey(named))
+}
+
+func rawStructKey(named *types.Named) string {
+	obj := named.Obj()
+	if obj.Pkg() != nil {
+		return obj.Pkg().Name() + "." + obj.Name()
+	}
+	return obj.Name()
+}
+
+// ── Field cache ──────────────────────────────────────────────────────────────
+// extractFieldsWithDocs is the single hottest function in the analyser.
+// Named types are immutable after package load, so we can cache their
+// extracted fields globally for the lifetime of one AnalyzeDir call.
+
+type cachedFields struct {
+	fields []FieldInfo
+	doc    string
+}
+
+type fieldCache struct {
+	mu    sync.RWMutex
+	cache map[structKeyHandle]cachedFields
+}
+
+func newFieldCache() *fieldCache {
+	return &fieldCache{cache: make(map[structKeyHandle]cachedFields, 256)}
+}
+
+func (fc *fieldCache) get(k structKeyHandle) (cachedFields, bool) {
+	fc.mu.RLock()
+	v, ok := fc.cache[k]
+	fc.mu.RUnlock()
+	return v, ok
+}
+
+func (fc *fieldCache) set(k structKeyHandle, v cachedFields) {
+	fc.mu.Lock()
+	fc.cache[k] = v
+	fc.mu.Unlock()
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
 func getExprColumnRange(fset *token.FileSet, expr ast.Expr) (startCol, endCol int) {
 	pos := fset.Position(expr.Pos())
 	endPos := fset.Position(expr.End())
 	return pos.Column, endPos.Column
 }
+
+// ── Main entry point ─────────────────────────────────────────────────────────
 
 func AnalyzeDir(dir string, contextFile string, config AnalysisConfig) AnalysisResult {
 	result := AnalysisResult{}
@@ -43,8 +99,26 @@ func AnalyzeDir(dir string, contextFile string, config AnalysisConfig) AnalysisR
 		return result
 	}
 
-	var allFiles []*ast.File
-	var info *types.Info
+	// ── Merge type info ──────────────────────────────────────────────────────
+	// Merge all package TypesInfo into one aggregate. This is sequential and
+	// happens before any concurrent work, so there is no data race.
+	// We pre-size the maps to avoid incremental rehashing.
+	totalTypes, totalDefs, totalUses := 0, 0, 0
+	for _, pkg := range pkgs {
+		if pkg.TypesInfo != nil {
+			totalTypes += len(pkg.TypesInfo.Types)
+			totalDefs += len(pkg.TypesInfo.Defs)
+			totalUses += len(pkg.TypesInfo.Uses)
+		}
+	}
+
+	info := &types.Info{
+		Types: make(map[ast.Expr]types.TypeAndValue, totalTypes),
+		Defs:  make(map[*ast.Ident]types.Object, totalDefs),
+		Uses:  make(map[*ast.Ident]types.Object, totalUses),
+	}
+
+	allFiles := make([]*ast.File, 0, totalTypes/10+len(pkgs))
 
 	for _, pkg := range pkgs {
 		for _, e := range pkg.Errors {
@@ -54,37 +128,31 @@ func AnalyzeDir(dir string, contextFile string, config AnalysisConfig) AnalysisR
 		}
 		allFiles = append(allFiles, pkg.Syntax...)
 		if pkg.TypesInfo != nil {
-			if info == nil {
-				info = pkg.TypesInfo
-			} else {
-				maps.Copy(info.Types, pkg.TypesInfo.Types)
-				maps.Copy(info.Defs, pkg.TypesInfo.Defs)
-				maps.Copy(info.Uses, pkg.TypesInfo.Uses)
-			}
+			maps.Copy(info.Types, pkg.TypesInfo.Types)
+			maps.Copy(info.Defs, pkg.TypesInfo.Defs)
+			maps.Copy(info.Uses, pkg.TypesInfo.Uses)
 		}
 	}
 
-	if info == nil {
-		info = &types.Info{
-			Types: make(map[ast.Expr]types.TypeAndValue),
-			Defs:  make(map[*ast.Ident]types.Object),
-			Uses:  make(map[*ast.Ident]types.Object),
-		}
-	}
-
-	filesMap := make(map[string]*ast.File)
+	// ── Build file map for struct indexing ───────────────────────────────────
+	filesMap := make(map[string]*ast.File, len(allFiles))
 	for _, f := range allFiles {
 		if pos := fset.File(f.Pos()); pos != nil {
 			filesMap[pos.Name()] = f
 		}
 	}
 
+	// Shared field cache — passed through the analysis so each unique named
+	// type pays extraction cost exactly once.
+	fc := newFieldCache()
+
+	// 1. Build struct index concurrently (writes go to sync.Map, no merge copy)
 	structIndex := buildStructIndex(fset, filesMap)
 
-	// Collect scopes (local functions) and analyze their Sets and Renders
-	scopes := collectFuncScopes(allFiles, info, fset, structIndex, config)
+	// 2. Collect scopes concurrently, distributing individual functions not files
+	scopes := collectFuncScopes(allFiles, info, fset, structIndex, fc, config)
 
-	// Identify global implicit variables (from scopes with Sets but NO Renders)
+	// ── Identify global implicit vars (scopes with Sets but NO Renders) ──────
 	var globalImplicitVars []TemplateVar
 	for _, scope := range scopes {
 		if len(scope.RenderNodes) == 0 && len(scope.SetVars) > 0 {
@@ -92,143 +160,208 @@ func AnalyzeDir(dir string, contextFile string, config AnalysisConfig) AnalysisR
 		}
 	}
 
-	// Generate render calls from scopes that HAVE renders
+	// ── Pre-count render calls to avoid slice re-growth ──────────────────────
+	totalRenders := 0
 	for _, scope := range scopes {
-		if len(scope.RenderNodes) > 0 {
-			for _, call := range scope.RenderNodes {
-				// Process this render call
-				// Duplicate logic from original AnalyzeDir loop but using 'call' directly
+		totalRenders += len(scope.RenderNodes)
+	}
+	result.RenderCalls = make([]RenderCall, 0, totalRenders)
 
-				// Re-extract template path and data arg (since we only stored the CallExpr)
-				templateArgIdx := 0
-
-				switch call.Fun.(type) {
-				case *ast.SelectorExpr:
-					templateArgIdx = 0
-				case *ast.Ident:
-					templateArgIdx = -1
-				}
-
-				if templateArgIdx == -1 {
-					for i, arg := range call.Args {
-						if lit, ok := arg.(*ast.BasicLit); ok && lit.Kind == token.STRING {
-							templateArgIdx = i
-							break
-						}
-					}
-				}
-
-				if templateArgIdx == -1 || templateArgIdx >= len(call.Args) {
-					continue
-				}
-
-				templatePathExpr := call.Args[templateArgIdx]
-				templatePath := extractString(templatePathExpr)
-
-				tplNameStartCol, tplNameEndCol := getExprColumnRange(fset, templatePathExpr)
-				if lit, ok := templatePathExpr.(*ast.BasicLit); ok && lit.Kind == token.STRING {
-					tplNameStartCol += 1
-					tplNameEndCol -= 1
-				}
-
-				if templatePath == "" {
-					continue
-				}
-
-				// Data arg is next
-				dataArgIdx := templateArgIdx + 1
-				var vars []TemplateVar
-				if dataArgIdx < len(call.Args) {
-					vars = extractMapVars(call.Args[dataArgIdx], info, fset, structIndex)
-				}
-
-				// Combine variables: Explicit + Local Scope + Global Implicit
-				var allVars []TemplateVar
-				allVars = append(allVars, vars...)
-				allVars = append(allVars, scope.SetVars...)
-				allVars = append(allVars, globalImplicitVars...)
-
-				pos := fset.Position(call.Pos())
-				relFile := pos.Filename
-				if abs, err := filepath.Abs(pos.Filename); err == nil {
-					if rel, err := filepath.Rel(dir, abs); err == nil {
-						relFile = rel
-					}
-				}
-
-				result.RenderCalls = append(result.RenderCalls, RenderCall{
-					File:                 relFile,
-					Line:                 pos.Line,
-					Template:             templatePath,
-					TemplateNameStartCol: tplNameStartCol,
-					TemplateNameEndCol:   tplNameEndCol,
-					Vars:                 allVars,
-				})
+	// ── Generate render calls from scopes that have renders ──────────────────
+	for _, scope := range scopes {
+		if len(scope.RenderNodes) == 0 {
+			continue
+		}
+		for _, call := range scope.RenderNodes {
+			templateArgIdx := 0
+			switch call.Fun.(type) {
+			case *ast.SelectorExpr:
+				templateArgIdx = 0
+			case *ast.Ident:
+				templateArgIdx = -1
 			}
+
+			if templateArgIdx == -1 {
+				for i, arg := range call.Args {
+					if lit, ok := arg.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+						templateArgIdx = i
+						break
+					}
+				}
+			}
+
+			if templateArgIdx == -1 || templateArgIdx >= len(call.Args) {
+				continue
+			}
+
+			templatePathExpr := call.Args[templateArgIdx]
+			templatePath := extractString(templatePathExpr)
+
+			tplNameStartCol, tplNameEndCol := getExprColumnRange(fset, templatePathExpr)
+			if lit, ok := templatePathExpr.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+				tplNameStartCol++
+				tplNameEndCol--
+			}
+
+			if templatePath == "" {
+				continue
+			}
+
+			dataArgIdx := templateArgIdx + 1
+			var vars []TemplateVar
+			if dataArgIdx < len(call.Args) {
+				vars = extractMapVars(call.Args[dataArgIdx], info, fset, structIndex, fc)
+			}
+
+			// Pre-allocate combined vars slice in one shot
+			allVars := make([]TemplateVar, 0, len(vars)+len(scope.SetVars)+len(globalImplicitVars))
+			allVars = append(allVars, vars...)
+			allVars = append(allVars, scope.SetVars...)
+			allVars = append(allVars, globalImplicitVars...)
+
+			pos := fset.Position(call.Pos())
+			relFile := pos.Filename
+			if abs, err := filepath.Abs(pos.Filename); err == nil {
+				if rel, err := filepath.Rel(dir, abs); err == nil {
+					relFile = rel
+				}
+			}
+
+			result.RenderCalls = append(result.RenderCalls, RenderCall{
+				File:                 relFile,
+				Line:                 pos.Line,
+				Template:             templatePath,
+				TemplateNameStartCol: tplNameStartCol,
+				TemplateNameEndCol:   tplNameEndCol,
+				Vars:                 allVars,
+			})
 		}
 	}
 
 	if contextFile != "" {
-		result.RenderCalls = enrichRenderCallsWithContext(result.RenderCalls, contextFile, pkgs, structIndex, fset, config)
+		result.RenderCalls = enrichRenderCallsWithContext(result.RenderCalls, contextFile, pkgs, structIndex, fc, fset, config)
 	}
 
 	return result
 }
 
-// FuncScope represents a function body analysis
+// ── FuncScope ────────────────────────────────────────────────────────────────
+
 type FuncScope struct {
 	SetVars     []TemplateVar
 	RenderNodes []*ast.CallExpr
 }
 
-func collectFuncScopes(files []*ast.File, info *types.Info, fset *token.FileSet, structIndex map[string]structIndexEntry, config AnalysisConfig) []FuncScope {
-	var scopes []FuncScope
+// funcWorkUnit is a single function node ready to be processed by a worker.
+type funcWorkUnit struct {
+	node ast.Node
+}
 
-	// Helper to process a function node (FuncDecl or FuncLit)
-	processFunc := func(n ast.Node) {
-		scope := FuncScope{}
-
-		// Inspect the body of the function
-		ast.Inspect(n, func(child ast.Node) bool {
-			// Don't recurse into nested function definitions; they will be handled by the outer loop
-			if child != n {
-				if _, isFunc := child.(*ast.FuncLit); isFunc {
-					return false
-				}
-			}
-
-			call, ok := child.(*ast.CallExpr)
-			if !ok {
-				return true
-			}
-
-			// Check for Render call
-			if isRenderCall(call, config) {
-				scope.RenderNodes = append(scope.RenderNodes, call)
-			}
-
-			// Check for Set call
-			if setVar := extractSetCallVar(call, info, fset, structIndex, config); setVar != nil {
-				scope.SetVars = append(scope.SetVars, *setVar)
-			}
-
-			return true
-		})
-		scopes = append(scopes, scope)
-	}
-
+// collectFuncScopes distributes individual function nodes (not files) across
+// workers for better load-balancing on files that contain many large functions.
+func collectFuncScopes(
+	files []*ast.File,
+	info *types.Info,
+	fset *token.FileSet,
+	structIndex map[structKeyHandle]structIndexEntry,
+	fc *fieldCache,
+	config AnalysisConfig,
+) []FuncScope {
+	// ── Phase 1: collect all function nodes sequentially (AST walk is fast) ──
+	// Reserve a reasonable capacity to avoid repeated growth.
+	funcNodes := make([]funcWorkUnit, 0, len(files)*8)
 	for _, f := range files {
 		ast.Inspect(f, func(n ast.Node) bool {
-			if _, ok := n.(*ast.FuncDecl); ok {
-				processFunc(n)
-			}
-			if _, ok := n.(*ast.FuncLit); ok {
-				processFunc(n)
+			switch n.(type) {
+			case *ast.FuncDecl, *ast.FuncLit:
+				funcNodes = append(funcNodes, funcWorkUnit{node: n})
 			}
 			return true
 		})
 	}
-	return scopes
+
+	if len(funcNodes) == 0 {
+		return nil
+	}
+
+	// ── Phase 2: process function nodes concurrently ─────────────────────────
+	numWorkers := max(runtime.NumCPU(), 1)
+
+	// Partition work by index range — no per-unit channel send overhead.
+	chunkSize := (len(funcNodes) + numWorkers - 1) / numWorkers
+
+	sliceResultChan := make(chan []FuncScope, numWorkers)
+	var wg sync.WaitGroup
+
+	for w := range numWorkers {
+		start := w * chunkSize
+		if start >= len(funcNodes) {
+			break
+		}
+		end := min(start+chunkSize, len(funcNodes))
+		chunk := funcNodes[start:end]
+
+		wg.Add(1)
+		go func(chunk []funcWorkUnit) {
+			defer wg.Done()
+			localScopes := make([]FuncScope, 0, len(chunk)/2)
+
+			for _, unit := range chunk {
+				scope := processFunc(unit.node, info, fset, structIndex, fc, config)
+				if len(scope.RenderNodes) > 0 || len(scope.SetVars) > 0 {
+					localScopes = append(localScopes, scope)
+				}
+			}
+			sliceResultChan <- localScopes
+		}(chunk)
+	}
+
+	// Close result channel once all workers finish.
+	go func() {
+		wg.Wait()
+		close(sliceResultChan)
+	}()
+
+	var allScopes []FuncScope
+	for scopes := range sliceResultChan {
+		allScopes = append(allScopes, scopes...)
+	}
+	return allScopes
+}
+
+// processFunc walks a single function node and returns its FuncScope.
+// Extracted from the closure so the compiler can inline/optimise it.
+func processFunc(
+	n ast.Node,
+	info *types.Info,
+	fset *token.FileSet,
+	structIndex map[structKeyHandle]structIndexEntry,
+	fc *fieldCache,
+	config AnalysisConfig,
+) FuncScope {
+	var scope FuncScope
+	ast.Inspect(n, func(child ast.Node) bool {
+		// Don't recurse into nested function literals.
+		if child != n {
+			if _, isFunc := child.(*ast.FuncLit); isFunc {
+				return false
+			}
+		}
+
+		call, ok := child.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+
+		if isRenderCall(call, config) {
+			scope.RenderNodes = append(scope.RenderNodes, call)
+		}
+		if setVar := extractSetCallVar(call, info, fset, structIndex, fc, config); setVar != nil {
+			scope.SetVars = append(scope.SetVars, *setVar)
+		}
+		return true
+	})
+	return scope
 }
 
 func isRenderCall(call *ast.CallExpr, config AnalysisConfig) bool {
@@ -239,21 +372,26 @@ func isRenderCall(call *ast.CallExpr, config AnalysisConfig) bool {
 	case *ast.Ident:
 		funcName = fn.Name
 	}
-	return (funcName == config.RenderFunctionName || funcName == config.ExecuteTemplateFunctionName) && len(call.Args) >= 2
+	return (funcName == config.RenderFunctionName || funcName == config.ExecuteTemplateFunctionName) &&
+		len(call.Args) >= 2
 }
 
-func extractSetCallVar(call *ast.CallExpr, info *types.Info, fset *token.FileSet, structIndex map[string]structIndexEntry, config AnalysisConfig) *TemplateVar {
-	// Look for c.Set("key", value)
+func extractSetCallVar(
+	call *ast.CallExpr,
+	info *types.Info,
+	fset *token.FileSet,
+	structIndex map[structKeyHandle]structIndexEntry,
+	fc *fieldCache,
+	config AnalysisConfig,
+) *TemplateVar {
 	sel, ok := call.Fun.(*ast.SelectorExpr)
 	if !ok {
 		return nil
 	}
-
 	if sel.Sel.Name != config.SetFunctionName {
 		return nil
 	}
 
-	// Check receiver type
 	if info != nil && sel.X != nil {
 		if typeAndValue, ok := info.Types[sel.X]; ok {
 			t := typeAndValue.Type
@@ -265,10 +403,6 @@ func extractSetCallVar(call *ast.CallExpr, info *types.Info, fset *token.FileSet
 					return nil
 				}
 			} else {
-				// Strict check: if unknown type, ignore to avoid false positives?
-				// For now, let's skip if we can't confirm it's Context, assuming 'Set' is rare enough or specific enough.
-				// But user might use other libraries with 'Set'.
-				// Let's rely on type name "Context" if available.
 				return nil
 			}
 		}
@@ -278,8 +412,7 @@ func extractSetCallVar(call *ast.CallExpr, info *types.Info, fset *token.FileSet
 		return nil
 	}
 
-	keyArg := call.Args[0]
-	key := extractString(keyArg)
+	key := extractString(call.Args[0])
 	if key == "" {
 		return nil
 	}
@@ -289,28 +422,20 @@ func extractSetCallVar(call *ast.CallExpr, info *types.Info, fset *token.FileSet
 
 	if typeInfo, ok := info.Types[valArg]; ok && typeInfo.Type != nil {
 		tv.TypeStr = normalizeTypeStr(typeInfo.Type.String())
-		seen := make(map[string]bool)
-		tv.Fields, tv.Doc = extractFieldsWithDocs(typeInfo.Type, structIndex, seen, fset)
+		seen := make(map[structKeyHandle]bool)
+		tv.Fields, tv.Doc = extractFieldsWithDocs(typeInfo.Type, structIndex, fc, seen, fset)
 
 		if elemType := getElementType(typeInfo.Type); elemType != nil {
 			tv.IsSlice = true
 			tv.ElemType = normalizeTypeStr(elemType.String())
-			elemSeen := make(map[string]bool)
-			elemFields, elemDoc := extractFieldsWithDocs(elemType, structIndex, elemSeen, fset)
-			tv.Fields = elemFields
-			if elemDoc != "" {
-				tv.Doc = elemDoc
-			}
+			elemSeen := make(map[structKeyHandle]bool)
+			tv.Fields, tv.Doc = extractFieldsWithDocsDoc(elemType, structIndex, fc, elemSeen, fset, tv.Doc)
 		} else if keyType, elemType := getMapTypes(typeInfo.Type); keyType != nil && elemType != nil {
 			tv.IsMap = true
 			tv.KeyType = normalizeTypeStr(keyType.String())
 			tv.ElemType = normalizeTypeStr(elemType.String())
-			elemSeen := make(map[string]bool)
-			elemFields, elemDoc := extractFieldsWithDocs(elemType, structIndex, elemSeen, fset)
-			tv.Fields = elemFields
-			if elemDoc != "" {
-				tv.Doc = elemDoc
-			}
+			elemSeen := make(map[structKeyHandle]bool)
+			tv.Fields, tv.Doc = extractFieldsWithDocsDoc(elemType, structIndex, fc, elemSeen, fset, tv.Doc)
 		}
 	} else {
 		tv.TypeStr = inferTypeFromAST(valArg)
@@ -320,7 +445,34 @@ func extractSetCallVar(call *ast.CallExpr, info *types.Info, fset *token.FileSet
 	return &tv
 }
 
-func enrichRenderCallsWithContext(calls []RenderCall, contextFile string, pkgs []*packages.Package, structIndex map[string]structIndexEntry, fset *token.FileSet, config AnalysisConfig) []RenderCall {
+// extractFieldsWithDocsDoc is a thin helper that preserves an existing doc
+// string when the recursive extraction returns an empty one.
+func extractFieldsWithDocsDoc(
+	t types.Type,
+	structIndex map[structKeyHandle]structIndexEntry,
+	fc *fieldCache,
+	seen map[structKeyHandle]bool,
+	fset *token.FileSet,
+	existingDoc string,
+) ([]FieldInfo, string) {
+	fields, doc := extractFieldsWithDocs(t, structIndex, fc, seen, fset)
+	if doc == "" {
+		doc = existingDoc
+	}
+	return fields, doc
+}
+
+// ── enrichRenderCallsWithContext ─────────────────────────────────────────────
+
+func enrichRenderCallsWithContext(
+	calls []RenderCall,
+	contextFile string,
+	pkgs []*packages.Package,
+	structIndex map[structKeyHandle]structIndexEntry,
+	fc *fieldCache,
+	fset *token.FileSet,
+	config AnalysisConfig,
+) []RenderCall {
 	data, err := os.ReadFile(contextFile)
 	if err != nil {
 		return calls
@@ -330,77 +482,105 @@ func enrichRenderCallsWithContext(calls []RenderCall, contextFile string, pkgs [
 		return calls
 	}
 
-	// Build a global type registry mapping "PackageName.TypeName" to *types.TypeName
-	// This allows us to extract both the Type and its Definition Position.
-	typeMap := make(map[string]*types.TypeName)
-	visited := make(map[string]bool)
+	// ── Concurrent BFS over the import graph ─────────────────────────────────
+	// Populate typeMap using a sync.Map so multiple goroutines can write
+	// concurrently without a mutex bottleneck.
+	var typeMapSync sync.Map // map[string]*types.TypeName
 
-	var walkPkg func(p *packages.Package)
-	walkPkg = func(p *packages.Package) {
-		if visited[p.ID] {
-			return
+	var (
+		visitedMu sync.Mutex
+		visited   = make(map[string]bool, len(pkgs)*4)
+		queue     = make(chan *packages.Package, len(pkgs)*8)
+		bfsWg     sync.WaitGroup
+	)
+
+	enqueue := func(p *packages.Package) {
+		visitedMu.Lock()
+		if !visited[p.ID] {
+			visited[p.ID] = true
+			visitedMu.Unlock()
+			bfsWg.Add(1)
+			queue <- p
+		} else {
+			visitedMu.Unlock()
 		}
-		visited[p.ID] = true
+	}
 
-		if p.Types != nil {
-			scope := p.Types.Scope()
-			for _, name := range scope.Names() {
-				obj := scope.Lookup(name)
-				if typeName, ok := obj.(*types.TypeName); ok {
-					key := p.Types.Name() + "." + name
-					typeMap[key] = typeName
+	bfsWorkers := max(runtime.NumCPU(), 1)
+	for range bfsWorkers {
+		go func() {
+			for p := range queue {
+				if p.Types != nil {
+					scope := p.Types.Scope()
+					for _, name := range scope.Names() {
+						if typeName, ok := scope.Lookup(name).(*types.TypeName); ok {
+							key := p.Types.Name() + "." + name
+							typeMapSync.Store(key, typeName)
+						}
+					}
 				}
+				for _, imp := range p.Imports {
+					enqueue(imp)
+				}
+				bfsWg.Done()
 			}
-		}
-
-		// Recursively walk imports to gather types from standard library or other modules
-		for _, imp := range p.Imports {
-			walkPkg(imp)
-		}
+		}()
 	}
 
 	for _, pkg := range pkgs {
-		walkPkg(pkg)
+		enqueue(pkg)
 	}
+	bfsWg.Wait()
+	close(queue)
 
-	globalVars := buildTemplateVars(contextConfig[config.GlobalTemplateName], typeMap, structIndex, fset)
+	// Convert sync.Map to a plain map for O(1) reads during var building.
+	typeMap := make(map[string]*types.TypeName, len(pkgs)*16)
+	typeMapSync.Range(func(k, v any) bool {
+		typeMap[k.(string)] = v.(*types.TypeName)
+		return true
+	})
 
-	seenTpls := make(map[string]bool)
+	globalVars := buildTemplateVars(contextConfig[config.GlobalTemplateName], typeMap, structIndex, fc, fset)
 
+	seenTpls := make(map[string]bool, len(calls))
 	for i, call := range calls {
 		seenTpls[call.Template] = true
-		var newVars []TemplateVar
-		newVars = append(newVars, globalVars...)
+		base := make([]TemplateVar, 0, len(globalVars)+len(call.Vars)+8)
+		base = append(base, globalVars...)
 		if tplVars, ok := contextConfig[call.Template]; ok {
-			newVars = append(newVars, buildTemplateVars(tplVars, typeMap, structIndex, fset)...)
+			base = append(base, buildTemplateVars(tplVars, typeMap, structIndex, fc, fset)...)
 		}
-		newVars = append(newVars, call.Vars...)
-		calls[i].Vars = newVars
+		base = append(base, call.Vars...)
+		calls[i].Vars = base
 	}
 
-	// Add synthetic render calls for templates defined in the JSON but not found in Go AST
+	// Synthetic render calls for templates defined in JSON but absent from Go AST.
 	for tplName, tplVars := range contextConfig {
-		if tplName == config.GlobalTemplateName {
+		if tplName == config.GlobalTemplateName || seenTpls[tplName] {
 			continue
 		}
-		if !seenTpls[tplName] {
-			var newVars []TemplateVar
-			newVars = append(newVars, globalVars...)
-			newVars = append(newVars, buildTemplateVars(tplVars, typeMap, structIndex, fset)...)
-			calls = append(calls, RenderCall{
-				File:     "context-file",
-				Line:     1,
-				Template: tplName,
-				Vars:     newVars,
-			})
-		}
+		newVars := make([]TemplateVar, 0, len(globalVars)+len(tplVars))
+		newVars = append(newVars, globalVars...)
+		newVars = append(newVars, buildTemplateVars(tplVars, typeMap, structIndex, fc, fset)...)
+		calls = append(calls, RenderCall{
+			File:     "context-file",
+			Line:     1,
+			Template: tplName,
+			Vars:     newVars,
+		})
 	}
 
 	return calls
 }
 
-func buildTemplateVars(varDefs map[string]string, typeMap map[string]*types.TypeName, structIndex map[string]structIndexEntry, fset *token.FileSet) []TemplateVar {
-	var vars []TemplateVar
+func buildTemplateVars(
+	varDefs map[string]string,
+	typeMap map[string]*types.TypeName,
+	structIndex map[structKeyHandle]structIndexEntry,
+	fc *fieldCache,
+	fset *token.FileSet,
+) []TemplateVar {
+	vars := make([]TemplateVar, 0, len(varDefs))
 	for name, typeStr := range varDefs {
 		tv := TemplateVar{Name: name, TypeStr: typeStr}
 
@@ -415,29 +595,16 @@ func buildTemplateVars(varDefs map[string]string, typeMap map[string]*types.Type
 			}
 		}
 
-		// Check for map type string: map[Key]Value
 		if strings.HasPrefix(baseTypeStr, "map[") {
 			if idx := strings.Index(baseTypeStr, "]"); idx != -1 {
-				keyType := baseTypeStr[4:idx]
-				elemType := baseTypeStr[idx+1:]
 				tv.IsMap = true
-				tv.KeyType = strings.TrimSpace(keyType)
-				tv.ElemType = strings.TrimSpace(elemType)
+				tv.KeyType = strings.TrimSpace(baseTypeStr[4:idx])
+				tv.ElemType = strings.TrimSpace(baseTypeStr[idx+1:])
 
-				// Attempt to resolve the value type's fields
-				valTypeLookup := tv.ElemType
-				for strings.HasPrefix(valTypeLookup, "*") {
-					valTypeLookup = valTypeLookup[1:]
-				}
-
-				if typeNameObj, ok := typeMap[valTypeLookup]; ok {
-					t := typeNameObj.Type()
-					seen := make(map[string]bool)
-					fields, doc := extractFieldsWithDocs(t, structIndex, seen, fset)
-					tv.Fields = fields
-					if doc != "" {
-						tv.Doc = doc
-					}
+				valLookup := strings.TrimLeft(tv.ElemType, "*")
+				if typeNameObj, ok := typeMap[valLookup]; ok {
+					seen := make(map[structKeyHandle]bool)
+					tv.Fields, tv.Doc = extractFieldsWithDocs(typeNameObj.Type(), structIndex, fc, seen, fset)
 				}
 				vars = append(vars, tv)
 				continue
@@ -446,134 +613,270 @@ func buildTemplateVars(varDefs map[string]string, typeMap map[string]*types.Type
 
 		if typeNameObj, ok := typeMap[baseTypeStr]; ok {
 			t := typeNameObj.Type()
-			seen := make(map[string]bool)
-			fields, doc := extractFieldsWithDocs(t, structIndex, seen, fset)
-			tv.Fields = fields
-			tv.Doc = doc
+			seen := make(map[structKeyHandle]bool)
+			tv.Fields, tv.Doc = extractFieldsWithDocs(t, structIndex, fc, seen, fset)
 
-			// Capture the definition location of the top-level variable type
 			if pos := typeNameObj.Pos(); pos.IsValid() && fset != nil {
 				position := fset.Position(pos)
 				tv.DefFile = position.Filename
 				tv.DefLine = position.Line
 				tv.DefCol = position.Column
 			}
-
 			if isSlice {
 				tv.IsSlice = true
 				tv.ElemType = baseTypeStr
 			}
-		} else {
-			// Fallback for built-in types (e.g., "string", "int") or unresolved types
-			if isSlice {
-				tv.IsSlice = true
-				tv.ElemType = baseTypeStr
-			}
+		} else if isSlice {
+			tv.IsSlice = true
+			tv.ElemType = baseTypeStr
 		}
 		vars = append(vars, tv)
 	}
 	return vars
 }
 
-// structKey returns a stable map key for a named type, qualified by package
-// name to prevent collisions between same-named types in different packages.
-func structKey(named *types.Named) string {
-	obj := named.Obj()
-	if obj.Pkg() != nil {
-		return obj.Pkg().Name() + "." + obj.Name()
-	}
-	return obj.Name()
-}
+// ── Struct index ─────────────────────────────────────────────────────────────
 
-// structIndexEntry holds the pre-computed documentation and field positions
-// for a single struct type.
 type structIndexEntry struct {
 	doc    string
 	fields map[string]fieldInfo
 }
 
-// buildStructIndex walks all AST files once and indexes every struct type by
-// "pkgName.TypeName". Call this once per analysis run.
-func buildStructIndex(fset *token.FileSet, files map[string]*ast.File) map[string]structIndexEntry {
-	index := make(map[string]structIndexEntry)
+// buildStructIndex walks all AST files concurrently. Workers write directly
+// into a sync.Map — no per-worker accumulation map, no post-merge copy.
+func buildStructIndex(fset *token.FileSet, files map[string]*ast.File) map[structKeyHandle]structIndexEntry {
+	numWorkers := max(runtime.NumCPU(), 1)
+	fileChan := make(chan *ast.File, len(files))
+
+	var sharedIndex sync.Map // map[structKeyHandle]structIndexEntry
+	var wg sync.WaitGroup
+
+	for range numWorkers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for f := range fileChan {
+				pkgName := f.Name.Name
+				ast.Inspect(f, func(n ast.Node) bool {
+					genDecl, ok := n.(*ast.GenDecl)
+					if !ok || genDecl.Tok != token.TYPE {
+						return true
+					}
+					for _, spec := range genDecl.Specs {
+						typeSpec, ok := spec.(*ast.TypeSpec)
+						if !ok {
+							continue
+						}
+						structType, ok := typeSpec.Type.(*ast.StructType)
+						if !ok {
+							continue
+						}
+
+						entry := structIndexEntry{
+							doc:    getTypeDoc(genDecl, typeSpec),
+							fields: make(map[string]fieldInfo, len(structType.Fields.List)),
+						}
+						for _, field := range structType.Fields.List {
+							pos := fset.Position(field.Pos())
+							doc := getFieldDoc(field)
+							for _, name := range field.Names {
+								entry.fields[name.Name] = fieldInfo{
+									file: pos.Filename,
+									line: pos.Line,
+									col:  pos.Column,
+									doc:  doc,
+								}
+							}
+						}
+
+						key := unique.Make(pkgName + "." + typeSpec.Name.Name)
+						sharedIndex.Store(key, entry)
+					}
+					return true
+				})
+			}
+		}()
+	}
 
 	for _, f := range files {
-		// Derive a package name prefix from the file's package declaration.
-		pkgName := f.Name.Name
-
-		ast.Inspect(f, func(n ast.Node) bool {
-			genDecl, ok := n.(*ast.GenDecl)
-			if !ok || genDecl.Tok != token.TYPE {
-				return true
-			}
-			for _, spec := range genDecl.Specs {
-				typeSpec, ok := spec.(*ast.TypeSpec)
-				if !ok {
-					continue
-				}
-				structType, ok := typeSpec.Type.(*ast.StructType)
-				if !ok {
-					continue
-				}
-
-				entry := structIndexEntry{
-					doc:    getTypeDoc(genDecl, typeSpec),
-					fields: make(map[string]fieldInfo),
-				}
-
-				for _, field := range structType.Fields.List {
-					pos := fset.Position(field.Pos())
-					doc := getFieldDoc(field)
-					for _, name := range field.Names {
-						entry.fields[name.Name] = fieldInfo{
-							file: pos.Filename,
-							line: pos.Line,
-							col:  pos.Column,
-							doc:  doc,
-						}
-					}
-				}
-
-				key := pkgName + "." + typeSpec.Name.Name
-				index[key] = entry
-			}
-			return true
-		})
+		fileChan <- f
 	}
+	close(fileChan)
+	wg.Wait()
 
-	return index
+	// Convert to a plain map for fast O(1) reads in the hot analysis path.
+	finalIndex := make(map[structKeyHandle]structIndexEntry, len(files)*4)
+	sharedIndex.Range(func(k, v any) bool {
+		finalIndex[k.(structKeyHandle)] = v.(structIndexEntry)
+		return true
+	})
+	return finalIndex
 }
 
-func isImportRelatedError(msg string) bool {
-	lower := strings.ToLower(msg)
-	for _, phrase := range []string{
-		"could not import",
-		"can't find import",
-		"cannot find package",
-		"no required module provides",
-	} {
-		if strings.Contains(lower, phrase) {
-			return true
+// ── Field extraction with caching ────────────────────────────────────────────
+
+// extractFieldsWithDocs recursively extracts exported fields from a named
+// struct type. Results are cached by structKeyHandle so each unique type is
+// processed exactly once per AnalyzeDir call.
+//
+// The seen map prevents infinite loops on self-referential types; callers
+// should pass a fresh map per extraction root.
+func extractFieldsWithDocs(
+	t types.Type,
+	structIndex map[structKeyHandle]structIndexEntry,
+	fc *fieldCache,
+	seen map[structKeyHandle]bool,
+	fset *token.FileSet,
+) ([]FieldInfo, string) {
+	if t == nil {
+		return nil, ""
+	}
+	if ptr, ok := t.(*types.Pointer); ok {
+		return extractFieldsWithDocs(ptr.Elem(), structIndex, fc, seen, fset)
+	}
+	if mapType, ok := t.(*types.Map); ok {
+		return extractFieldsWithDocs(mapType.Elem(), structIndex, fc, seen, fset)
+	}
+
+	named, ok := t.(*types.Named)
+	if !ok {
+		return nil, ""
+	}
+
+	handle := makeStructKey(named)
+
+	// Cycle guard.
+	if seen[handle] {
+		return nil, ""
+	}
+	seen[handle] = true
+
+	// ── Cache hit ────────────────────────────────────────────────────────────
+	if cached, ok := fc.get(handle); ok {
+		return cached.fields, cached.doc
+	}
+
+	// ── Cache miss: compute ──────────────────────────────────────────────────
+	strct, ok := named.Underlying().(*types.Struct)
+	if !ok {
+		// Interface or other named type: expose exported methods only.
+		var fields []FieldInfo
+		for i := range named.NumMethods() {
+			m := named.Method(i)
+			if !m.Exported() {
+				continue
+			}
+			fi := FieldInfo{Name: m.Name(), TypeStr: normalizeTypeStr(m.Type().String())}
+			if pos := m.Pos(); pos.IsValid() && fset != nil {
+				position := fset.Position(pos)
+				fi.DefFile = position.Filename
+				fi.DefLine = position.Line
+				fi.DefCol = position.Column
+			}
+			fields = append(fields, fi)
 		}
+		// Don't cache interface results as they don't have struct index entries.
+		return fields, ""
 	}
-	return false
+
+	entry := structIndex[handle]
+	fields := make([]FieldInfo, 0, strct.NumFields())
+
+	for i := range strct.NumFields() {
+		f := strct.Field(i)
+		if !f.Exported() {
+			continue
+		}
+
+		fi := FieldInfo{
+			Name:    f.Name(),
+			TypeStr: normalizeTypeStr(f.Type().String()),
+		}
+
+		if pos := f.Pos(); pos.IsValid() && fset != nil {
+			position := fset.Position(pos)
+			fi.DefFile = position.Filename
+			fi.DefLine = position.Line
+			fi.DefCol = position.Column
+		}
+
+		ft := f.Type()
+		if ptr, ok2 := ft.(*types.Pointer); ok2 {
+			ft = ptr.Elem()
+		}
+
+		if slice, ok2 := ft.(*types.Slice); ok2 {
+			fi.IsSlice = true
+			// Copy seen so sibling slices of the same type don't suppress each other.
+			elemSeen := copySeenMap(seen)
+			fi.Fields, _ = extractFieldsWithDocs(slice.Elem(), structIndex, fc, elemSeen, fset)
+		} else if keyType, elemType := getMapTypes(ft); keyType != nil && elemType != nil {
+			fi.IsMap = true
+			fi.KeyType = normalizeTypeStr(keyType.String())
+			fi.ElemType = normalizeTypeStr(elemType.String())
+			elemSeen := copySeenMap(seen)
+			fi.Fields, _ = extractFieldsWithDocs(elemType, structIndex, fc, elemSeen, fset)
+		} else {
+			// Recurse using the shared seen map (cycle detection across the path).
+			fi.Fields, _ = extractFieldsWithDocs(ft, structIndex, fc, seen, fset)
+		}
+
+		if pos, ok2 := entry.fields[f.Name()]; ok2 {
+			if fi.DefFile == "" {
+				fi.DefFile = pos.file
+				fi.DefLine = pos.line
+				fi.DefCol = pos.col
+			}
+			fi.Doc = pos.doc
+		}
+
+		fields = append(fields, fi)
+	}
+
+	// Append exported methods after fields.
+	for i := range named.NumMethods() {
+		m := named.Method(i)
+		if !m.Exported() {
+			continue
+		}
+		fi := FieldInfo{Name: m.Name(), TypeStr: "method"}
+		if pos := m.Pos(); pos.IsValid() && fset != nil {
+			position := fset.Position(pos)
+			fi.DefFile = position.Filename
+			fi.DefLine = position.Line
+			fi.DefCol = position.Column
+		}
+		fields = append(fields, fi)
+	}
+
+	result := cachedFields{fields: fields, doc: entry.doc}
+	fc.set(handle, result)
+	return fields, entry.doc
 }
 
-func extractString(expr ast.Expr) string {
-	lit, ok := expr.(*ast.BasicLit)
-	if !ok || lit.Kind != token.STRING || len(lit.Value) < 2 {
-		return ""
-	}
-	return lit.Value[1 : len(lit.Value)-1]
+// copySeenMap creates a shallow copy of a seen map for independent traversal
+// branches (e.g., sibling slice fields of the same element type).
+func copySeenMap(src map[structKeyHandle]bool) map[structKeyHandle]bool {
+	dst := make(map[structKeyHandle]bool, len(src))
+	maps.Copy(dst, src)
+	return dst
 }
 
-func extractMapVars(expr ast.Expr, info *types.Info, fset *token.FileSet, structIndex map[string]structIndexEntry) []TemplateVar {
+// ── extractMapVars ────────────────────────────────────────────────────────────
+
+func extractMapVars(
+	expr ast.Expr,
+	info *types.Info,
+	fset *token.FileSet,
+	structIndex map[structKeyHandle]structIndexEntry,
+	fc *fieldCache,
+) []TemplateVar {
 	comp, ok := expr.(*ast.CompositeLit)
 	if !ok {
 		return nil
 	}
 
-	var vars []TemplateVar
+	vars := make([]TemplateVar, 0, len(comp.Elts))
 	for _, elt := range comp.Elts {
 		kv, ok := elt.(*ast.KeyValueExpr)
 		if !ok {
@@ -590,35 +893,20 @@ func extractMapVars(expr ast.Expr, info *types.Info, fset *token.FileSet, struct
 		if typeInfo, ok := info.Types[kv.Value]; ok {
 			tv.TypeStr = normalizeTypeStr(typeInfo.Type.String())
 
-			// Create a fresh seen map per top-level variable so that the same
-			// struct type can appear under different variable names without being
-			// suppressed. Cycles within a single variable's type tree are still
-			// prevented — the same type key cannot appear twice in one path.
-			seen := make(map[string]bool)
-			tv.Fields, tv.Doc = extractFieldsWithDocs(typeInfo.Type, structIndex, seen, fset)
+			seen := make(map[structKeyHandle]bool)
+			tv.Fields, tv.Doc = extractFieldsWithDocs(typeInfo.Type, structIndex, fc, seen, fset)
 
 			if elemType := getElementType(typeInfo.Type); elemType != nil {
 				tv.IsSlice = true
 				tv.ElemType = normalizeTypeStr(elemType.String())
-				// Create a fresh seen map for element type extraction — the slice
-				// element type may be the same struct that appears elsewhere.
-				elemSeen := make(map[string]bool)
-				elemFields, elemDoc := extractFieldsWithDocs(elemType, structIndex, elemSeen, fset)
-				tv.Fields = elemFields
-				if elemDoc != "" {
-					tv.Doc = elemDoc
-				}
+				elemSeen := make(map[structKeyHandle]bool)
+				tv.Fields, tv.Doc = extractFieldsWithDocsDoc(elemType, structIndex, fc, elemSeen, fset, tv.Doc)
 			} else if keyType, elemType := getMapTypes(typeInfo.Type); keyType != nil && elemType != nil {
 				tv.IsMap = true
 				tv.KeyType = normalizeTypeStr(keyType.String())
 				tv.ElemType = normalizeTypeStr(elemType.String())
-				// Create a fresh seen map for element type extraction
-				elemSeen := make(map[string]bool)
-				elemFields, elemDoc := extractFieldsWithDocs(elemType, structIndex, elemSeen, fset)
-				tv.Fields = elemFields
-				if elemDoc != "" {
-					tv.Doc = elemDoc
-				}
+				elemSeen := make(map[structKeyHandle]bool)
+				tv.Fields, tv.Doc = extractFieldsWithDocsDoc(elemType, structIndex, fc, elemSeen, fset, tv.Doc)
 			}
 		} else {
 			tv.TypeStr = inferTypeFromAST(kv.Value)
@@ -629,6 +917,8 @@ func extractMapVars(expr ast.Expr, info *types.Info, fset *token.FileSet, struct
 	}
 	return vars
 }
+
+// ── Misc helpers ──────────────────────────────────────────────────────────────
 
 func findDefinitionLocation(expr ast.Expr, info *types.Info, fset *token.FileSet) (string, int, int) {
 	var ident *ast.Ident
@@ -687,8 +977,6 @@ func normalizeTypeStr(s string) string {
 	}
 }
 
-// getElementType unwraps slices (and pointer-to-slice) to return the element
-// type. Returns nil for non-slice types.
 func getElementType(t types.Type) types.Type {
 	switch v := t.(type) {
 	case *types.Slice:
@@ -701,8 +989,6 @@ func getElementType(t types.Type) types.Type {
 	return nil
 }
 
-// getMapTypes unwraps maps (and pointer-to-map) to return the key and element
-// types. Returns nil for non-map types.
 func getMapTypes(t types.Type) (types.Type, types.Type) {
 	switch v := t.(type) {
 	case *types.Map:
@@ -713,145 +999,6 @@ func getMapTypes(t types.Type) (types.Type, types.Type) {
 		return getMapTypes(v.Underlying())
 	}
 	return nil, nil
-}
-
-// extractFieldsWithDocs recursively extracts exported fields (and their nested
-// fields) from a named struct type. The seen map prevents infinite loops on
-// self-referential types; callers should pass a fresh map per extraction root.
-func extractFieldsWithDocs(t types.Type, structIndex map[string]structIndexEntry, seen map[string]bool, fset *token.FileSet) ([]FieldInfo, string) {
-	if t == nil {
-		return nil, ""
-	}
-	if ptr, ok := t.(*types.Pointer); ok {
-		return extractFieldsWithDocs(ptr.Elem(), structIndex, seen, fset)
-	}
-	if mapType, ok := t.(*types.Map); ok {
-		return extractFieldsWithDocs(mapType.Elem(), structIndex, seen, fset)
-	}
-
-	named, ok := t.(*types.Named)
-	if !ok {
-		return nil, ""
-	}
-
-	// Cycle guard: if we've already started processing this type in the current
-	// extraction tree, stop to prevent infinite recursion.
-	key := structKey(named)
-	if seen[key] {
-		return nil, ""
-	}
-	seen[key] = true
-
-	strct, ok := named.Underlying().(*types.Struct)
-	if !ok {
-		// Interface or other named type: expose exported methods only.
-		var fields []FieldInfo
-		for i := 0; i < named.NumMethods(); i++ {
-			m := named.Method(i)
-			if m.Exported() {
-				fi := FieldInfo{
-					Name:    m.Name(),
-					TypeStr: normalizeTypeStr(m.Type().String()),
-				}
-				if pos := m.Pos(); pos.IsValid() && fset != nil {
-					position := fset.Position(pos)
-					fi.DefFile = position.Filename
-					fi.DefLine = position.Line
-					fi.DefCol = position.Column
-				}
-				fields = append(fields, fi)
-			}
-		}
-		return fields, ""
-	}
-
-	entry := structIndex[key]
-
-	var fields []FieldInfo
-	for i := 0; i < strct.NumFields(); i++ {
-		f := strct.Field(i)
-		if !f.Exported() {
-			continue
-		}
-
-		fi := FieldInfo{
-			Name:    f.Name(),
-			TypeStr: normalizeTypeStr(f.Type().String()),
-		}
-
-		// Use the exact position from the type checker for reliable Go-to-Definition
-		if pos := f.Pos(); pos.IsValid() && fset != nil {
-			position := fset.Position(pos)
-			fi.DefFile = position.Filename
-			fi.DefLine = position.Line
-			fi.DefCol = position.Column
-		}
-
-		ft := f.Type()
-		if ptr, ok := ft.(*types.Pointer); ok {
-			ft = ptr.Elem()
-		}
-
-		if slice, ok := ft.(*types.Slice); ok {
-			// Slice field — extract element type's fields.
-			// Use a copy of seen so that processing sibling slices of the same
-			// type doesn't suppress each other.
-			fi.IsSlice = true
-			elemSeen := copySeenMap(seen)
-			fi.Fields, _ = extractFieldsWithDocs(slice.Elem(), structIndex, elemSeen, fset)
-		} else if keyType, elemType := getMapTypes(ft); keyType != nil && elemType != nil {
-			// Map field - extract element type's fields
-			fi.IsMap = true
-			fi.KeyType = normalizeTypeStr(keyType.String())
-			fi.ElemType = normalizeTypeStr(elemType.String())
-			elemSeen := copySeenMap(seen)
-			fi.Fields, _ = extractFieldsWithDocs(elemType, structIndex, elemSeen, fset)
-		} else {
-			// Non-slice field — recurse into the field's type.
-			// Pass the shared seen map so the cycle guard works across the whole
-			// current path, but siblings of the same type can still be processed
-			// independently (they would each have been added to seen on their own
-			// path, not on a sibling path).
-			fi.Fields, _ = extractFieldsWithDocs(ft, structIndex, seen, fset)
-		}
-
-		// Fallback to AST structIndex for position if missing, and always grab doc comments
-		if pos, ok := entry.fields[f.Name()]; ok {
-			if fi.DefFile == "" {
-				fi.DefFile = pos.file
-				fi.DefLine = pos.line
-				fi.DefCol = pos.col
-			}
-			fi.Doc = pos.doc
-		}
-
-		fields = append(fields, fi)
-	}
-
-	// Append exported methods after fields.
-	for i := 0; i < named.NumMethods(); i++ {
-		m := named.Method(i)
-		if m.Exported() {
-			fi := FieldInfo{Name: m.Name(), TypeStr: "method"}
-			if pos := m.Pos(); pos.IsValid() && fset != nil {
-				position := fset.Position(pos)
-				fi.DefFile = position.Filename
-				fi.DefLine = position.Line
-				fi.DefCol = position.Column
-			}
-			fields = append(fields, fi)
-		}
-	}
-
-	return fields, entry.doc
-}
-
-// copySeenMap creates a shallow copy of a seen map so that an independent
-// traversal branch can track its own cycle detection without affecting siblings.
-func copySeenMap(src map[string]bool) map[string]bool {
-	dst := make(map[string]bool, len(src))
-	maps.Copy(dst, src)
-	return dst
 }
 
 type fieldInfo struct {
@@ -911,6 +1058,29 @@ func inferTypeFromAST(expr ast.Expr) string {
 		return "unary"
 	}
 	return "unknown"
+}
+
+func isImportRelatedError(msg string) bool {
+	lower := strings.ToLower(msg)
+	for _, phrase := range []string{
+		"could not import",
+		"can't find import",
+		"cannot find package",
+		"no required module provides",
+	} {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+func extractString(expr ast.Expr) string {
+	lit, ok := expr.(*ast.BasicLit)
+	if !ok || lit.Kind != token.STRING || len(lit.Value) < 2 {
+		return ""
+	}
+	return lit.Value[1 : len(lit.Value)-1]
 }
 
 func FindGoFiles(root string) ([]string, error) {
