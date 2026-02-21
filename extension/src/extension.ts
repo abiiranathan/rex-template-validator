@@ -106,10 +106,10 @@ export async function activate(context: vscode.ExtensionContext) {
             if (partialCtx) ctx = partialCtx;
           }
           if (!ctx) return [];
-          return validator.getCompletions(document, position, ctx);
-        },
-      },
-      '.'
+           return validator.getCompletionItems(document, position, ctx);
+         },
+       },
+       '.', '$'
     )
   );
 

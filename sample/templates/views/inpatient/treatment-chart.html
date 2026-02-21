@@ -54,8 +54,9 @@
     {{ end }}
 
     {{ $large := index $.billedDrugs 0 }}
+    {{ $roleValue := index $.roles "name" }}
 
-    <h3>Drug Name: {{ $large.Name }}</h3>
+    <h3>Drug Name: {{ $roleValue }}</h3>
 
 </body>
 

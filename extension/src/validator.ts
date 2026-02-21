@@ -1522,6 +1522,155 @@ export class TemplateValidator {
     return this.findRangeVariableDefinition(pathForDef, stack, ctx);
   }
 
+   async getCompletionItems(
+     document: vscode.TextDocument,
+     position: vscode.Position,
+     ctx: TemplateContext
+   ): Promise<vscode.CompletionItem[]> {
+     const completionItems: vscode.CompletionItem[] = [];
+     const content = document.getText();
+     const nodes = this.parser.parse(content);
+ 
+     const hit = this.findNodeAtPosition(nodes, position, ctx.vars, [], nodes);
+     if (!hit) {
+       // If no specific node is hit, provide root context variables
+       // For global variables when no node is hit, the range should start at the current position - 1 if '.' is typed
+       const lineText = document.lineAt(position.line).text;
+       let startCol = position.character;
+       if (startCol > 0 && (lineText[startCol - 1] === '.' || lineText[startCol - 1] === '$')) {
+         startCol--;
+       }
+       const replacementRange = new vscode.Range(position.line, startCol, position.line, position.character);
+       this.addGlobalVariablesToCompletion(ctx.vars, completionItems, '', replacementRange);
+       return completionItems;
+     }
+ 
+     const { node, stack, vars: hitVars, locals: hitLocals } = hit;
+ 
+     const lineText = document.lineAt(position.line).text;
+     let startChar = position.character;
+     while (startChar > 0 && (/[a-zA-Z0-9_.]/.test(lineText[startChar - 1]) || lineText[startChar - 1] === '$')) {
+       startChar--;
+     }
+ 
+     const currentWord = lineText.substring(startChar, position.character);
+ 
+     let prefix = '';
+     let partialName = currentWord;
+     if (currentWord.startsWith('.') || currentWord.startsWith('$')) {
+       prefix = currentWord[0];
+       partialName = currentWord.substring(1);
+     }
+     
+     const replacementRange = new vscode.Range(position.line, startChar, position.line, position.character);
+ 
+     if (prefix === '$') {
+       // Suggest local variables
+       this.addLocalVariablesToCompletion(stack, hitLocals, completionItems, partialName, replacementRange);
+     } else if (prefix === '.') {
+       // Suggest global variables and fields of the current context
+       const currentDotContext = this.findDotFrameAtPosition(node, stack, hitVars, hitLocals);
+       this.addFieldsToCompletion(currentDotContext, completionItems, partialName, replacementRange);
+     } else { // No explicit prefix, suggest both global and local that match partial name
+       this.addGlobalVariablesToCompletion(hitVars, completionItems, partialName, replacementRange);
+       this.addLocalVariablesToCompletion(stack, hitLocals, completionItems, partialName, replacementRange);
+     }
+ 
+     return completionItems;
+   }
+
+   private addGlobalVariablesToCompletion(
+     vars: Map<string, TemplateVar>,
+     completionItems: vscode.CompletionItem[],
+     partialName: string = '',
+     replacementRange: vscode.Range
+   ) {
+     for (const [name, variable] of vars) {
+       if (name.startsWith(partialName)) {
+         const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Variable);
+         item.detail = variable.type;
+         item.documentation = new vscode.MarkdownString(variable.doc);
+         item.range = replacementRange;
+         completionItems.push(item);
+       }
+     }
+   }
+ 
+   private addLocalVariablesToCompletion(
+     scopeStack: ScopeFrame[],
+     blockLocals: Map<string, TemplateVar> | undefined,
+     completionItems: vscode.CompletionItem[],
+     partialName: string = '',
+     replacementRange: vscode.Range
+   ) {
+     // Add block locals
+     if (blockLocals) {
+       for (const [name, variable] of blockLocals) {
+         if (name.startsWith(partialName)) {
+           const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Variable);
+           item.detail = variable.type;
+           item.documentation = new vscode.MarkdownString(variable.doc);
+           item.range = replacementRange;
+           completionItems.push(item);
+         }
+       }
+     }
+ 
+     // Add variables from scope stack
+     for (let i = scopeStack.length - 1; i >= 0; i--) {
+       if (scopeStack[i].locals) {
+         for (const [name, variable] of scopeStack[i].locals!) {
+           if (name.startsWith(partialName)) {
+             const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Variable);
+             item.detail = variable.type;
+             item.documentation = new vscode.MarkdownString(variable.doc);
+             item.range = replacementRange;
+             completionItems.push(item);
+           }
+         }
+       }
+     }
+   }
+ 
+   private addFieldsToCompletion(
+     context: { fields?: FieldInfo[] },
+     completionItems: vscode.CompletionItem[],
+     partialName: string = '',
+     replacementRange: vscode.Range
+   ) {
+     if (context.fields) {
+       for (const field of context.fields) {
+         if (field.name.startsWith(partialName)) {
+           const item = new vscode.CompletionItem(field.name, vscode.CompletionItemKind.Field);
+           item.detail = field.isSlice ? `[]${field.type}` : field.type;
+           item.documentation = new vscode.MarkdownString(field.doc);
+           item.range = replacementRange;
+           completionItems.push(item);
+         }
+       }
+     }
+   }
+
+  private findDotFrameAtPosition(
+    node: TemplateNode,
+    scopeStack: ScopeFrame[],
+    vars: Map<string, TemplateVar>,
+    blockLocals: Map<string, TemplateVar> | undefined
+  ): { fields?: FieldInfo[] } {
+    // Logic to determine the current "." context based on the node and scopeStack
+    // This will likely involve using resolvePath or similar logic to get the fields
+    // of the current context. For now, a simplified version.
+    const result = resolvePath(node.path, vars, scopeStack, blockLocals);
+    if (result.found) {
+      return { fields: result.fields };
+    }
+    const dotFrame = scopeStack.slice().reverse().find(f => f.key === '.');
+    if (dotFrame) {
+      return { fields: dotFrame.fields };
+    }
+    return { fields: [...vars.values()].map(v => ({ name: v.name, type: v.type, isSlice: v.isSlice ?? false, doc: v.doc })) };
+  }
+
   private navigateToFieldDefinition(
     fieldPath: string[],
     fields: FieldInfo[],
