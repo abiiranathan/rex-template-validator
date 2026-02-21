@@ -55,7 +55,6 @@
     {{ end }}
 
     {{ template "messages" . }}
-
     {{ define "messages" }}
     {{ $msg := index .prescriptions 0 }}
     <h1>{{ $msg }}</h1>
