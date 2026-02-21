@@ -85,6 +85,9 @@ func AnalyzeDir(dir string, contextFile string) AnalysisResult {
 	// Key: "pkgName.TypeName" to avoid cross-package name collisions.
 	structIndex := buildStructIndex(fset, filesMap)
 
+	// Automatically discover context variables set via c.Set("key", value)
+	implicitVars := findContextSetCalls(pkgs, info, fset, structIndex)
+
 	for _, f := range allFiles {
 		ast.Inspect(f, func(n ast.Node) bool {
 			call, ok := n.(*ast.CallExpr)
@@ -178,7 +181,7 @@ func AnalyzeDir(dir string, contextFile string) AnalysisResult {
 				Template:             templatePath,
 				TemplateNameStartCol: tplNameStartCol,
 				TemplateNameEndCol:   tplNameEndCol,
-				Vars:                 vars,
+				Vars:                 append(vars, implicitVars...),
 			})
 			return true
 		})
@@ -796,4 +799,111 @@ func FindGoFiles(root string) ([]string, error) {
 		return nil
 	})
 	return files, err
+}
+
+// findContextSetCalls scans for c.Set("key", value) calls to identify global template variables
+func findContextSetCalls(pkgs []*packages.Package, info *types.Info, fset *token.FileSet, structIndex map[string]structIndexEntry) []TemplateVar {
+	var vars []TemplateVar
+	seenVars := make(map[string]bool)
+
+	for _, pkg := range pkgs {
+		for _, file := range pkg.Syntax {
+			ast.Inspect(file, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+
+				// Look for c.Set("key", value)
+				sel, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok {
+					return true
+				}
+
+				if sel.Sel.Name != "Set" {
+					return true
+				}
+
+				// Check receiver type
+				if info != nil {
+					if sel.X != nil {
+						if typeAndValue, ok := info.Types[sel.X]; ok {
+							t := typeAndValue.Type
+							// Unwrap pointer
+							if ptr, ok := t.(*types.Pointer); ok {
+								t = ptr.Elem()
+							}
+							if named, ok := t.(*types.Named); ok {
+								obj := named.Obj()
+								// Check if type name is Context.
+								if obj.Name() != "Context" {
+									return true
+								}
+							} else {
+								// If we can't determine type name, we might skip or be lenient.
+								// Being strict avoids false positives.
+								return true
+							}
+						}
+					}
+				}
+
+				if len(call.Args) < 2 {
+					return true
+				}
+
+				// Extract key
+				keyArg := call.Args[0]
+				key := extractString(keyArg)
+				if key == "" {
+					return true
+				}
+
+				if seenVars[key] {
+					return true
+				}
+				seenVars[key] = true
+
+				// Extract value type
+				valArg := call.Args[1]
+				tv := TemplateVar{Name: key}
+
+				if typeInfo, ok := info.Types[valArg]; ok && typeInfo.Type != nil {
+					tv.TypeStr = normalizeTypeStr(typeInfo.Type.String())
+					seen := make(map[string]bool)
+					tv.Fields, tv.Doc = extractFieldsWithDocs(typeInfo.Type, structIndex, seen, fset)
+
+					if elemType := getElementType(typeInfo.Type); elemType != nil {
+						tv.IsSlice = true
+						tv.ElemType = normalizeTypeStr(elemType.String())
+						elemSeen := make(map[string]bool)
+						elemFields, elemDoc := extractFieldsWithDocs(elemType, structIndex, elemSeen, fset)
+						tv.Fields = elemFields
+						if elemDoc != "" {
+							tv.Doc = elemDoc
+						}
+					} else if keyType, elemType := getMapTypes(typeInfo.Type); keyType != nil && elemType != nil {
+						tv.IsMap = true
+						tv.KeyType = normalizeTypeStr(keyType.String())
+						tv.ElemType = normalizeTypeStr(elemType.String())
+						elemSeen := make(map[string]bool)
+						elemFields, elemDoc := extractFieldsWithDocs(elemType, structIndex, elemSeen, fset)
+						tv.Fields = elemFields
+						if elemDoc != "" {
+							tv.Doc = elemDoc
+						}
+					}
+
+				} else {
+					tv.TypeStr = inferTypeFromAST(valArg)
+				}
+
+				tv.DefFile, tv.DefLine, tv.DefCol = findDefinitionLocation(valArg, info, fset)
+
+				vars = append(vars, tv)
+				return true
+			})
+		}
+	}
+	return vars
 }
