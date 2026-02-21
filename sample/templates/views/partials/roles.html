@@ -1,5 +1,5 @@
 {{ define "roles" }}
-{{ $value := . "key" }}
+{{ $value := index . "key" }}
 {{ range $key, $v := . }}
 {{ $key }}: {{ $v }}
 {{ end }}

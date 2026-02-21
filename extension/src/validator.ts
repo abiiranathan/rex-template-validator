@@ -375,7 +375,6 @@ export class TemplateValidator {
     // 2. Fallback to path resolution
     if (!resolvedType) {
       const result = resolvePath(node.path, vars, scopeStack, blockLocals);
-      // We only accept empty-path resolution (which returns context) if the expression is explicitly "." or "$"
       const isExplicitContext = node.assignExpr === '.' || node.assignExpr === '$';
       const isValidPath =
         (node.path.length > 0 &&
@@ -1657,19 +1656,11 @@ export class TemplateValidator {
   ): vscode.Location | null {
     if (
       node.kind === 'assignment' &&
-      node.assignVars?.includes(varName) &&
-      node.assignExpr
+      node.assignVars?.includes(varName)
     ) {
-      const rhsPath = this.parser.parseDotPath(node.assignExpr);
-      const dotFrame = scopeStack.slice().reverse().find(f => f.key === '.');
-      if (dotFrame?.fields) {
-        const fieldPath = rhsPath[0] === '.' ? rhsPath.slice(1) : rhsPath;
-        const loc = this.navigateToFieldDefinition(fieldPath, dotFrame.fields, ctx);
-        if (loc) return loc;
-      }
-      return this.findVariableDefinition(
-        { kind: 'variable', path: rhsPath, rawText: node.assignExpr, line: node.line, col: node.col },
-        ctx
+      return new vscode.Location(
+        vscode.Uri.file(ctx.absolutePath),
+        new vscode.Position(node.line - 1, node.col - 1)
       );
     }
     if (node.children) {
@@ -2138,71 +2129,47 @@ export class TemplateValidator {
     const content = document.getText();
     const nodes = this.parser.parse(content);
 
-    let scopeResult = this.findScopeAtPosition(nodes, position, ctx.vars, [], nodes, ctx);
-    if (!scopeResult) {
-      const enclosing = this.findEnclosingBlockOrDefine(nodes, position);
-      if (enclosing?.blockName) {
-        const callCtx = this.resolveNamedBlockCallCtxForHover(
-          enclosing.blockName,
-          ctx.vars,
-          nodes,
-          document.uri.fsPath
-        );
-        if (callCtx) {
-          scopeResult = {
-            stack: [{
-              key: '.',
-              typeStr: callCtx.typeStr,
-              fields: callCtx.fields ?? [],
-              isMap: callCtx.isMap,
-              keyType: callCtx.keyType,
-              elemType: callCtx.elemType,
-              isSlice: callCtx.isSlice
-            }],
-            locals: new Map(),
-          };
-        }
-      }
-    }
+    // Get accurate scope at cursor
+    const scopeResult = this.findScopeAtPosition(nodes, position, ctx.vars, [], nodes, ctx);
 
     const { stack, locals } = scopeResult ?? {
       stack: [] as ScopeFrame[],
       locals: new Map<string, TemplateVar>(),
     };
 
-    const linePrefix = document.lineAt(position.line).text.slice(0, position.character);
+    const lineText = document.lineAt(position.line).text;
+    const linePrefix = lineText.slice(0, position.character);
 
+    // Handle partial/complex expressions (pipe, function args, etc.)
     const inComplexExpr = /\(\s*[^)]*$|\|\s*[^|}]*$/.test(linePrefix);
-
     if (inComplexExpr) {
       const match = linePrefix.match(/(?:\(|\|)\s*(.*)$/);
       if (match) {
         const partialExpr = match[1].trim();
-
         try {
           const exprType = inferExpressionType(partialExpr, ctx.vars, stack, locals);
-
           if (exprType?.fields) {
             return exprType.fields.map(f => {
               const item = new vscode.CompletionItem(
                 f.name,
-                vscode.CompletionItemKind.Field
+                f.type === 'method' ? vscode.CompletionItemKind.Method : vscode.CompletionItemKind.Field
               );
               item.detail = f.isSlice ? `[]${f.type}` : f.type;
-              if (f.doc) {
-                item.documentation = new vscode.MarkdownString(f.doc);
-              }
+              if (f.doc) item.documentation = new vscode.MarkdownString(f.doc);
               return item;
             });
           }
-        } catch { }
+        } catch {
+          // silent fail — fall through to dot/path completion
+        }
       }
     }
 
-    const match = linePrefix.match(/(?:\$|\.)[\w.]*$/);
-    if (!match) return [];
+    // Standard dot / $ completion
+    const pathMatch = linePrefix.match(/(?:\$|\.)[\w.]*$/);
+    if (!pathMatch) return [];
 
-    const rawPath = match[0];
+    const rawPath = pathMatch[0];
     const parts = rawPath.split('.');
     let lookupPath: string[];
     let filterPrefix: string;
@@ -2212,37 +2179,52 @@ export class TemplateValidator {
       filterPrefix = '';
     } else {
       filterPrefix = parts[parts.length - 1];
-      lookupPath = this.parser.parseDotPath(
-        rawPath.slice(0, rawPath.length - filterPrefix.length)
-      );
+      lookupPath = this.parser.parseDotPath(rawPath.slice(0, rawPath.length - filterPrefix.length));
     }
 
     let fields: FieldInfo[] = [];
-    if (lookupPath.length === 1 && lookupPath[0] === '.') {
-      const res = resolvePath(['.'], ctx.vars, stack, locals);
-      fields =
-        res.found && res.fields
-          ? res.fields
-          : stack.slice().reverse().find(f => f.key === '.')?.fields ??
-          ([...ctx.vars.values()] as unknown as FieldInfo[]);
-    } else if (lookupPath.length === 1 && lookupPath[0] === '$') {
-      fields = [...ctx.vars.values()] as unknown as FieldInfo[];
+
+    if (lookupPath.length === 0) return [];
+
+    if (lookupPath.length === 1 && (lookupPath[0] === '.' || lookupPath[0] === '')) {
+      // . → current context
+      const dotFrame = stack.slice().reverse().find(f => f.key === '.');
+      fields = dotFrame?.fields ?? [...ctx.vars.values()].map(v => ({
+        name: v.name,
+        type: v.type,
+        fields: v.fields,
+        isSlice: v.isSlice ?? false,
+        doc: v.doc,
+      } as FieldInfo));
+    } else if (lookupPath[0] === '$') {
+      // $var or just $ → top-level variables
+      fields = [...ctx.vars.values()].map(v => ({
+        name: v.name,
+        type: v.type,
+        fields: v.fields,
+        isSlice: v.isSlice ?? false,
+        doc: v.doc,
+      } as FieldInfo));
     } else {
-      const res = resolvePath(lookupPath, ctx.vars, stack, locals);
-      if (res.found && res.fields) fields = res.fields;
+      // Resolve arbitrary path using both stack and locals
+      const resolveResult = resolvePath(lookupPath, ctx.vars, stack, locals);
+      if (resolveResult.found && resolveResult.fields) {
+        fields = resolveResult.fields;
+      }
     }
 
+    // Filter and create completion items
     return fields
       .filter(f => f.name.toLowerCase().startsWith(filterPrefix.toLowerCase()))
       .map(f => {
         const item = new vscode.CompletionItem(
           f.name,
-          f.type === 'method'
-            ? vscode.CompletionItemKind.Method
-            : vscode.CompletionItemKind.Field
+          f.type === 'method' ? vscode.CompletionItemKind.Method : vscode.CompletionItemKind.Field
         );
         item.detail = f.isSlice ? `[]${f.type}` : f.type;
-        if (f.doc) item.documentation = new vscode.MarkdownString(f.doc);
+        if (f.doc) {
+          item.documentation = new vscode.MarkdownString(f.doc);
+        }
         return item;
       });
   }
@@ -2254,65 +2236,89 @@ export class TemplateValidator {
     scopeStack: ScopeFrame[],
     rootNodes: TemplateNode[],
     ctx: TemplateContext
-  ): { stack: ScopeFrame[]; locals: Map<string, TemplateVar> } | null {
-    const blockLocals = new Map<string, TemplateVar>();
+  ): { stack: ScopeFrame[]; locals: Map<string, TemplateVar> } {
+
+    let blockLocals = new Map<string, TemplateVar>();
 
     for (const node of nodes) {
-      this.processAssignment(node, vars, scopeStack, blockLocals);
 
-      if (node.endLine === undefined) continue;
+      // Process assignments as early as possible — even before we know if we're inside
+      if (node.kind === 'assignment') {
+        this.processAssignment(node, vars, scopeStack, blockLocals);
+      }
 
       const startLine = node.line - 1;
-      const endLine = node.endLine - 1;
-      const afterStart =
-        position.line > startLine ||
-        (position.line === startLine && position.character >= node.col - 1);
-      const beforeEnd =
-        position.line < endLine ||
-        (position.line === endLine && position.character <= (node.endCol ?? 0));
+      const startCol = node.col - 1;
 
-      if (afterStart && beforeEnd) {
-        if ((node.kind === 'define' || node.kind === 'block') && node.blockName) {
-          const callCtx = this.resolveNamedBlockCallCtxForHover(
-            node.blockName,
-            vars,
-            rootNodes,
-            ctx.absolutePath
-          );
-          if (callCtx) {
-            const childVars = this.fieldsToVarMap(callCtx.fields ?? []);
-            const childStack: ScopeFrame[] = [
-              {
-                key: '.',
-                typeStr: callCtx.typeStr,
-                fields: callCtx.fields ?? [],
-                isMap: callCtx.isMap,
-                keyType: callCtx.keyType,
-                elemType: callCtx.elemType,
-                isSlice: callCtx.isSlice
-              },
-            ];
-            if (node.children) {
-              const inner = this.findScopeAtPosition(
-                node.children,
-                position,
-                childVars,
-                childStack,
-                rootNodes,
-                ctx
-              );
-              if (inner) return inner;
-            }
-            return { stack: childStack, locals: blockLocals };
-          }
+      // Skip nodes that start after the cursor
+      if (
+        startLine > position.line ||
+        (startLine === position.line && startCol > position.character)
+      ) {
+        continue;
+      }
+
+      // ── Prepare child context ───────────────────────────────────────
+      let childVars = vars;
+      let childStack = scopeStack;
+      let childLocals = new Map(blockLocals); // preserve accumulated locals
+
+      // Special handling for named blocks / defines
+      if ((node.kind === 'define' || node.kind === 'block') && node.blockName) {
+        const callCtx = this.resolveNamedBlockCallCtxForHover(
+          node.blockName,
+          vars,
+          rootNodes,
+          ctx.absolutePath
+        );
+        if (callCtx) {
+          childVars = this.fieldsToVarMap(callCtx.fields ?? []);
+          childStack = [{
+            key: '.',
+            typeStr: callCtx.typeStr,
+            fields: callCtx.fields ?? [],
+            isMap: callCtx.isMap,
+            keyType: callCtx.keyType,
+            elemType: callCtx.elemType,
+            isSlice: callCtx.isSlice
+          }];
+          // Note: we do NOT inherit outer blockLocals inside a named block body
+          // because named blocks usually get fresh context from caller
+          childLocals = new Map();
         }
+      }
 
-        const childScope = this.buildChildScope(node, vars, scopeStack, blockLocals, rootNodes);
-        const childVars = childScope?.childVars ?? vars;
-        const childStack = childScope?.childStack ?? scopeStack;
+      // Normal structural scopes: range, with, etc.
+      const childScopeBuild = this.buildChildScope(node, vars, scopeStack, childLocals, rootNodes);
+      if (childScopeBuild) {
+        childVars = childScopeBuild.childVars;
+        childStack = childScopeBuild.childStack;
+        // locals are already updated in childLocals via buildChildScope
+      }
 
-        if (node.children) {
-          const inner = this.findScopeAtPosition(
+      // ── Is cursor inside this node? ─────────────────────────────────
+      let isInside = false;
+
+      if (node.endLine === undefined) {
+        // inline/leaf node
+        const endCol = startCol + (node.rawText?.length ?? 0);
+        isInside =
+          position.line === startLine &&
+          position.character >= startCol &&
+          position.character <= endCol;
+      } else {
+        const endLine = node.endLine - 1;
+        const endCol = node.endCol ?? 999999;
+
+        isInside =
+          (position.line > startLine || (position.line === startLine && position.character >= startCol)) &&
+          (position.line < endLine || (position.line === endLine && position.character <= endCol));
+      }
+
+      if (isInside) {
+        // descend if possible
+        if (node.children && node.children.length > 0) {
+          return this.findScopeAtPosition(
             node.children,
             position,
             childVars,
@@ -2320,15 +2326,19 @@ export class TemplateValidator {
             rootNodes,
             ctx
           );
-          if (inner) return inner;
         }
-
-        return { stack: childStack, locals: blockLocals };
+        // otherwise return current accumulated scope
+        return { stack: childStack, locals: childLocals };
       }
+
+      // If not inside → keep accumulating locals from siblings
+      // (especially important for assignments before the cursor)
     }
 
-    return null;
+    // Fell through — return whatever we accumulated up to this point
+    return { stack: scopeStack, locals: blockLocals };
   }
+
 
   // ── Utilities ──────────────────────────────────────────────────────────────
 

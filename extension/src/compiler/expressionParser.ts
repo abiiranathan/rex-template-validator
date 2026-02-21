@@ -686,14 +686,14 @@ export class TypeInferencer {
         if (!target) return null;
 
         if (target.isMap && target.elemType) {
-          return { typeStr: target.elemType };
+          return { typeStr: target.elemType, fields: target.fields };
         }
         if (target.isSlice && target.elemType) {
-          return { typeStr: target.elemType };
+          return { typeStr: target.elemType, fields: target.fields };
         }
         // Array index
         if (target.typeStr.startsWith('[]')) {
-          return { typeStr: target.typeStr.slice(2) };
+          return { typeStr: target.typeStr.slice(2), fields: target.fields };
         }
         return null;
       }
