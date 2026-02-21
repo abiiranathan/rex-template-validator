@@ -31,13 +31,12 @@ func AnalyzeDir(dir string, contextFile string) AnalysisResult {
 			packages.NeedTypes |
 			packages.NeedTypesInfo |
 			packages.NeedTypesSizes |
-			packages.NeedImports, // Added NeedImports to resolve types from imported packages
+			packages.NeedImports,
 		Dir:   dir,
 		Fset:  fset,
 		Tests: false,
 	}
 
-	// Load the entire project so we have access to all types (e.g., models.User)
 	pkgs, err := packages.Load(cfg, "./...")
 	if err != nil {
 		result.Errors = append(result.Errors, fmt.Sprintf("load error: %v", err))
@@ -73,7 +72,6 @@ func AnalyzeDir(dir string, contextFile string) AnalysisResult {
 		}
 	}
 
-	// Build file map and pre-compute all struct positions once — not per call.
 	filesMap := make(map[string]*ast.File)
 	for _, f := range allFiles {
 		if pos := fset.File(f.Pos()); pos != nil {
@@ -81,110 +79,93 @@ func AnalyzeDir(dir string, contextFile string) AnalysisResult {
 		}
 	}
 
-	// structIndex is built once and shared for the lifetime of this analysis.
-	// Key: "pkgName.TypeName" to avoid cross-package name collisions.
 	structIndex := buildStructIndex(fset, filesMap)
 
-	// Automatically discover context variables set via c.Set("key", value)
-	implicitVars := findContextSetCalls(pkgs, info, fset, structIndex)
+	// Collect scopes (local functions) and analyze their Sets and Renders
+	scopes := collectFuncScopes(allFiles, info, fset, structIndex)
 
-	for _, f := range allFiles {
-		ast.Inspect(f, func(n ast.Node) bool {
-			call, ok := n.(*ast.CallExpr)
-			if !ok {
-				return true
-			}
+	// Identify global implicit variables (from scopes with Sets but NO Renders)
+	var globalImplicitVars []TemplateVar
+	for _, scope := range scopes {
+		if len(scope.RenderNodes) == 0 && len(scope.SetVars) > 0 {
+			globalImplicitVars = append(globalImplicitVars, scope.SetVars...)
+		}
+	}
 
-			// Determine the function name and the argument index of the template path.
-			//
-			// We support two calling conventions:
-			//   1. Method call:  c.Render("tmpl.html", data)
-			//                    c.ExecuteTemplate(w, "tmpl.html", data)
-			//      The function is a SelectorExpr; the template path is Args[0].
-			//
-			//   2. Plain function call: Render(w, "tmpl.html", data)
-			//      The function is an Ident; we look for a string literal among
-			//      Args to identify the template path argument.
-			//
-			// In both cases we require at least 2 arguments total.
+	// Generate render calls from scopes that HAVE renders
+	for _, scope := range scopes {
+		if len(scope.RenderNodes) > 0 {
+			for _, call := range scope.RenderNodes {
+				// Process this render call
+				// Duplicate logic from original AnalyzeDir loop but using 'call' directly
 
-			funcName := ""
-			templateArgIdx := 0 // index of the template path string in call.Args
+				// Re-extract template path and data arg (since we only stored the CallExpr)
+				templateArgIdx := 0
 
-			switch fn := call.Fun.(type) {
-			case *ast.SelectorExpr:
-				funcName = fn.Sel.Name
-				// Method call: first arg is the template path.
-				templateArgIdx = 0
-			case *ast.Ident:
-				funcName = fn.Name
-				// Plain function call: the template path may be the first or second
-				// argument (e.g. Render(w, "tmpl.html", data)). Find the first
-				// string-literal argument and use that as the template path, taking
-				// the argument immediately after it as the data argument.
-				templateArgIdx = -1 // will be resolved below
-			}
+				switch call.Fun.(type) {
+				case *ast.SelectorExpr:
+					templateArgIdx = 0
+				case *ast.Ident:
+					templateArgIdx = -1
+				}
 
-			if funcName != "Render" && funcName != "ExecuteTemplate" {
-				return true
-			}
-
-			if len(call.Args) < 2 {
-				return true
-			}
-
-			// For plain function calls, find the first string-literal argument.
-			if templateArgIdx == -1 {
-				for i, arg := range call.Args {
-					if lit, ok := arg.(*ast.BasicLit); ok && lit.Kind == token.STRING {
-						templateArgIdx = i
-						break
+				if templateArgIdx == -1 {
+					for i, arg := range call.Args {
+						if lit, ok := arg.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+							templateArgIdx = i
+							break
+						}
 					}
 				}
-				if templateArgIdx == -1 {
-					return true // no string literal found — not a recognized pattern
+
+				if templateArgIdx == -1 || templateArgIdx >= len(call.Args) {
+					continue
 				}
-			}
 
-			// Ensure we have a data argument after the template path.
-			dataArgIdx := templateArgIdx + 1
-			if dataArgIdx >= len(call.Args) {
-				return true
-			}
+				templatePathExpr := call.Args[templateArgIdx]
+				templatePath := extractString(templatePathExpr)
 
-			templatePathExpr := call.Args[templateArgIdx]
-			templatePath := extractString(templatePathExpr)
-
-			tplNameStartCol, tplNameEndCol := getExprColumnRange(fset, templatePathExpr)
-			if lit, ok := templatePathExpr.(*ast.BasicLit); ok && lit.Kind == token.STRING {
-				tplNameStartCol += 1
-				tplNameEndCol -= 1
-			}
-
-			if templatePath == "" {
-				return true
-			}
-
-			vars := extractMapVars(call.Args[dataArgIdx], info, fset, structIndex)
-
-			pos := fset.Position(call.Pos())
-			relFile := pos.Filename
-			if abs, err := filepath.Abs(pos.Filename); err == nil {
-				if rel, err := filepath.Rel(dir, abs); err == nil {
-					relFile = rel
+				tplNameStartCol, tplNameEndCol := getExprColumnRange(fset, templatePathExpr)
+				if lit, ok := templatePathExpr.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+					tplNameStartCol += 1
+					tplNameEndCol -= 1
 				}
-			}
 
-			result.RenderCalls = append(result.RenderCalls, RenderCall{
-				File:                 relFile,
-				Line:                 pos.Line,
-				Template:             templatePath,
-				TemplateNameStartCol: tplNameStartCol,
-				TemplateNameEndCol:   tplNameEndCol,
-				Vars:                 append(vars, implicitVars...),
-			})
-			return true
-		})
+				if templatePath == "" {
+					continue
+				}
+
+				// Data arg is next
+				dataArgIdx := templateArgIdx + 1
+				var vars []TemplateVar
+				if dataArgIdx < len(call.Args) {
+					vars = extractMapVars(call.Args[dataArgIdx], info, fset, structIndex)
+				}
+
+				// Combine variables: Explicit + Local Scope + Global Implicit
+				var allVars []TemplateVar
+				allVars = append(allVars, vars...)
+				allVars = append(allVars, scope.SetVars...)
+				allVars = append(allVars, globalImplicitVars...)
+
+				pos := fset.Position(call.Pos())
+				relFile := pos.Filename
+				if abs, err := filepath.Abs(pos.Filename); err == nil {
+					if rel, err := filepath.Rel(dir, abs); err == nil {
+						relFile = rel
+					}
+				}
+
+				result.RenderCalls = append(result.RenderCalls, RenderCall{
+					File:                 relFile,
+					Line:                 pos.Line,
+					Template:             templatePath,
+					TemplateNameStartCol: tplNameStartCol,
+					TemplateNameEndCol:   tplNameEndCol,
+					Vars:                 allVars,
+				})
+			}
+		}
 	}
 
 	if contextFile != "" {
@@ -192,6 +173,151 @@ func AnalyzeDir(dir string, contextFile string) AnalysisResult {
 	}
 
 	return result
+}
+
+// FuncScope represents a function body analysis
+type FuncScope struct {
+	SetVars     []TemplateVar
+	RenderNodes []*ast.CallExpr
+}
+
+func collectFuncScopes(files []*ast.File, info *types.Info, fset *token.FileSet, structIndex map[string]structIndexEntry) []FuncScope {
+	var scopes []FuncScope
+
+	// Helper to process a function node (FuncDecl or FuncLit)
+	processFunc := func(n ast.Node) {
+		scope := FuncScope{}
+
+		// Inspect the body of the function
+		ast.Inspect(n, func(child ast.Node) bool {
+			// Don't recurse into nested function definitions; they will be handled by the outer loop
+			if child != n {
+				if _, isFunc := child.(*ast.FuncLit); isFunc {
+					return false
+				}
+			}
+
+			call, ok := child.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+
+			// Check for Render call
+			if isRenderCall(call) {
+				scope.RenderNodes = append(scope.RenderNodes, call)
+			}
+
+			// Check for Set call
+			if setVar := extractSetCallVar(call, info, fset, structIndex); setVar != nil {
+				scope.SetVars = append(scope.SetVars, *setVar)
+			}
+
+			return true
+		})
+		scopes = append(scopes, scope)
+	}
+
+	for _, f := range files {
+		ast.Inspect(f, func(n ast.Node) bool {
+			if _, ok := n.(*ast.FuncDecl); ok {
+				processFunc(n)
+			}
+			if _, ok := n.(*ast.FuncLit); ok {
+				processFunc(n)
+			}
+			return true
+		})
+	}
+	return scopes
+}
+
+func isRenderCall(call *ast.CallExpr) bool {
+	funcName := ""
+	switch fn := call.Fun.(type) {
+	case *ast.SelectorExpr:
+		funcName = fn.Sel.Name
+	case *ast.Ident:
+		funcName = fn.Name
+	}
+	return (funcName == "Render" || funcName == "ExecuteTemplate") && len(call.Args) >= 2
+}
+
+func extractSetCallVar(call *ast.CallExpr, info *types.Info, fset *token.FileSet, structIndex map[string]structIndexEntry) *TemplateVar {
+	// Look for c.Set("key", value)
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return nil
+	}
+
+	if sel.Sel.Name != "Set" {
+		return nil
+	}
+
+	// Check receiver type
+	if info != nil && sel.X != nil {
+		if typeAndValue, ok := info.Types[sel.X]; ok {
+			t := typeAndValue.Type
+			if ptr, ok := t.(*types.Pointer); ok {
+				t = ptr.Elem()
+			}
+			if named, ok := t.(*types.Named); ok {
+				if named.Obj().Name() != "Context" {
+					return nil
+				}
+			} else {
+				// Strict check: if unknown type, ignore to avoid false positives?
+				// For now, let's skip if we can't confirm it's Context, assuming 'Set' is rare enough or specific enough.
+				// But user might use other libraries with 'Set'.
+				// Let's rely on type name "Context" if available.
+				return nil
+			}
+		}
+	}
+
+	if len(call.Args) < 2 {
+		return nil
+	}
+
+	keyArg := call.Args[0]
+	key := extractString(keyArg)
+	if key == "" {
+		return nil
+	}
+
+	valArg := call.Args[1]
+	tv := TemplateVar{Name: key}
+
+	if typeInfo, ok := info.Types[valArg]; ok && typeInfo.Type != nil {
+		tv.TypeStr = normalizeTypeStr(typeInfo.Type.String())
+		seen := make(map[string]bool)
+		tv.Fields, tv.Doc = extractFieldsWithDocs(typeInfo.Type, structIndex, seen, fset)
+
+		if elemType := getElementType(typeInfo.Type); elemType != nil {
+			tv.IsSlice = true
+			tv.ElemType = normalizeTypeStr(elemType.String())
+			elemSeen := make(map[string]bool)
+			elemFields, elemDoc := extractFieldsWithDocs(elemType, structIndex, elemSeen, fset)
+			tv.Fields = elemFields
+			if elemDoc != "" {
+				tv.Doc = elemDoc
+			}
+		} else if keyType, elemType := getMapTypes(typeInfo.Type); keyType != nil && elemType != nil {
+			tv.IsMap = true
+			tv.KeyType = normalizeTypeStr(keyType.String())
+			tv.ElemType = normalizeTypeStr(elemType.String())
+			elemSeen := make(map[string]bool)
+			elemFields, elemDoc := extractFieldsWithDocs(elemType, structIndex, elemSeen, fset)
+			tv.Fields = elemFields
+			if elemDoc != "" {
+				tv.Doc = elemDoc
+			}
+		}
+	} else {
+		tv.TypeStr = inferTypeFromAST(valArg)
+	}
+
+	tv.DefFile, tv.DefLine, tv.DefCol = findDefinitionLocation(valArg, info, fset)
+	return &tv
 }
 
 func enrichRenderCallsWithContext(calls []RenderCall, contextFile string, pkgs []*packages.Package, structIndex map[string]structIndexEntry, fset *token.FileSet) []RenderCall {
@@ -799,111 +925,4 @@ func FindGoFiles(root string) ([]string, error) {
 		return nil
 	})
 	return files, err
-}
-
-// findContextSetCalls scans for c.Set("key", value) calls to identify global template variables
-func findContextSetCalls(pkgs []*packages.Package, info *types.Info, fset *token.FileSet, structIndex map[string]structIndexEntry) []TemplateVar {
-	var vars []TemplateVar
-	seenVars := make(map[string]bool)
-
-	for _, pkg := range pkgs {
-		for _, file := range pkg.Syntax {
-			ast.Inspect(file, func(n ast.Node) bool {
-				call, ok := n.(*ast.CallExpr)
-				if !ok {
-					return true
-				}
-
-				// Look for c.Set("key", value)
-				sel, ok := call.Fun.(*ast.SelectorExpr)
-				if !ok {
-					return true
-				}
-
-				if sel.Sel.Name != "Set" {
-					return true
-				}
-
-				// Check receiver type
-				if info != nil {
-					if sel.X != nil {
-						if typeAndValue, ok := info.Types[sel.X]; ok {
-							t := typeAndValue.Type
-							// Unwrap pointer
-							if ptr, ok := t.(*types.Pointer); ok {
-								t = ptr.Elem()
-							}
-							if named, ok := t.(*types.Named); ok {
-								obj := named.Obj()
-								// Check if type name is Context.
-								if obj.Name() != "Context" {
-									return true
-								}
-							} else {
-								// If we can't determine type name, we might skip or be lenient.
-								// Being strict avoids false positives.
-								return true
-							}
-						}
-					}
-				}
-
-				if len(call.Args) < 2 {
-					return true
-				}
-
-				// Extract key
-				keyArg := call.Args[0]
-				key := extractString(keyArg)
-				if key == "" {
-					return true
-				}
-
-				if seenVars[key] {
-					return true
-				}
-				seenVars[key] = true
-
-				// Extract value type
-				valArg := call.Args[1]
-				tv := TemplateVar{Name: key}
-
-				if typeInfo, ok := info.Types[valArg]; ok && typeInfo.Type != nil {
-					tv.TypeStr = normalizeTypeStr(typeInfo.Type.String())
-					seen := make(map[string]bool)
-					tv.Fields, tv.Doc = extractFieldsWithDocs(typeInfo.Type, structIndex, seen, fset)
-
-					if elemType := getElementType(typeInfo.Type); elemType != nil {
-						tv.IsSlice = true
-						tv.ElemType = normalizeTypeStr(elemType.String())
-						elemSeen := make(map[string]bool)
-						elemFields, elemDoc := extractFieldsWithDocs(elemType, structIndex, elemSeen, fset)
-						tv.Fields = elemFields
-						if elemDoc != "" {
-							tv.Doc = elemDoc
-						}
-					} else if keyType, elemType := getMapTypes(typeInfo.Type); keyType != nil && elemType != nil {
-						tv.IsMap = true
-						tv.KeyType = normalizeTypeStr(keyType.String())
-						tv.ElemType = normalizeTypeStr(elemType.String())
-						elemSeen := make(map[string]bool)
-						elemFields, elemDoc := extractFieldsWithDocs(elemType, structIndex, elemSeen, fset)
-						tv.Fields = elemFields
-						if elemDoc != "" {
-							tv.Doc = elemDoc
-						}
-					}
-
-				} else {
-					tv.TypeStr = inferTypeFromAST(valArg)
-				}
-
-				tv.DefFile, tv.DefLine, tv.DefCol = findDefinitionLocation(valArg, info, fset)
-
-				vars = append(vars, tv)
-				return true
-			})
-		}
-	}
-	return vars
 }
