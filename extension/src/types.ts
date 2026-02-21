@@ -59,6 +59,35 @@ export interface AnalysisResult {
   validationErrors?: GoValidationError[];
 }
 
+// ─── Named Block Registry ──────────────────────────────────────────────────────
+
+/**
+ * A single entry in the named block registry. Represents a {{ define "name" }}
+ * or {{ block "name" ... }} declaration found in any template file.
+ */
+export interface NamedBlockEntry {
+  /** The block/define name, e.g. "header", "billed-drug" */
+  name: string;
+  /** Absolute path to the file that contains this declaration */
+  absolutePath: string;
+  /** Logical/relative template path (relative to templateBase), e.g. "views/partials/_blocks.html" */
+  templatePath: string;
+  /** 1-based line number of the opening {{ define }} or {{ block }} tag */
+  line: number;
+  /** 1-based column of the opening tag */
+  col: number;
+  /** The AST node, stored so validators can walk its children */
+  node: import('./types').TemplateNode;
+}
+
+/**
+ * The global registry of all named blocks found across all template files.
+ *
+ * Key: block name (e.g. "header")
+ * Value: all declarations of that name (should be exactly 1; >1 is an error)
+ */
+export type NamedBlockRegistry = Map<string, NamedBlockEntry[]>;
+
 // ─── Knowledge Graph ──────────────────────────────────────────────────────────
 
 export interface TemplateContext {
@@ -72,7 +101,20 @@ export interface TemplateContext {
 
 export interface KnowledgeGraph {
   templates: Map<string, TemplateContext>; // keyed by logical templatePath
+  /** Cross-file registry of all {{ define }} and {{ block }} declarations */
+  namedBlocks: NamedBlockRegistry;
+  /** Errors found while building the registry (e.g. duplicate block names) */
+  namedBlockErrors: NamedBlockDuplicateError[];
   analyzedAt: Date;
+}
+
+/**
+ * Reported when the same block name is declared in more than one location.
+ */
+export interface NamedBlockDuplicateError {
+  name: string;
+  entries: NamedBlockEntry[];
+  message: string;
 }
 
 // ─── Template AST ─────────────────────────────────────────────────────────────
@@ -111,6 +153,14 @@ export interface ScopeFrame {
   typeStr: string;
   fields?: FieldInfo[];
   isRange?: boolean;
+  /** Whether this scope's dot value is a map */
+  isMap?: boolean;
+  /** Map key type (e.g. "string") when isMap is true */
+  keyType?: string;
+  /** Map/slice element type when isMap or isSlice is true */
+  elemType?: string;
+  /** Whether this scope's dot value is a slice */
+  isSlice?: boolean;
   /** For ranges: the source variable being iterated (e.g., "prescriptions" from {{ range .prescriptions }}) */
   sourceVar?: TemplateVar;
   /** Local variables defined in this scope (e.g. via $name := ...) */

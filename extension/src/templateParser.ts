@@ -16,10 +16,8 @@ export class TemplateParser {
 
   private tokenize(content: string): Token[] {
     const tokens: Token[] = [];
-    // Match {{ ... }} with optional whitespace trimming dashes
     const actionRe = /\{\{-?\s*([\s\S]*?)\s*-?\}\}/g;
 
-    // Pre-compute line start offsets for O(log n) position lookup
     const lineOffsets: number[] = [0];
     for (let i = 0; i < content.length; i++) {
       if (content[i] === '\n') {
@@ -56,17 +54,13 @@ export class TemplateParser {
       const tok = tokens[pos];
       const inner = tok.inner;
 
-      // end / else → stop this level
       if (inner === 'end' || inner === 'else' || inner.startsWith('else ')) {
         return { nodes, nextPos: pos + 1, endToken: tok };
       }
 
-      // Comments
       if (inner.startsWith('/*') || inner.startsWith('-/*') || inner.startsWith('//')) {
         pos++; continue;
       }
-
-      // ── Block openers ────────────────────────────────────────────────────
 
       if (inner.startsWith('range ')) {
         const expr = inner.slice(6).trim();
@@ -193,8 +187,6 @@ export class TemplateParser {
         continue;
       }
 
-      // ── Template / partial calls ─────────────────────────────────────────
-
       if (inner.startsWith('template ')) {
         const tplMatch = inner.match(/^template\s+"([^"]+)"(?:\s+(.+))?/);
         if (tplMatch) {
@@ -212,8 +204,6 @@ export class TemplateParser {
         pos++; continue;
       }
 
-      // ── Variable / pipeline ──────────────────────────────────────────────
-
       const varNodes = this.tryParseVariables(tok);
       nodes.push(...varNodes);
       pos++;
@@ -224,15 +214,10 @@ export class TemplateParser {
 
   // ── Helpers ────────────────────────────────────────────────────────────────
 
-  /**
-   * Extract all dot-path variable references from a token.
-   * A single action may contain multiple refs: `eq .Name "foo"`, `not .IsLast`
-   */
   private tryParseVariables(tok: Token): TemplateNode[] {
     let inner = tok.inner;
     const results: TemplateNode[] = [];
 
-    // 1. Strip assignment LHS: $var := ... or $a, $b := ...
     const assignMatch = inner.match(/^\s*(?:\$(\w+)(?:\s*,\s*\$(\w+))?)\s*:=\s*(.*)/);
     if (assignMatch) {
       const assignVars = [];
@@ -249,19 +234,14 @@ export class TemplateParser {
         assignVars,
         assignExpr,
       });
-      inner = assignExpr; // continue parsing the RHS for variables
+      inner = assignExpr;
     }
 
-    // 2. Scan for references starting with . or $
-    // Matches: .Field, $Var, $.Field, ., $, and index operations like (index .Slice 0).Field
     const refs = inner.match(/(\(index\s+(?:\$|\.)[\w\d_.]+\s+[^)]+\)(?:\.[\w\d_.]+)*|(?:\$|\.)[\w\d_.[\]]*)/g);
 
     if (refs) {
       for (const ref of refs) {
-        // Skip purely numeric decimals like .23
         if (/^\.\d+$/.test(ref)) continue;
-
-        // Skip ellipsis "..."
         if (ref === '...') continue;
 
         results.push({
@@ -286,41 +266,33 @@ export class TemplateParser {
    * "$.User.Name"        → ["$", "User", "Name"]
    */
   parseDotPath(expr: string): string[] {
-    // Strip variable assignment prefix "$v := "
     expr = expr.replace(/^\$\w+\s*:=\s*/, '').trim();
 
-    // Extract path from (call .Method args)
     const callMatch = expr.match(/\(call\s+(\.[^\s)]+)/);
     if (callMatch) expr = callMatch[1];
 
-    // Handle index: (index .Slice 0).Field -> .Slice.[].Field
     let indexMatch;
     while ((indexMatch = expr.match(/\(index\s+((?:\$|\.)[\w.]+)[^)]*\)/))) {
       expr = expr.replace(indexMatch[0], indexMatch[1] + '.[]');
     }
 
-    // Take only the path part before any space/pipe/paren
     const pathPart = expr.split(/[\s|(),]/)[0];
 
     if (pathPart === '.' || pathPart === '') return ['.'];
     if (!pathPart.startsWith('.') && !pathPart.startsWith('$')) return [];
 
-    // Handle "$." root access — becomes ["$", ...rest]
     if (pathPart.startsWith('$.')) {
       const rest = pathPart.slice(2).split('.').filter(p => p.length > 0);
       return ['$', ...rest];
     }
 
-    // Handle bare "$" — root context reference
     if (pathPart === '$') return ['$'];
 
-    // Handle "$varName" (local variable, not root access)
     if (pathPart.startsWith('$')) {
       const parts = pathPart.split('.');
       return parts.filter(p => p.length > 0);
     }
 
-    // Normal dot path: ".A.B.C" → ["A", "B", "C"]
     return pathPart.split('.').filter(p => p.length > 0);
   }
 }
@@ -370,7 +342,6 @@ export function resolvePath(
   if (path[0].startsWith('$') && path[0] !== '$') {
     let local = blockLocals?.get(path[0]);
     if (!local) {
-      // check scopeStack for locals
       for (let i = scopeStack.length - 1; i >= 0; i--) {
         if (scopeStack[i].locals?.has(path[0])) {
           local = scopeStack[i].locals!.get(path[0]);
@@ -397,7 +368,20 @@ export function resolvePath(
   // Bare dot → current scope
   if (path.length === 1 && path[0] === '.') {
     const frame = findDotFrame(scopeStack);
-    if (frame) return { typeStr: frame.typeStr, found: true, fields: frame.fields };
+    if (frame) {
+      return {
+        typeStr: frame.typeStr,
+        found: true,
+        fields: frame.fields,
+        // Propagate map/slice metadata stored on the frame so that
+        // `range $k, $v := .` over a map context correctly identifies
+        // the key and value types.
+        isMap: frame.isMap,
+        keyType: frame.keyType,
+        elemType: frame.elemType,
+        isSlice: frame.isSlice,
+      };
+    }
     return { typeStr: 'context', found: true };
   }
 
@@ -408,7 +392,7 @@ export function resolvePath(
 
   // Root-anchored path "$." → resolve against root vars, bypassing scope stack
   if (path[0] === '$') {
-    const remaining = path.slice(1); // e.g. ["User", "Name"]
+    const remaining = path.slice(1);
     const topVar = vars.get(remaining[0]);
     if (!topVar) return { typeStr: 'unknown', found: false };
     if (remaining.length === 1) {
@@ -426,7 +410,6 @@ export function resolvePath(
   }
 
   // Path inside a with/range scope → check the active dot frame first.
-  // Only fall through to top-level vars for explicit "$"-prefixed paths.
   const dotFrame = findDotFrame(scopeStack);
   if (dotFrame) {
     if (dotFrame.fields) {
@@ -464,10 +447,6 @@ function findDotFrame(scopeStack: ScopeFrame[]): ScopeFrame | undefined {
   return undefined;
 }
 
-/**
- * Walk a field path (no leading var name) through a fields array.
- * Handles arbitrary depth: ["Profile", "Address", "City"] against User's fields.
- */
 function resolveFields(
   parts: string[],
   fields: FieldInfo[],
@@ -527,12 +506,6 @@ function resolveFields(
   return resolveFieldsDeep(parts, fields);
 }
 
-/**
- * Core recursive field resolver — supports unlimited nesting depth.
- *
- * Each element of `parts` is a field name to traverse. When the final
- * part is reached, the field's type info is returned.
- */
 function resolveFieldsDeep(
   parts: string[],
   fields: FieldInfo[]
@@ -548,17 +521,13 @@ function resolveFieldsDeep(
     return { typeStr: 'unknown', found: false };
   }
 
-  // Found field. Check if we need to go deeper via map or struct access.
   if (tail.length > 0) {
     if (field.isMap) {
-      // Delegate to map handling for the rest of path
       return resolveFields(tail, field.fields ?? [], true, field.elemType);
     }
-    // Struct/slice recursion
     return resolveFieldsDeep(tail, field.fields ?? []);
   }
 
-  // Reached the target field
   return {
     typeStr: field.type,
     found: true,

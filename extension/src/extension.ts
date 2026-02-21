@@ -4,7 +4,7 @@ import { GoAnalyzer } from './analyzer';
 import { KnowledgeGraphBuilder } from './knowledgeGraph';
 import { TemplateValidator } from './validator';
 import { KnowledgeGraphPanel } from './graphPanel';
-import { KnowledgeGraph, GoValidationError } from './types';
+import { KnowledgeGraph, GoValidationError, NamedBlockDuplicateError } from './types';
 import * as fs from 'fs';
 
 const TEMPLATE_SELECTOR: vscode.DocumentSelector = [
@@ -14,19 +14,19 @@ const TEMPLATE_SELECTOR: vscode.DocumentSelector = [
   { pattern: '**/*.html' },
 ];
 
-// Two separate collections so they never interfere with each other:
-// - analyzerCollection: diagnostics from the Go binary (persists across template edits)
-// - editorCollection:   diagnostics from the in-editor TypeScript validator (per-document)
+// Three separate collections so they never interfere with each other:
+// - analyzerCollection:   diagnostics from the Go binary (persists across template edits)
+// - editorCollection:     diagnostics from the in-editor TypeScript validator (per-document)
+// - namedBlockCollection: duplicate named-block errors (cross-file, rebuilt with index)
 let analyzerCollection: vscode.DiagnosticCollection;
 let editorCollection: vscode.DiagnosticCollection;
+let namedBlockCollection: vscode.DiagnosticCollection;
 let outputChannel: vscode.OutputChannel;
 let graphBuilder: KnowledgeGraphBuilder | undefined;
 let validator: TemplateValidator | undefined;
 let currentGraph: KnowledgeGraph | undefined;
 let analyzer: GoAnalyzer | undefined;
 
-// Separate timers for rebuild (Go changes) vs validate (template changes)
-// so a template edit doesn't trigger a full Go re-analysis.
 let rebuildTimer: NodeJS.Timeout | undefined;
 let validateTimer: NodeJS.Timeout | undefined;
 
@@ -34,8 +34,9 @@ export async function activate(context: vscode.ExtensionContext) {
   outputChannel = vscode.window.createOutputChannel('Rex Template Validator');
   analyzerCollection = vscode.languages.createDiagnosticCollection('rex-analyzer');
   editorCollection = vscode.languages.createDiagnosticCollection('rex-editor');
+  namedBlockCollection = vscode.languages.createDiagnosticCollection('rex-named-blocks');
 
-  context.subscriptions.push(outputChannel, analyzerCollection, editorCollection);
+  context.subscriptions.push(outputChannel, analyzerCollection, editorCollection, namedBlockCollection);
   outputChannel.appendLine('[Rex] Extension activated');
 
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -75,19 +76,14 @@ export async function activate(context: vscode.ExtensionContext) {
 
   // ── Language features ──────────────────────────────────────────────────────
 
-  // Hover
   context.subscriptions.push(
     vscode.languages.registerHoverProvider(TEMPLATE_SELECTOR, {
       async provideHover(document, position) {
         if (!validator || !graphBuilder) return;
         let ctx = graphBuilder.findContextForFile(document.uri.fsPath);
-        // If this file has no render calls or wasn't found, it might be a partial used by other templates
-        // Try to find the context from a parent template's partial call
         if (!ctx || ctx.renderCalls.length === 0) {
           const partialCtx = graphBuilder.findContextForFileAsPartial(document.uri.fsPath);
-          if (partialCtx) {
-            ctx = partialCtx;
-          }
+          if (partialCtx) ctx = partialCtx;
         }
         if (!ctx) return;
         return await validator.getHoverInfo(document, position, ctx);
@@ -95,7 +91,6 @@ export async function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // Completion
   context.subscriptions.push(
     vscode.languages.registerCompletionItemProvider(
       TEMPLATE_SELECTOR,
@@ -103,13 +98,9 @@ export async function activate(context: vscode.ExtensionContext) {
         provideCompletionItems(document, position) {
           if (!validator || !graphBuilder) return;
           let ctx = graphBuilder.findContextForFile(document.uri.fsPath);
-          // If this file has no render calls or wasn't found, it might be a partial used by other templates
-          // Try to find the context from a parent template's partial call
           if (!ctx || ctx.renderCalls.length === 0) {
             const partialCtx = graphBuilder.findContextForFileAsPartial(document.uri.fsPath);
-            if (partialCtx) {
-              ctx = partialCtx;
-            }
+            if (partialCtx) ctx = partialCtx;
           }
           if (!ctx) return [];
           return validator.getCompletions(document, position, ctx);
@@ -119,19 +110,14 @@ export async function activate(context: vscode.ExtensionContext) {
     )
   );
 
-  // Go to Definition — jumps from template variable to the c.Render() call in Go
   context.subscriptions.push(
     vscode.languages.registerDefinitionProvider(TEMPLATE_SELECTOR, {
       async provideDefinition(document, position) {
         if (!validator || !graphBuilder) return;
         let ctx = graphBuilder.findContextForFile(document.uri.fsPath);
-        // If this file has no render calls or wasn't found, it might be a partial used by other templates
-        // Try to find the context from a parent template's partial call
         if (!ctx || ctx.renderCalls.length === 0) {
           const partialCtx = graphBuilder.findContextForFileAsPartial(document.uri.fsPath);
-          if (partialCtx) {
-            ctx = partialCtx;
-          }
+          if (partialCtx) ctx = partialCtx;
         }
         if (!ctx) return;
         return await validator.getDefinitionLocation(document, position, ctx);
@@ -139,7 +125,6 @@ export async function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // Go to Definition for Go files — jumps from c.Render("template.html", ...) to the template file
   const GO_SELECTOR: vscode.DocumentSelector = [{ language: 'go', scheme: 'file' }];
   context.subscriptions.push(
     vscode.languages.registerDefinitionProvider(GO_SELECTOR, {
@@ -152,7 +137,6 @@ export async function activate(context: vscode.ExtensionContext) {
 
   // ── File watchers ──────────────────────────────────────────────────────────
 
-  // Go source changes → full re-analysis
   const goWatcher = vscode.workspace.createFileSystemWatcher('**/*.go');
   context.subscriptions.push(
     goWatcher,
@@ -161,21 +145,26 @@ export async function activate(context: vscode.ExtensionContext) {
     goWatcher.onDidDelete(() => scheduleRebuild(workspaceRoot))
   );
 
-  // Template changes → re-validate only (no Go analysis needed)
-  const tplWatcher = vscode.workspace.createFileSystemWatcher('**/*.{html,tmpl}');
+  const tplWatcher = vscode.workspace.createFileSystemWatcher('**/*.{html,tmpl,tpl,gohtml}');
   context.subscriptions.push(
     tplWatcher,
     tplWatcher.onDidChange(async (uri) => {
+      // A template file changed: rebuild named-block registry first (fast), then
+      // re-validate the changed file and any file that might reference its blocks.
+      if (graphBuilder) graphBuilder.rebuildNamedBlocks();
+      applyNamedBlockDiagnostics();
       const doc = await vscode.workspace.openTextDocument(uri);
       if (isTemplate(doc)) scheduleValidate(doc);
     }),
-    tplWatcher.onDidCreate(async (uri) => {
-      // New template file — rebuild so it can be indexed
+    tplWatcher.onDidCreate(() => {
       scheduleRebuild(workspaceRoot);
+    }),
+    tplWatcher.onDidDelete(() => {
+      if (graphBuilder) graphBuilder.rebuildNamedBlocks();
+      applyNamedBlockDiagnostics();
     })
   );
 
-  // Validate on open/change/save
   context.subscriptions.push(
     vscode.workspace.onDidOpenTextDocument((doc) => {
       if (isTemplate(doc)) scheduleValidate(doc);
@@ -187,16 +176,17 @@ export async function activate(context: vscode.ExtensionContext) {
 
     vscode.workspace.onDidSaveTextDocument((doc) => {
       if (doc.fileName.endsWith('.go')) {
-        scheduleRebuild(workspaceRoot);      // re-run Go analyzer
+        scheduleRebuild(workspaceRoot);
       } else if (isTemplate(doc)) {
-        scheduleValidate(doc);               // re-validate template against existing graph
+        if (graphBuilder) graphBuilder.rebuildNamedBlocks();
+        applyNamedBlockDiagnostics();
+        scheduleValidate(doc);
       } else {
-        scheduleRebuild(workspaceRoot); // default
+        scheduleRebuild(workspaceRoot);
       }
     })
   );
 
-  // Config changes → rebuild so new sourceDir/templateRoot take effect
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('rex-analyzer')) {
@@ -210,7 +200,6 @@ export async function activate(context: vscode.ExtensionContext) {
 
   await rebuildIndex(workspaceRoot);
 
-  // Validate already-open templates
   for (const doc of vscode.workspace.textDocuments) {
     if (isTemplate(doc)) {
       await validateDocument(doc);
@@ -268,7 +257,6 @@ async function rebuildIndex(workspaceRoot: string) {
     const extensionMissingTemplateLogicalPaths = new Set<string>();
     const extensionGeneratedErrors: GoValidationError[] = [];
 
-    // Check for missing templates
     for (const [logicalPath, ctx] of currentGraph.templates) {
       if (!fs.existsSync(ctx.absolutePath)) {
         for (const rc of ctx.renderCalls) {
@@ -291,24 +279,23 @@ async function rebuildIndex(workspaceRoot: string) {
 
     const finalValidationErrors: GoValidationError[] = [];
 
-    // Filter out analyzer errors if a more precise extension error exists
     for (const analyzerErr of initialValidationErrors) {
       if (
         analyzerErr.message.includes('Could not read template file:') &&
         extensionMissingTemplateLogicalPaths.has(analyzerErr.template)
       ) {
-        // Skip this analyzer error as the extension provides a better one
         continue;
       }
       finalValidationErrors.push(analyzerErr);
     }
 
-    // Add all extension-generated errors
     finalValidationErrors.push(...extensionGeneratedErrors);
 
     await applyAnalyzerDiagnostics(finalValidationErrors, workspaceRoot, sourceDir, templateRoot, templateBaseDir);
 
-    // Re-validate open template docs with fresh graph (editor diagnostics only)
+    // Surface named-block duplicate errors
+    applyNamedBlockDiagnostics();
+
     for (const doc of vscode.workspace.textDocuments) {
       if (isTemplate(doc)) {
         await validateDocument(doc);
@@ -320,6 +307,72 @@ async function rebuildIndex(workspaceRoot: string) {
   } finally {
     setTimeout(() => statusBarItem.dispose(), 5000);
   }
+}
+
+/**
+ * Apply duplicate named-block errors to the namedBlockCollection.
+ *
+ * Each duplicate is reported as an error on every file that contains a
+ * conflicting declaration, pointing at the line of the define/block tag.
+ */
+function applyNamedBlockDiagnostics() {
+  if (!graphBuilder) return;
+  namedBlockCollection.clear();
+
+  const duplicateErrors: NamedBlockDuplicateError[] = graphBuilder.getAllDuplicateErrors();
+  if (duplicateErrors.length === 0) return;
+
+  const issuesByFile = new Map<string, vscode.Diagnostic[]>();
+
+  for (const err of duplicateErrors) {
+    for (const entry of err.entries) {
+      const locs = err.entries
+        .filter(e => e.absolutePath !== entry.absolutePath || e.line !== entry.line)
+        .map(e => `${e.templatePath}:${e.line}`)
+        .join(', ');
+
+      const msg =
+        `Duplicate named block "${err.name}". ` +
+        `Also declared at: ${locs}. Only one declaration is allowed project-wide.`;
+
+      const range = new vscode.Range(
+        Math.max(0, entry.line - 1),
+        Math.max(0, entry.col - 1),
+        Math.max(0, entry.line - 1),
+        Math.max(0, entry.col - 1) + entry.name.length + 2 // +2 for the quotes
+      );
+
+      const diag = new vscode.Diagnostic(range, msg, vscode.DiagnosticSeverity.Error);
+      diag.source = 'Rex';
+      diag.code = 'duplicate-named-block';
+
+      // Add related information pointing to all other declarations
+      diag.relatedInformation = err.entries
+        .filter(e => e !== entry)
+        .map(
+          e =>
+            new vscode.DiagnosticRelatedInformation(
+              new vscode.Location(
+                vscode.Uri.file(e.absolutePath),
+                new vscode.Position(Math.max(0, e.line - 1), Math.max(0, e.col - 1))
+              ),
+              `Also declared here as "${e.name}"`
+            )
+        );
+
+      const list = issuesByFile.get(entry.absolutePath) ?? [];
+      list.push(diag);
+      issuesByFile.set(entry.absolutePath, list);
+    }
+  }
+
+  for (const [filePath, issues] of issuesByFile) {
+    namedBlockCollection.set(vscode.Uri.file(filePath), issues);
+  }
+
+  outputChannel.appendLine(
+    `[Rex] Applied ${duplicateErrors.length} duplicate named-block diagnostic(s)`
+  );
 }
 
 async function applyAnalyzerDiagnostics(
@@ -340,21 +393,19 @@ async function applyAnalyzerDiagnostics(
     let diagnosticEndCol: number;
     let relatedInfo: vscode.DiagnosticRelatedInformation[] | undefined;
 
-    // If it's a template not found error, point to the Go call site
     if (err.message.includes('Template file not found') && err.goFile && err.goLine !== undefined) {
       diagnosticFilePath = path.join(workspaceRoot, sourceDir, err.goFile);
       diagnosticLine = Math.max(0, err.goLine - 1);
-
-      // Use the precise column info from the error object
       diagnosticCol = Math.max(0, (err.templateNameStartCol ?? 1) - 1);
-      diagnosticEndCol = Math.max(0, (err.templateNameEndCol ?? (err.templateNameStartCol ?? 1) + err.template.length) - 1); // Fallback if end col is missing
-
-      // No related info needed as the diagnostic itself is on the Go file
+      diagnosticEndCol = Math.max(
+        0,
+        (err.templateNameEndCol ?? (err.templateNameStartCol ?? 1) + err.template.length) - 1
+      );
       relatedInfo = undefined;
-
     } else {
-      // For other validation errors, point to the template file itself
-      const baseDir = templateBaseDir ? path.join(workspaceRoot, templateBaseDir) : path.join(workspaceRoot, sourceDir);
+      const baseDir = templateBaseDir
+        ? path.join(workspaceRoot, templateBaseDir)
+        : path.join(workspaceRoot, sourceDir);
       diagnosticFilePath = path.join(baseDir, templateRoot, err.template);
       diagnosticLine = Math.max(0, err.line - 1);
       diagnosticCol = Math.max(0, err.column - 1);
@@ -404,13 +455,9 @@ async function validateDocument(doc: vscode.TextDocument) {
 
   let ctx = graphBuilder.findContextForFile(doc.uri.fsPath);
 
-  // If this file has no render calls or wasn't found, it might be a partial used by other templates
-  // Try to find the context from a parent template's partial call
   if (!ctx || ctx.renderCalls.length === 0) {
     const partialCtx = graphBuilder.findContextForFileAsPartial(doc.uri.fsPath);
-    if (partialCtx) {
-      ctx = partialCtx;
-    }
+    if (partialCtx) ctx = partialCtx;
   }
 
   if (!ctx) {
@@ -447,5 +494,6 @@ export function deactivate() {
   if (validateTimer) clearTimeout(validateTimer);
   analyzerCollection?.dispose();
   editorCollection?.dispose();
+  namedBlockCollection?.dispose();
   outputChannel?.dispose();
 }

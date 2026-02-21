@@ -4,6 +4,9 @@ import * as vscode from 'vscode';
 import {
   AnalysisResult,
   KnowledgeGraph,
+  NamedBlockRegistry,
+  NamedBlockEntry,
+  NamedBlockDuplicateError,
   TemplateContext,
   TemplateVar,
   TemplateNode,
@@ -14,6 +17,8 @@ import { TemplateParser, resolvePath } from './templateParser';
 export class KnowledgeGraphBuilder {
   private graph: KnowledgeGraph = {
     templates: new Map(),
+    namedBlocks: new Map(),
+    namedBlockErrors: [],
     analyzedAt: new Date(),
   };
 
@@ -26,7 +31,7 @@ export class KnowledgeGraphBuilder {
   }
 
   /**
-   * Resolves the base directory for templates by combining workspaceRoot, 
+   * Resolves the base directory for templates by combining workspaceRoot,
    * sourceDir, templateBaseDir, and templateRoot correctly.
    */
   private getTemplateBase(): string {
@@ -35,7 +40,6 @@ export class KnowledgeGraphBuilder {
     const templateBaseDir: string = config.get('templateBaseDir') ?? '';
     const templateRoot: string = config.get('templateRoot') ?? '';
 
-    // If templateBaseDir is not set, default to sourceDir (matching Go analyzer behavior)
     const baseDir = templateBaseDir
       ? path.resolve(this.workspaceRoot, templateBaseDir)
       : path.resolve(this.workspaceRoot, sourceDir);
@@ -49,7 +53,6 @@ export class KnowledgeGraphBuilder {
 
     for (const rc of analysisResult.renderCalls ?? []) {
       const logicalPath = rc.template.replace(/^\.\//, '');
-
       const absPath = path.join(templateBase, logicalPath);
 
       let ctx = templates.get(logicalPath);
@@ -67,20 +70,29 @@ export class KnowledgeGraphBuilder {
 
       for (const v of rc.vars ?? []) {
         const existing = ctx.vars.get(v.name);
-        // Prefer the entry with the most complete field information (deepest nesting).
-        // This ensures that if the same template is rendered from multiple call sites,
-        // we keep whichever has richer type information.
         if (!existing || isMoreComplete(v, existing)) {
           ctx.vars.set(v.name, v);
         }
       }
     }
 
-    this.graph = { templates, analyzedAt: new Date() };
+    // Build the cross-file named block registry
+    const { namedBlocks, namedBlockErrors } = this.buildNamedBlockRegistry(templates, templateBase);
+
+    this.graph = { templates, namedBlocks, namedBlockErrors, analyzedAt: new Date() };
 
     this.outputChannel.appendLine(
-      `[KnowledgeGraph] Built graph with ${templates.size} templates`
+      `[KnowledgeGraph] Built graph with ${templates.size} templates, ` +
+      `${namedBlocks.size} named block(s)`
     );
+
+    if (namedBlockErrors.length > 0) {
+      this.outputChannel.appendLine(`[KnowledgeGraph] ${namedBlockErrors.length} duplicate named block(s) found:`);
+      for (const err of namedBlockErrors) {
+        this.outputChannel.appendLine(`  ${err.message}`);
+      }
+    }
+
     for (const [tpl, ctx] of templates) {
       this.outputChannel.appendLine(
         `  ${tpl}: ${[...ctx.vars.keys()].join(', ')} (${ctx.renderCalls.length} call(s))`
@@ -90,13 +102,167 @@ export class KnowledgeGraphBuilder {
     return this.graph;
   }
 
+  /**
+   * Walk all template files on disk (from templateBase) and collect every
+   * {{ define "name" }} and {{ block "name" ... }} declaration into a
+   * cross-file registry.  Also detects duplicates.
+   */
+  private buildNamedBlockRegistry(
+    templates: Map<string, TemplateContext>,
+    templateBase: string
+  ): { namedBlocks: NamedBlockRegistry; namedBlockErrors: NamedBlockDuplicateError[] } {
+    const namedBlocks: NamedBlockRegistry = new Map();
+    const parser = new TemplateParser();
+
+    // Gather all absolute paths to scan — include both known render-call targets
+    // and any additional template files discovered on disk.
+    const toScan = new Set<string>();
+
+    for (const ctx of templates.values()) {
+      if (ctx.absolutePath) toScan.add(ctx.absolutePath);
+    }
+
+    // Also walk the template base directory for any files not in the render graph
+    // (e.g. pure partial files that are only {{ define }}'d).
+    this.walkTemplateDir(templateBase, toScan);
+
+    for (const absPath of toScan) {
+      if (!fs.existsSync(absPath)) continue;
+
+      let content: string;
+      try {
+        // Prefer the in-editor version if open.
+        const openDoc = vscode.workspace.textDocuments.find(d => d.uri.fsPath === absPath);
+        content = openDoc ? openDoc.getText() : fs.readFileSync(absPath, 'utf8');
+      } catch {
+        continue;
+      }
+
+      const logicalPath = path.relative(templateBase, absPath).replace(/\\/g, '/');
+      const nodes = parser.parse(content);
+      this.collectNamedBlocksFromNodes(nodes, absPath, logicalPath, namedBlocks);
+    }
+
+    // Detect duplicates
+    const namedBlockErrors: NamedBlockDuplicateError[] = [];
+    for (const [name, entries] of namedBlocks) {
+      if (entries.length > 1) {
+        const locations = entries
+          .map(e => `${e.templatePath}:${e.line}`)
+          .join(', ');
+        namedBlockErrors.push({
+          name,
+          entries,
+          message: `Duplicate named block "${name}" found in: ${locations}`,
+        });
+        this.outputChannel.appendLine(
+          `[KnowledgeGraph] ERROR: Duplicate named block "${name}" declared in: ${locations}`
+        );
+      }
+    }
+
+    return { namedBlocks, namedBlockErrors };
+  }
+
+  /**
+   * Recursively walk a directory and add all template files (.html, .tmpl,
+   * .gohtml, .tpl, .htm) to the toScan set.
+   */
+  private walkTemplateDir(dir: string, toScan: Set<string>) {
+    if (!fs.existsSync(dir)) return;
+    try {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          this.walkTemplateDir(full, toScan);
+        } else if (isTemplateFile(entry.name)) {
+          toScan.add(full);
+        }
+      }
+    } catch {
+      // permission errors etc — skip silently
+    }
+  }
+
+  /**
+   * Walk an AST and register every `define` and `block` node.
+   * We descend into children so nested defines are found too (though unusual).
+   */
+  private collectNamedBlocksFromNodes(
+    nodes: TemplateNode[],
+    absPath: string,
+    logicalPath: string,
+    registry: NamedBlockRegistry
+  ) {
+    for (const node of nodes) {
+      if ((node.kind === 'define' || node.kind === 'block') && node.blockName) {
+        const entry: NamedBlockEntry = {
+          name: node.blockName,
+          absolutePath: absPath,
+          templatePath: logicalPath,
+          line: node.line,
+          col: node.col,
+          node,
+        };
+
+        const existing = registry.get(node.blockName) ?? [];
+        existing.push(entry);
+        registry.set(node.blockName, existing);
+      }
+
+      // Recurse into children (handles nested blocks / defines inside range etc.)
+      if (node.children) {
+        this.collectNamedBlocksFromNodes(node.children, absPath, logicalPath, registry);
+      }
+    }
+  }
+
   getGraph(): KnowledgeGraph {
     return this.graph;
   }
 
   /**
+   * Look up a named block by name from the cross-file registry.
+   * Returns the single entry, or undefined if not found.
+   * If duplicates exist, returns the first entry (the caller will also see the
+   * duplicate error surfaced separately).
+   */
+  lookupNamedBlock(name: string): NamedBlockEntry | undefined {
+    const entries = this.graph.namedBlocks.get(name);
+    if (!entries || entries.length === 0) return undefined;
+    return entries[0];
+  }
+
+  /**
+   * Get any duplicate-block errors for a specific block name.
+   */
+  getDuplicateErrorsForBlock(name: string): NamedBlockDuplicateError[] {
+    return this.graph.namedBlockErrors.filter(e => e.name === name);
+  }
+
+  /**
+   * Get all duplicate block errors, for surfacing as diagnostics.
+   */
+  getAllDuplicateErrors(): NamedBlockDuplicateError[] {
+    return this.graph.namedBlockErrors;
+  }
+
+  /**
+   * Rebuild only the named block registry (fast path: called when a template
+   * file changes without needing a full Go re-analysis).
+   */
+  rebuildNamedBlocks() {
+    const templateBase = this.getTemplateBase();
+    const { namedBlocks, namedBlockErrors } = this.buildNamedBlockRegistry(
+      this.graph.templates,
+      templateBase
+    );
+    this.graph = { ...this.graph, namedBlocks, namedBlockErrors };
+  }
+
+  /**
    * Find the TemplateContext for a given absolute file path.
-   * Handles templateRoot stripping and fuzzy suffix matching.
    */
   findContextForFile(absolutePath: string): TemplateContext | undefined {
     const templateBase = this.getTemplateBase();
@@ -123,7 +289,7 @@ export class KnowledgeGraphBuilder {
   }
 
   /**
-   * Find a partial template context by name, searching the graph and filesystem.
+   * Find a partial template context by name.
    */
   findPartialContext(partialName: string, currentFile: string): TemplateContext | undefined {
     for (const [tplPath, ctx] of this.graph.templates) {
@@ -159,8 +325,6 @@ export class KnowledgeGraphBuilder {
 
   /**
    * Find the context for a file when it's being used as a partial.
-   * Walks the graph to find which parent templates include this partial
-   * and what context they pass to it, then resolves the correct vars.
    */
   findContextForFileAsPartial(absolutePath: string): TemplateContext | undefined {
     const templateBase = this.getTemplateBase();
@@ -173,6 +337,15 @@ export class KnowledgeGraphBuilder {
 
     const parser = new TemplateParser();
 
+    const definedBlocksInFile = new Set<string>();
+    for (const [blockName, entries] of this.graph.namedBlocks) {
+      for (const entry of entries) {
+        if (entry.absolutePath === absolutePath) {
+          definedBlocksInFile.add(blockName);
+        }
+      }
+    }
+
     for (const [parentTplPath, parentCtx] of this.graph.templates) {
       if (!parentCtx.absolutePath || !fs.existsSync(parentCtx.absolutePath)) {
         continue;
@@ -182,7 +355,7 @@ export class KnowledgeGraphBuilder {
         const content = fs.readFileSync(parentCtx.absolutePath, 'utf8');
         const nodes = parser.parse(content);
 
-        const partialCall = this.findPartialCall(nodes, partialRelPath, partialBasename);
+        const partialCall = this.findPartialCall(nodes, partialRelPath, partialBasename, definedBlocksInFile);
         if (partialCall) {
           this.outputChannel.appendLine(
             `[KnowledgeGraph] Found partial call in ${parentTplPath}: template "${partialCall.partialName}" ${partialCall.partialContext}`
@@ -224,7 +397,8 @@ export class KnowledgeGraphBuilder {
   private findPartialCall(
     nodes: TemplateNode[],
     partialRelPath: string,
-    partialBasename: string
+    partialBasename: string,
+    definedBlocksInFile?: Set<string>
   ): TemplateNode | undefined {
     for (const node of nodes) {
       if (node.kind === 'partial' && node.partialName) {
@@ -233,27 +407,21 @@ export class KnowledgeGraphBuilder {
           name === partialRelPath ||
           name === partialBasename ||
           partialRelPath.endsWith('/' + name) ||
-          partialRelPath.endsWith(name)
+          partialRelPath.endsWith(name) ||
+          (definedBlocksInFile && definedBlocksInFile.has(name))
         ) {
           return node;
         }
       }
 
       if (node.children) {
-        const found = this.findPartialCall(node.children, partialRelPath, partialBasename);
+        const found = this.findPartialCall(node.children, partialRelPath, partialBasename, definedBlocksInFile);
         if (found) return found;
       }
     }
     return undefined;
   }
 
-  /**
-   * Given the context arg passed to a partial (e.g. ".", ".User", ".User.Profile.Address"),
-   * build the vars map that the partial will see as its root scope.
-   *
-   * Supports unlimited nesting depth. For ".User.Profile.Address", the partial
-   * will see Address's fields (Street, City, Zip) as its top-level variables.
-   */
   private resolvePartialVars(
     contextArg: string,
     vars: Map<string, TemplateVar>
@@ -264,8 +432,6 @@ export class KnowledgeGraphBuilder {
 
     const parser = new TemplateParser();
     const parsedPath = parser.parseDotPath(contextArg);
-
-    // resolvePath with empty scopeStack → resolves against top-level vars
     const result = resolvePath(parsedPath, vars, []);
 
     if (!result.found || !result.fields) {
@@ -279,12 +445,6 @@ export class KnowledgeGraphBuilder {
     return partialVars;
   }
 
-  /**
-   * Find the source variable that was passed to a partial.
-   * For {{ template "partial" .User }}, returns the "User" TemplateVar.
-   * For {{ template "partial" .User.Profile }}, returns a synthetic TemplateVar
-   * for Profile with its fields.
-   */
   private findPartialSourceVar(
     contextArg: string,
     vars: Map<string, TemplateVar>
@@ -299,17 +459,14 @@ export class KnowledgeGraphBuilder {
       return undefined;
     }
 
-    // Resolve the full path to get type info for the passed context
     const result = resolvePath(parsedPath, vars, []);
     if (!result.found) return undefined;
 
-    // Return a synthetic TemplateVar representing the resolved context
     const topVar = vars.get(parsedPath[0]);
     if (parsedPath.length === 1 && topVar) {
       return topVar;
     }
 
-    // Navigate to nested field and return as synthetic var
     return {
       name: parsedPath[parsedPath.length - 1],
       type: result.typeStr,
@@ -318,20 +475,13 @@ export class KnowledgeGraphBuilder {
     };
   }
 
-  /**
-   * Resolve a Go source file path (relative to sourceDir) to an absolute path.
-   */
   resolveGoFilePath(relativeFile: string): string | null {
     const config = vscode.workspace.getConfiguration('rex-analyzer');
     const sourceDir: string = config.get('sourceDir') ?? '.';
-
     const abs = path.join(this.workspaceRoot, sourceDir, relativeFile);
     return fs.existsSync(abs) ? abs : null;
   }
 
-  /**
-   * Resolve a template path to an absolute file path.
-   */
   resolveTemplatePath(templatePath: string): string | null {
     const ctx = this.graph.templates.get(templatePath);
     if (ctx?.absolutePath && fs.existsSync(ctx.absolutePath)) {
@@ -379,14 +529,13 @@ export class KnowledgeGraphBuilder {
   }
 }
 
-/**
- * Convert a FieldInfo to a TemplateVar, preserving all nested fields recursively.
- */
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
 function fieldInfoToTemplateVar(f: FieldInfo): TemplateVar {
   return {
     name: f.name,
     type: f.type,
-    fields: f.fields, // preserve full nested field tree
+    fields: f.fields,
     isSlice: f.isSlice,
     defFile: f.defFile,
     defLine: f.defLine,
@@ -395,19 +544,12 @@ function fieldInfoToTemplateVar(f: FieldInfo): TemplateVar {
   };
 }
 
-/**
- * Returns true if `a` has more complete field information than `b`.
- * Used to prefer richer type data when merging vars from multiple render calls.
- */
 function isMoreComplete(a: TemplateVar, b: TemplateVar): boolean {
   const depthA = maxFieldDepth(a.fields ?? []);
   const depthB = maxFieldDepth(b.fields ?? []);
   return depthA > depthB;
 }
 
-/**
- * Compute the maximum nesting depth of a FieldInfo array.
- */
 function maxFieldDepth(fields: FieldInfo[]): number {
   if (fields.length === 0) return 0;
   let max = 0;
@@ -416,4 +558,10 @@ function maxFieldDepth(fields: FieldInfo[]): number {
     if (d > max) max = d;
   }
   return max;
+}
+
+function isTemplateFile(name: string): boolean {
+  return ['.html', '.tmpl', '.gohtml', '.tpl', '.htm'].some(ext =>
+    name.toLowerCase().endsWith(ext)
+  );
 }
