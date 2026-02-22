@@ -151,7 +151,7 @@ func AnalyzeDir(dir string, contextFile string, config AnalysisConfig) AnalysisR
 	structIndex := buildStructIndex(fset, filesMap)
 
 	// 2. Collect scopes concurrently, distributing individual functions not files
-	scopes := collectFuncScopes(allFiles, info, fset, structIndex, fc, config)
+	scopes := collectFuncScopes(allFiles, info, fset, structIndex, fc, config, filesMap)
 
 	// ── Identify global implicit vars (scopes with Sets but NO Renders) ──────
 	var globalImplicitVars []TemplateVar
@@ -289,6 +289,7 @@ func collectFuncScopes(
 	structIndex map[structKeyHandle]structIndexEntry,
 	fc *fieldCache,
 	config AnalysisConfig,
+	filesMap map[string]*ast.File,
 ) []FuncScope {
 	// ── Phase 1: collect all function nodes sequentially (AST walk is fast) ──
 	// Reserve a reasonable capacity to avoid repeated growth.
@@ -335,7 +336,7 @@ func collectFuncScopes(
 			localScopes := make([]FuncScope, 0, len(chunk)/2)
 
 			for _, unit := range chunk {
-				scope := processFunc(unit.node, info, fset, structIndex, fc, config)
+				scope := processFunc(unit.node, info, fset, structIndex, fc, config, filesMap)
 				if len(scope.RenderNodes) > 0 || len(scope.SetVars) > 0 || len(scope.FuncMaps) > 0 {
 					localScopes = append(localScopes, scope)
 				}
@@ -366,6 +367,7 @@ func processFunc(
 	structIndex map[structKeyHandle]structIndexEntry,
 	fc *fieldCache,
 	config AnalysisConfig,
+	filesMap map[string]*ast.File,
 ) FuncScope {
 	var scope FuncScope
 
@@ -392,16 +394,14 @@ func processFunc(
 									fInfo := FuncMapInfo{Name: name}
 									if i < len(assign.Rhs) {
 										rhs := assign.Rhs[i]
+										fInfo.DefFile, fInfo.DefLine, fInfo.DefCol = resolveFuncDefLocation(rhs, info, fset)
 										if rtv, ok := info.Types[rhs]; ok && rtv.Type != nil {
-											if sig, ok := rtv.Type.Underlying().(*types.Signature); ok {
-												fInfo.Args = make([]string, sig.Params().Len())
-												for p := 0; p < sig.Params().Len(); p++ {
-													fInfo.Args[p] = normalizeTypeStr(sig.Params().At(p).Type().String())
-												}
-												fInfo.Returns = make([]string, sig.Results().Len())
-												for r := 0; r < sig.Results().Len(); r++ {
-													fInfo.Returns[r] = normalizeTypeStr(sig.Results().At(r).Type().String())
-												}
+											underlying := rtv.Type
+											if ptr, ok2 := underlying.(*types.Pointer); ok2 {
+												underlying = ptr.Elem()
+											}
+											if sig, ok2 := underlying.(*types.Signature); ok2 {
+												fInfo.Params, fInfo.Returns, fInfo.Args = extractSignatureInfo(sig)
 											}
 										}
 									}
@@ -423,11 +423,10 @@ func processFunc(
 				}
 				if comp, ok := rhs.(*ast.CompositeLit); ok {
 					funcMapAssignments[ident.Name] = comp
-					// Check if LHS type is FuncMap
 					if info != nil {
 						if tv, ok := info.Types[ident]; ok && tv.Type != nil {
 							if strings.HasSuffix(tv.Type.String(), "template.FuncMap") {
-								scope.FuncMaps = append(scope.FuncMaps, extractFuncMaps(comp, info)...)
+								scope.FuncMaps = append(scope.FuncMaps, extractFuncMaps(comp, info, fset, filesMap)...)
 							}
 						}
 					}
@@ -451,11 +450,10 @@ func processFunc(
 					}
 					if comp, ok := rhs.(*ast.CompositeLit); ok {
 						funcMapAssignments[name.Name] = comp
-						// Check if LHS type is FuncMap
 						if info != nil {
 							if tv, ok := info.Defs[name]; ok && tv.Type() != nil {
 								if strings.HasSuffix(tv.Type().String(), "template.FuncMap") {
-									scope.FuncMaps = append(scope.FuncMaps, extractFuncMaps(comp, info)...)
+									scope.FuncMaps = append(scope.FuncMaps, extractFuncMaps(comp, info, fset, filesMap)...)
 								}
 							}
 						}
@@ -479,7 +477,7 @@ func processFunc(
 			if info != nil {
 				if tv, ok := info.Types[comp]; ok && tv.Type != nil {
 					if strings.HasSuffix(tv.Type.String(), "template.FuncMap") {
-						scope.FuncMaps = append(scope.FuncMaps, extractFuncMaps(comp, info)...)
+						scope.FuncMaps = append(scope.FuncMaps, extractFuncMaps(comp, info, fset, filesMap)...)
 					}
 				}
 			}
@@ -550,8 +548,97 @@ func processFunc(
 	return scope
 }
 
-func extractFuncMaps(comp *ast.CompositeLit, info *types.Info) []FuncMapInfo {
+// extractSignatureInfo extracts parameter names, types, and return types from
+// a *types.Signature. Names are preserved when present; unnamed params get an
+// empty Name field. The legacy Args []string slice is also populated for
+// backward compatibility.
+func extractSignatureInfo(sig *types.Signature) (params, returns []ParamInfo, args []string) {
+	params = make([]ParamInfo, sig.Params().Len())
+	args = make([]string, sig.Params().Len())
+	for i := range sig.Params().Len() {
+		p := sig.Params().At(i)
+		ts := normalizeTypeStr(p.Type().String())
+		params[i] = ParamInfo{Name: p.Name(), TypeStr: ts}
+		args[i] = ts
+	}
+	returns = make([]ParamInfo, sig.Results().Len())
+	for i := range sig.Results().Len() {
+		r := sig.Results().At(i)
+		ts := normalizeTypeStr(r.Type().String())
+		returns[i] = ParamInfo{Name: r.Name(), TypeStr: ts}
+	}
+	return
+}
 
+// resolveFuncDefLocation returns the best available definition position for a
+// function value expression. For named references (ident or selector) it
+// resolves through TypesInfo to the actual declaration site; for literals it
+// falls back to the expression's own position.
+func resolveFuncDefLocation(expr ast.Expr, info *types.Info, fset *token.FileSet) (file string, line, col int) {
+	if fset == nil {
+		return
+	}
+	switch e := expr.(type) {
+	case *ast.Ident:
+		if info != nil {
+			if obj := info.ObjectOf(e); obj != nil && obj.Pos().IsValid() {
+				pos := fset.Position(obj.Pos())
+				return pos.Filename, pos.Line, pos.Column
+			}
+		}
+	case *ast.SelectorExpr:
+		if info != nil {
+			if obj := info.ObjectOf(e.Sel); obj != nil && obj.Pos().IsValid() {
+				pos := fset.Position(obj.Pos())
+				return pos.Filename, pos.Line, pos.Column
+			}
+		}
+	}
+	pos := fset.Position(expr.Pos())
+	return pos.Filename, pos.Line, pos.Column
+}
+
+// resolveFuncDoc attempts to extract the doc comment for a function value
+// expression. For named references (bare ident or pkg.Func selector) it finds
+// the *ast.FuncDecl in the parsed file set and returns its doc text. Anonymous
+// function literals carry no doc comment, so the empty string is returned.
+func resolveFuncDoc(expr ast.Expr, info *types.Info, filesMap map[string]*ast.File) string {
+	if info == nil {
+		return ""
+	}
+
+	var obj types.Object
+	switch e := expr.(type) {
+	case *ast.Ident:
+		obj = info.ObjectOf(e)
+	case *ast.SelectorExpr:
+		obj = info.ObjectOf(e.Sel)
+	default:
+		return ""
+	}
+
+	if obj == nil || !obj.Pos().IsValid() {
+		return ""
+	}
+
+	for _, file := range filesMap {
+		for _, decl := range file.Decls {
+			fd, ok := decl.(*ast.FuncDecl)
+			if !ok {
+				continue
+			}
+			if fd.Name.Obj != nil && fd.Name.Obj.Pos() == obj.Pos() {
+				if fd.Doc != nil {
+					return strings.TrimSpace(fd.Doc.Text())
+				}
+				return ""
+			}
+		}
+	}
+	return ""
+}
+
+func extractFuncMaps(comp *ast.CompositeLit, info *types.Info, fset *token.FileSet, filesMap map[string]*ast.File) []FuncMapInfo {
 	var result []FuncMapInfo
 	for _, elt := range comp.Elts {
 		kv, ok := elt.(*ast.KeyValueExpr)
@@ -566,18 +653,17 @@ func extractFuncMaps(comp *ast.CompositeLit, info *types.Info) []FuncMapInfo {
 		name := strings.Trim(key.Value, "\"")
 		fInfo := FuncMapInfo{Name: name}
 
+		fInfo.DefFile, fInfo.DefLine, fInfo.DefCol = resolveFuncDefLocation(kv.Value, info, fset)
+		fInfo.Doc = resolveFuncDoc(kv.Value, info, filesMap)
+
 		if info != nil {
-			if tv, ok := info.Types[kv.Value]; ok {
-				sig, ok := tv.Type.(*types.Signature)
-				if ok {
-					fInfo.Args = make([]string, sig.Params().Len())
-					for i := 0; i < sig.Params().Len(); i++ {
-						fInfo.Args[i] = normalizeTypeStr(sig.Params().At(i).Type().String())
-					}
-					fInfo.Returns = make([]string, sig.Results().Len())
-					for i := 0; i < sig.Results().Len(); i++ {
-						fInfo.Returns[i] = normalizeTypeStr(sig.Results().At(i).Type().String())
-					}
+			if tv, ok := info.Types[kv.Value]; ok && tv.Type != nil {
+				underlying := tv.Type
+				if ptr, ok2 := underlying.(*types.Pointer); ok2 {
+					underlying = ptr.Elem()
+				}
+				if sig, ok2 := underlying.(*types.Signature); ok2 {
+					fInfo.Params, fInfo.Returns, fInfo.Args = extractSignatureInfo(sig)
 				}
 			}
 		}

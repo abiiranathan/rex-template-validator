@@ -1211,43 +1211,36 @@ export class TemplateValidator {
             const subPathStr = this.extractPathAtCursor(node.rawText, cursorOffset);
 
             if (subPathStr) {
-                // Check if the subpath is a function name
                 const funcMaps = this.graphBuilder.getGraph().funcMaps;
                 if (funcMaps && funcMaps.has(subPathStr)) {
                     const fn = funcMaps.get(subPathStr)!;
                     const md = new vscode.MarkdownString();
                     md.isTrusted = true;
 
-                    // Determine whether the analyzer provided parameter names.
-                    // Args with names look like "userId int"; bare type-only args look like "int".
-                    const argsMissingNames = (fn.args ?? []).some(
-                        arg => arg.trim().length > 0 && !arg.includes(' ')
-                    );
+                    const params = fn.params ?? [];
+                    const returns = fn.returns ?? [];
 
-                    const argList = (fn.args ?? []).map((argType, i) => {
-                        if (argType.includes(' ')) return argType; // already has a name
-                        // Synthesize a short placeholder so the signature is still readable.
-                        return `${String.fromCharCode(97 + i)} ${argType}`; // a int, b string, ...
-                    }).join(', ');
+                    const paramsStr = params
+                        .map((p, i) => p.name ? `${p.name} ${p.type}` : `${String.fromCharCode(97 + i)} ${p.type}`)
+                        .join(', ');
 
-                    const returnsList = fn.returns ?? [];
-                    const returns = returnsList.length > 1
-                        ? `(${returnsList.join(', ')})`
-                        : returnsList[0] ?? '';
+                    const returnsStr = returns.length === 0
+                        ? ''
+                        : returns.length === 1
+                            ? (returns[0].name ? `${returns[0].name} ${returns[0].type}` : returns[0].type)
+                            : `(${returns.map(r => r.name ? `${r.name} ${r.type}` : r.type).join(', ')})`;
 
                     md.appendCodeblock(
-                        `func ${fn.name}(${argList})${returns ? ' ' + returns : ''}`,
+                        `func ${fn.name}(${paramsStr})${returnsStr ? ' ' + returnsStr : ''}`,
                         'go'
                     );
 
-                    // Show doc when present, but also when arg names are missing — in that case
-                    // the doc string is the only place a human-readable description can come from.
-                    if (fn.doc && fn.doc.trim()) {
+                    const hasUnnamedParams = params.some(p => !p.name);
+
+                    if (fn.doc?.trim()) {
                         md.appendMarkdown('\n\n---\n\n');
                         md.appendMarkdown(fn.doc.trim());
-                    } else if (argsMissingNames) {
-                        // No doc and no param names — at minimum note that param names are unavailable
-                        // so the user isn't left wondering why args show as single letters.
+                    } else if (hasUnnamedParams) {
                         md.appendMarkdown('\n\n---\n\n*Parameter names unavailable (anonymous function)*');
                     }
 
@@ -1781,11 +1774,19 @@ export class TemplateValidator {
         for (const [name, fn] of funcMaps) {
             if (partialName && !name.startsWith(partialName)) continue;
             const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Function);
-            const args = fn.args ? fn.args.join(', ') : '';
-            const returnsList = fn.returns || [];
-            let returns = returnsList.join(', ');
-            if (returnsList.length > 1) returns = `(${returns})`;
-            item.detail = `func(${args}) ${returns}`;
+
+            const paramsStr = (fn.params ?? [])
+                .map(p => p.name ? `${p.name} ${p.type}` : p.type)
+                .join(', ');
+
+            const returns = fn.returns ?? [];
+            const returnsStr = returns.length === 0
+                ? ''
+                : returns.length === 1
+                    ? (returns[0].name ? `${returns[0].name} ${returns[0].type}` : returns[0].type)
+                    : `(${returns.map(r => r.name ? `${r.name} ${r.type}` : r.type).join(', ')})`;
+
+            item.detail = `func(${paramsStr})${returnsStr ? ` ${returnsStr}` : ''}`;
             if (fn.doc) item.documentation = new vscode.MarkdownString(fn.doc);
             if (replacementRange) item.range = replacementRange;
             completionItems.push(item);

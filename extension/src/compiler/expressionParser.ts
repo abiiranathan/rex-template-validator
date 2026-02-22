@@ -695,15 +695,12 @@ export class TypeInferencer {
         if (this.funcMaps?.has(func)) {
             const fn = this.funcMaps.get(func)!;
             if (fn.returns && fn.returns.length > 0) {
-                // Use the first return type
-                let retType = fn.returns[0];
+                let retType = fn.returns[0].type;
 
-                // Clean up basic types (e.g. from pointer or wrapper if applicable)
                 if (retType.startsWith('*')) {
                     retType = retType.substring(1);
                 }
 
-                // Attempt to hydrate fields for the return type from the known type registry.
                 const resolvedFields = this.fieldResolver?.(retType);
                 return { typeStr: retType, fields: resolvedFields };
             }

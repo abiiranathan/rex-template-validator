@@ -53,11 +53,22 @@ export interface GoValidationError {
   templateNameEndCol?: number;
 }
 
+
+export interface ParamInfo {
+  name?: string;   // empty when the parameter is unnamed
+  type: string;
+}
+
 export interface FuncMapInfo {
   name: string;
-  args: string[];
-  returns: string[];
+  params?: ParamInfo[];   // parameter names + types
+  returns?: ParamInfo[];  // return value names + types
+  // args?: string[];        // legacy: param types only, kept for backward compat
   doc?: string;
+  // Definition location in Go source (for go-to-definition)
+  defFile?: string;
+  defLine?: number;
+  defCol?: number;
 }
 
 export interface AnalysisResult {

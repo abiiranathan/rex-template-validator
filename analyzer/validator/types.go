@@ -69,10 +69,21 @@ type AnalysisResult struct {
 
 // FuncMapInfo represents a template.FuncMap call found in Go source
 type FuncMapInfo struct {
-	Name    string   `json:"name"`
-	Args    []string `json:"args"`
-	Returns []string `json:"returns"`
-	Doc     string   `json:"doc,omitempty"`
+	Name    string      `json:"name"`
+	Params  []ParamInfo `json:"params,omitempty"`
+	Args    []string    `json:"args"`
+	Returns []ParamInfo `json:"returns"`
+	Doc     string      `json:"doc,omitempty"`
+	DefFile string      `json:"defFile,omitempty"`
+	DefLine int         `json:"defLine,omitempty"`
+	DefCol  int         `json:"defCol,omitempty"`
+}
+
+// ParamInfo represents a single function parameter or return value with its
+// name (which may be empty for unnamed params) and resolved type string.
+type ParamInfo struct {
+	Name    string `json:"name,omitempty"`
+	TypeStr string `json:"type"`
 }
 
 // ScopeType represents the type of a scope (root or element type in a range)
