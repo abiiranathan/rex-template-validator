@@ -1281,10 +1281,7 @@ export class TemplateValidator {
 
     if (start >= end) return null;
 
-    const candidate = text.substring(start, end);
-    if (!candidate.includes('.') && !candidate.includes('$')) return null;
-
-    return candidate;
+    return text.substring(start, end);
   }
 
   private buildHoverForPath(
@@ -1295,13 +1292,13 @@ export class TemplateValidator {
     locals?: Map<string, TemplateVar>,
     rawText?: string
   ): vscode.Hover {
-    const varName = rawText && path.length === 1 && (path[0] === 'expression' || path[0] === 'unknown')
+    const varName = rawText && path.length <= 1 && (path[0] === 'expression' || path[0] === 'unknown' || path.length === 0)
       ? rawText
-      : path[0] === '.'
+      : path.length > 0 && path[0] === '.'
         ? '.'
-        : path[0] === '$'
+        : path.length > 0 && path[0] === '$'
           ? '$.' + path.slice(1).join('.')
-          : path[0].startsWith('$')
+          : path.length > 0 && path[0].startsWith('$')
             ? path.join('.')
             : '.' + path.join('.');
 
