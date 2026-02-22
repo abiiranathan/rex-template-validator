@@ -3,6 +3,7 @@ package handlers
 
 import (
 	"fmt"
+	"html/template"
 
 	"github.com/abiiranathan/rex"
 )
@@ -89,6 +90,14 @@ func (h *Handler) RenderTreatmentChart(inpatient bool) rex.HandlerFunc {
 			title = "OPD Progressive Treatment Chart"
 			label = "OPD"
 		}
+
+		// Func Map
+		add := func(a, b int) int { return a + b }
+		funcMap := template.FuncMap{
+			"add": add,
+		}
+
+		template.New("").Funcs(funcMap)
 
 		// Analyzer also detects calls to c.Set and updated the index.
 		c.Set("currentUser", newuser)

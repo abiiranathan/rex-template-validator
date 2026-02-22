@@ -22,6 +22,7 @@ import {
   TemplateNode,
   TemplateVar,
   ValidationError,
+  FuncMapInfo,
 } from './types';
 import { TemplateParser, resolvePath, ResolveResult } from './templateParser';
 import { KnowledgeGraphBuilder } from './knowledgeGraph';
@@ -367,7 +368,7 @@ export class TemplateValidator {
     // 1. Try expression inference
     try {
       if (node.assignExpr) {
-        const exprType = inferExpressionType(node.assignExpr, vars, scopeStack, blockLocals);
+        const exprType = inferExpressionType(node.assignExpr, vars, scopeStack, blockLocals, this.graphBuilder.getGraph().funcMaps);
         if (exprType) resolvedType = exprType;
       }
     } catch { }
@@ -425,7 +426,7 @@ export class TemplateValidator {
         // 1. Try expression evaluation first
         try {
           if (node.assignExpr) {
-            const exprType = inferExpressionType(node.assignExpr, vars, scopeStack, blockLocals);
+            const exprType = inferExpressionType(node.assignExpr, vars, scopeStack, blockLocals, this.graphBuilder.getGraph().funcMaps);
             if (exprType) {
               resolvedType = exprType;
               this.outputChannel.appendLine(`  Assignment expression inferred: ${JSON.stringify(exprType)}`);
@@ -480,7 +481,7 @@ export class TemplateValidator {
         try {
           if (cleanExpr) {
             this.outputChannel.appendLine(`  Attempting inferExpressionType for: "${cleanExpr}"`);
-            exprType = inferExpressionType(cleanExpr, vars, scopeStack, blockLocals);
+            exprType = inferExpressionType(cleanExpr, vars, scopeStack, blockLocals, this.graphBuilder.getGraph().funcMaps);
             this.outputChannel.appendLine(`  inferExpressionType result: ${exprType ? JSON.stringify(exprType) : 'null'}`);
           }
         } catch (e) {
@@ -1202,6 +1203,24 @@ export class TemplateValidator {
       const subPathStr = this.extractPathAtCursor(node.rawText, cursorOffset);
 
       if (subPathStr) {
+        // Check if the subpath is a function name
+        const funcMaps = this.graphBuilder.getGraph().funcMaps;
+        if (funcMaps && funcMaps.has(subPathStr)) {
+          const fn = funcMaps.get(subPathStr)!;
+          const md = new vscode.MarkdownString();
+          const args = fn.args ? fn.args.join(', ') : '';
+          const returnsList = fn.returns || [];
+          let returns = returnsList.join(', ');
+          if (returnsList.length > 1) {
+            returns = `(${returns})`;
+          }
+          md.appendCodeblock(`func ${fn.name}(${args}) ${returns}`, 'go');
+          if (fn.doc) {
+            md.appendMarkdown(`\n\n${fn.doc}`);
+          }
+          return new vscode.Hover(md);
+        }
+
         const parts = this.parser.parseDotPath(subPathStr);
         if (parts.length > 0 && !(parts.length === 1 && parts[0] === '.' && subPathStr !== '.')) {
           const subResult = resolvePath(parts, hitVars, stack, hitLocals);
@@ -1224,7 +1243,7 @@ export class TemplateValidator {
     if (!result.found && node.rawText) {
       try {
         const cleanExpr = node.rawText.replace(/^\{\{-?\s*/, '').replace(/\s*-?\}\}$/, '');
-        const exprType = inferExpressionType(cleanExpr, hitVars, stack, hitLocals);
+        const exprType = inferExpressionType(cleanExpr, hitVars, stack, hitLocals, this.graphBuilder.getGraph().funcMaps);
         if (exprType) {
           result = {
             typeStr: exprType.typeStr,
@@ -1540,9 +1559,10 @@ export class TemplateValidator {
        if (startCol > 0 && (lineText[startCol - 1] === '.' || lineText[startCol - 1] === '$')) {
          startCol--;
        }
-       const replacementRange = new vscode.Range(position.line, startCol, position.line, position.character);
-       this.addGlobalVariablesToCompletion(ctx.vars, completionItems, '', replacementRange);
-       return completionItems;
+      const replacementRange = new vscode.Range(position.line, startCol, position.line, position.character);
+      this.addGlobalVariablesToCompletion(ctx.vars, completionItems, '', replacementRange);
+      this.addFunctionsToCompletion(this.graphBuilder.getGraph().funcMaps, completionItems, '', replacementRange);
+      return completionItems;
      }
  
      const { node, stack, vars: hitVars, locals: hitLocals } = hit;
@@ -1572,14 +1592,41 @@ export class TemplateValidator {
        const currentDotContext = this.findDotFrameAtPosition(node, stack, hitVars, hitLocals);
        this.addFieldsToCompletion(currentDotContext, completionItems, partialName, replacementRange);
      } else { // No explicit prefix, suggest both global and local that match partial name
-       this.addGlobalVariablesToCompletion(hitVars, completionItems, partialName, replacementRange);
-       this.addLocalVariablesToCompletion(stack, hitLocals, completionItems, partialName, replacementRange);
-     }
- 
-     return completionItems;
-   }
+      this.addGlobalVariablesToCompletion(hitVars, completionItems, partialName, replacementRange);
+      this.addLocalVariablesToCompletion(stack, hitLocals, completionItems, partialName, replacementRange);
+      this.addFunctionsToCompletion(this.graphBuilder.getGraph().funcMaps, completionItems, partialName, replacementRange);
+    }
 
-   private addGlobalVariablesToCompletion(
+    return completionItems;
+  }
+
+  private addFunctionsToCompletion(
+    funcMaps: Map<string, FuncMapInfo> | undefined,
+    completionItems: vscode.CompletionItem[],
+    partialName: string = '',
+    replacementRange: vscode.Range
+  ) {
+    if (!funcMaps) return;
+    for (const [name, fn] of funcMaps) {
+      if (name.startsWith(partialName)) {
+        const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Function);
+        const args = fn.args ? fn.args.join(', ') : '';
+        const returnsList = fn.returns || [];
+        let returns = returnsList.join(', ');
+        if (returnsList.length > 1) {
+          returns = `(${returns})`;
+        }
+        item.detail = `func(${args}) ${returns}`;
+        if (fn.doc) {
+          item.documentation = new vscode.MarkdownString(fn.doc);
+        }
+        item.range = replacementRange;
+        completionItems.push(item);
+      }
+    }
+  }
+
+  private addGlobalVariablesToCompletion(
      vars: Map<string, TemplateVar>,
      completionItems: vscode.CompletionItem[],
      partialName: string = '',
@@ -2296,7 +2343,7 @@ export class TemplateValidator {
       if (match) {
         const partialExpr = match[1].trim();
         try {
-          const exprType = inferExpressionType(partialExpr, ctx.vars, stack, locals);
+          const exprType = inferExpressionType(partialExpr, ctx.vars, stack, locals, this.graphBuilder.getGraph().funcMaps);
           if (exprType?.fields) {
             return exprType.fields.map(f => {
               const item = new vscode.CompletionItem(

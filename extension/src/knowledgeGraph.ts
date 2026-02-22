@@ -11,6 +11,7 @@ import {
   TemplateVar,
   TemplateNode,
   FieldInfo,
+  FuncMapInfo,
 } from './types';
 import { TemplateParser, resolvePath } from './templateParser';
 
@@ -20,6 +21,7 @@ export class KnowledgeGraphBuilder {
     namedBlocks: new Map(),
     namedBlockErrors: [],
     analyzedAt: new Date(),
+    funcMaps: new Map(),
   };
 
   private workspaceRoot: string;
@@ -79,11 +81,17 @@ export class KnowledgeGraphBuilder {
     // Build the cross-file named block registry
     const { namedBlocks, namedBlockErrors } = this.buildNamedBlockRegistry(templates, templateBase);
 
-    this.graph = { templates, namedBlocks, namedBlockErrors, analyzedAt: new Date() };
+    const funcMaps = new Map<string, FuncMapInfo>();
+    for (const fm of analysisResult.funcMaps ?? []) {
+      funcMaps.set(fm.name, fm);
+    }
+
+    this.graph = { templates, namedBlocks, namedBlockErrors, analyzedAt: new Date(), funcMaps };
 
     this.outputChannel.appendLine(
       `[KnowledgeGraph] Built graph with ${templates.size} templates, ` +
-      `${namedBlocks.size} named block(s)`
+      `${namedBlocks.size} named block(s), ` +
+      `${funcMaps.size} template functions`
     );
 
     if (namedBlockErrors.length > 0) {

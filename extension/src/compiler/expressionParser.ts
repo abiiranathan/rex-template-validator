@@ -14,7 +14,7 @@
  * - Pipeline operations: value | func
  */
 
-import { FieldInfo, TemplateVar, ScopeFrame } from '../types';
+import { FieldInfo, TemplateVar, ScopeFrame, FuncMapInfo } from '../types';
 
 // ── Token types ────────────────────────────────────────────────────────────
 
@@ -222,9 +222,11 @@ class Lexer {
 
 class ExpressionParser {
   private lexer: Lexer;
+  private funcMaps?: Map<string, FuncMapInfo>;
 
-  constructor(input: string) {
+  constructor(input: string, funcMaps?: Map<string, FuncMapInfo>) {
     this.lexer = new Lexer(input);
+    this.funcMaps = funcMaps;
   }
 
   parse(): ExprNode | null {
@@ -342,7 +344,7 @@ class ExpressionParser {
         'lt', 'le', 'gt', 'ge', 'add', 'sub', 'mul', 'div', 'mod'
       ];
 
-      if (functionKeywords.includes(name)) {
+      if (functionKeywords.includes(name) || (this.funcMaps && this.funcMaps.has(name))) {
         const args = this.parseArgList();
         return { kind: 'call', func: name, args };
       }
@@ -444,7 +446,7 @@ class ExpressionParser {
           'lt', 'le', 'gt', 'ge', 'add', 'sub', 'mul', 'div', 'mod'
         ];
 
-        if (functionKeywords.includes(name)) {
+        if (functionKeywords.includes(name) || (this.funcMaps && this.funcMaps.has(name))) {
           // Nested function call
           const nestedArgs = this.parseArgList();
           args.push({ kind: 'call', func: name, args: nestedArgs });
@@ -472,18 +474,25 @@ export class TypeInferencer {
   private vars: Map<string, TemplateVar>;
   private scopeStack: ScopeFrame[];
   private blockLocals?: Map<string, TemplateVar>;
+  private funcMaps?: Map<string, FuncMapInfo>;
 
-  constructor(vars: Map<string, TemplateVar>, scopeStack: ScopeFrame[], blockLocals?: Map<string, TemplateVar>) {
+  constructor(
+    vars: Map<string, TemplateVar>,
+    scopeStack: ScopeFrame[],
+    blockLocals?: Map<string, TemplateVar>,
+    funcMaps?: Map<string, FuncMapInfo>
+  ) {
     this.vars = vars;
     this.scopeStack = scopeStack;
     this.blockLocals = blockLocals;
+    this.funcMaps = funcMaps;
   }
 
   /**
    * Infer the type of a template expression.
    */
   inferType(expr: string): TypeResult | null {
-    const parser = new ExpressionParser(expr);
+    const parser = new ExpressionParser(expr, this.funcMaps);
     const ast = parser.parse();
     if (!ast) return null;
 
@@ -770,6 +779,21 @@ export class TypeInferencer {
       }
 
       default:
+        // Try looking up the function in our discovered funcMaps
+        if (this.funcMaps?.has(func)) {
+          const fn = this.funcMaps.get(func)!;
+          if (fn.returns && fn.returns.length > 0) {
+            // Use the first return type
+            let retType = fn.returns[0];
+            
+            // Clean up basic types (e.g. from pointer or wrapper if applicable)
+            if (retType.startsWith('*')) {
+              retType = retType.substring(1);
+            }
+            
+            return { typeStr: retType };
+          }
+        }
         return null;
     }
   }
@@ -900,8 +924,9 @@ export function inferExpressionType(
   expr: string,
   vars: Map<string, TemplateVar>,
   scopeStack: ScopeFrame[],
-  blockLocals?: Map<string, TemplateVar>
+  blockLocals?: Map<string, TemplateVar>,
+  funcMaps?: Map<string, FuncMapInfo>
 ): TypeResult | null {
-  const inferencer = new TypeInferencer(vars, scopeStack, blockLocals);
+  const inferencer = new TypeInferencer(vars, scopeStack, blockLocals, funcMaps);
   return inferencer.inferType(expr);
 }

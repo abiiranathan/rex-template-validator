@@ -53,8 +53,16 @@ export interface GoValidationError {
   templateNameEndCol?: number;
 }
 
+export interface FuncMapInfo {
+  name: string;
+  args: string[];
+  returns: string[];
+  doc?: string;
+}
+
 export interface AnalysisResult {
   renderCalls: RenderCall[];
+  funcMaps?: FuncMapInfo[];
   errors: string[];
   validationErrors?: GoValidationError[];
 }
@@ -113,6 +121,8 @@ export interface KnowledgeGraph {
   /** Errors found while building the registry (e.g. duplicate block names) */
   namedBlockErrors: NamedBlockDuplicateError[];
   analyzedAt: Date;
+  /** Discovered template functions */
+  funcMaps: Map<string, FuncMapInfo>;
 }
 
 /**
