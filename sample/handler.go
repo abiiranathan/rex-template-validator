@@ -69,6 +69,9 @@ type Management struct {
 // Handler holds service dependencies
 type Handler struct{}
 
+// getAuthUser returns the logged in user.
+func getAuthUser(userId int) *User { return &User{} }
+
 // RenderTreatmentChart renders the treatment chart
 func (h *Handler) RenderTreatmentChart(inpatient bool) rex.HandlerFunc {
 	return func(c *rex.Context) error {
@@ -92,9 +95,8 @@ func (h *Handler) RenderTreatmentChart(inpatient bool) rex.HandlerFunc {
 		}
 
 		// Func Map
-		add := func(a, b int) *User { return &User{} }
 		funcMap := template.FuncMap{
-			"add": add,
+			"getAuthUser": getAuthUser,
 		}
 
 		template.New("").Funcs(funcMap)

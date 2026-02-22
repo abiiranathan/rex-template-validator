@@ -55,11 +55,9 @@
 
     {{ $large := index $.billedDrugs 0 }}
     {{ $drugName := $large.Name }}
-    {{ $roleValue := index $.roles "name" }}
 
-    <h3>Drug Name: {{ $roleValue }}</h3>
-    <p>{{ $num := (add 10.5 20.8) }}</p>
-    <p>{{ $num }}</p>
+    {{ $authUser := getAuthUser 1 }}
+    {{ $authUser.Name }}
 </body>
 
 </html>
