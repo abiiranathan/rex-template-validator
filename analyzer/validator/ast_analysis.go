@@ -295,13 +295,13 @@ func collectFuncScopes(
 	funcNodes := make([]funcWorkUnit, 0, len(files)*8)
 	for _, f := range files {
 		ast.Inspect(f, func(n ast.Node) bool {
-			switch n.(type) {
+			switch node := n.(type) {
 			case *ast.FuncDecl, *ast.FuncLit:
-				funcNodes = append(funcNodes, funcWorkUnit{node: n})
+				funcNodes = append(funcNodes, funcWorkUnit{node: node})
 			case *ast.GenDecl:
 				// Process global variable declarations directly
-				if decl, ok := n.(*ast.GenDecl); ok && (decl.Tok == token.VAR || decl.Tok == token.CONST) {
-					funcNodes = append(funcNodes, funcWorkUnit{node: n})
+				if node.Tok == token.VAR || node.Tok == token.CONST {
+					funcNodes = append(funcNodes, funcWorkUnit{node: node})
 				}
 			}
 			return true
