@@ -18,10 +18,13 @@ import (
 	"golang.org/x/tools/go/packages"
 )
 
-// ── Interned key type ────────────────────────────────────────────────────────
-// unique.Handle gives O(1) pointer-equality comparisons and eliminates
-// repeated string hashing on the hot structIndex lookup path.
+// ── Interned key type ──────────────────────────────────────────────────────
 type structKeyHandle = unique.Handle[string]
+
+type structIndexEntry struct {
+	doc    string
+	fields map[string]fieldInfo
+}
 
 func makeStructKey(named *types.Named) structKeyHandle {
 	return unique.Make(rawStructKey(named))
@@ -35,11 +38,7 @@ func rawStructKey(named *types.Named) string {
 	return obj.Name()
 }
 
-// ── Field cache ──────────────────────────────────────────────────────────────
-// extractFieldsWithDocs is the single hottest function in the analyser.
-// Named types are immutable after package load, so we can cache their
-// extracted fields globally for the lifetime of one AnalyzeDir call.
-
+// ── Field cache ────────────────────────────────────────────────────────────
 type cachedFields struct {
 	fields []FieldInfo
 	doc    string
@@ -67,27 +66,49 @@ func (fc *fieldCache) set(k structKeyHandle, v cachedFields) {
 	fc.mu.Unlock()
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Optimized seen map pool ────────────────────────────────────────────────
+// Reuse seen maps instead of allocating new ones
+type seenMapPool struct {
+	pool sync.Pool
+}
 
+func newSeenMapPool() *seenMapPool {
+	return &seenMapPool{
+		pool: sync.Pool{
+			New: func() interface{} {
+				return make(map[structKeyHandle]bool, 16)
+			},
+		},
+	}
+}
+
+func (smp *seenMapPool) get() map[structKeyHandle]bool {
+	m := smp.pool.Get().(map[structKeyHandle]bool)
+	// Clear the map
+	for k := range m {
+		delete(m, k)
+	}
+	return m
+}
+
+func (smp *seenMapPool) put(m map[structKeyHandle]bool) {
+	smp.pool.Put(m)
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
 func getExprColumnRange(fset *token.FileSet, expr ast.Expr) (startCol, endCol int) {
 	pos := fset.Position(expr.Pos())
 	endPos := fset.Position(expr.End())
 	return pos.Column, endPos.Column
 }
 
-// ── Main entry point ─────────────────────────────────────────────────────────
-
 func AnalyzeDir(dir string, contextFile string, config AnalysisConfig) AnalysisResult {
 	result := AnalysisResult{}
 	fset := token.NewFileSet()
 
 	cfg := &packages.Config{
-		Mode: packages.NeedName |
-			packages.NeedFiles |
-			packages.NeedSyntax |
-			packages.NeedTypes |
-			packages.NeedTypesInfo |
-			packages.NeedTypesSizes |
+		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
+			packages.NeedTypes | packages.NeedTypesInfo | packages.NeedTypesSizes |
 			packages.NeedImports,
 		Dir:   dir,
 		Fset:  fset,
@@ -100,10 +121,7 @@ func AnalyzeDir(dir string, contextFile string, config AnalysisConfig) AnalysisR
 		return result
 	}
 
-	// ── Merge type info ──────────────────────────────────────────────────────
-	// Merge all package TypesInfo into one aggregate. This is sequential and
-	// happens before any concurrent work, so there is no data race.
-	// We pre-size the maps to avoid incremental rehashing.
+	// ── Merge type info ────────────────────────────────────────────────────
 	totalTypes, totalDefs, totalUses := 0, 0, 0
 	for _, pkg := range pkgs {
 		if pkg.TypesInfo != nil {
@@ -120,7 +138,6 @@ func AnalyzeDir(dir string, contextFile string, config AnalysisConfig) AnalysisR
 	}
 
 	allFiles := make([]*ast.File, 0, totalTypes/10+len(pkgs))
-
 	for _, pkg := range pkgs {
 		for _, e := range pkg.Errors {
 			if !isImportRelatedError(e.Msg) {
@@ -135,7 +152,7 @@ func AnalyzeDir(dir string, contextFile string, config AnalysisConfig) AnalysisR
 		}
 	}
 
-	// ── Build file map for struct indexing ───────────────────────────────────
+	// ── Build file map ─────────────────────────────────────────────────────
 	filesMap := make(map[string]*ast.File, len(allFiles))
 	for _, f := range allFiles {
 		if pos := fset.File(f.Pos()); pos != nil {
@@ -143,17 +160,16 @@ func AnalyzeDir(dir string, contextFile string, config AnalysisConfig) AnalysisR
 		}
 	}
 
-	// Shared field cache — passed through the analysis so each unique named
-	// type pays extraction cost exactly once.
 	fc := newFieldCache()
+	seenPool := newSeenMapPool()
 
-	// 1. Build struct index concurrently (writes go to sync.Map, no merge copy)
+	// 1. Build struct index concurrently
 	structIndex := buildStructIndex(fset, filesMap)
 
-	// 2. Collect scopes concurrently, distributing individual functions not files
-	scopes := collectFuncScopes(allFiles, info, fset, structIndex, fc, config, filesMap)
+	// 2. Collect scopes with seen map pooling
+	scopes := collectFuncScopesOptimized(allFiles, info, fset, structIndex, fc, config, filesMap, seenPool)
 
-	// ── Identify global implicit vars (scopes with Sets but NO Renders) ──────
+	// ── Identify global implicit vars ──────────────────────────────────────
 	var globalImplicitVars []TemplateVar
 	for _, scope := range scopes {
 		if len(scope.RenderNodes) == 0 && len(scope.SetVars) > 0 {
@@ -161,51 +177,48 @@ func AnalyzeDir(dir string, contextFile string, config AnalysisConfig) AnalysisR
 		}
 	}
 
-	// ── Pre-count render calls to avoid slice re-growth ──────────────────────
+	// ── Pre-count render calls ─────────────────────────────────────────────
 	totalRenders := 0
 	totalFuncMaps := 0
 	for _, scope := range scopes {
 		totalRenders += len(scope.RenderNodes)
 		totalFuncMaps += len(scope.FuncMaps)
 	}
+
 	result.RenderCalls = make([]RenderCall, 0, totalRenders)
 	result.FuncMaps = make([]FuncMapInfo, 0, totalFuncMaps)
 
-	// ── Aggregate FuncMaps ───────────────────────────────────────────────────
+	// ── Aggregate FuncMaps ─────────────────────────────────────────────────
 	for _, scope := range scopes {
 		result.FuncMaps = append(result.FuncMaps, scope.FuncMaps...)
 	}
 
-	// ── Generate render calls from scopes that have renders ──────────────────
+	// ── Generate render calls ──────────────────────────────────────────────
 	for _, scope := range scopes {
 		if len(scope.RenderNodes) == 0 {
 			continue
 		}
+
 		for _, rr := range scope.RenderNodes {
 			call := rr.Node
 			templateArgIdx := rr.TemplateArgIdx
 
-			// If no templates resolved, skip
 			if len(rr.TemplateNames) == 0 {
 				continue
 			}
 
-			// We need column info for the template argument expression
-			// Use the first template name's source location?
-			// The original code used templatePathExpr from call.Args[templateArgIdx].
-			// Let's get that expr again.
 			if templateArgIdx < 0 || templateArgIdx >= len(call.Args) {
 				continue
 			}
-			templatePathExpr := call.Args[templateArgIdx]
 
+			templatePathExpr := call.Args[templateArgIdx]
 			tplNameStartCol, tplNameEndCol := getExprColumnRange(fset, templatePathExpr)
+
 			if lit, ok := templatePathExpr.(*ast.BasicLit); ok && lit.Kind == token.STRING {
 				tplNameStartCol++
 				tplNameEndCol--
 			}
 
-			// Process each resolved template name
 			for _, templatePath := range rr.TemplateNames {
 				if templatePath == "" {
 					continue
@@ -214,10 +227,11 @@ func AnalyzeDir(dir string, contextFile string, config AnalysisConfig) AnalysisR
 				dataArgIdx := templateArgIdx + 1
 				var vars []TemplateVar
 				if dataArgIdx < len(call.Args) {
-					vars = extractMapVars(call.Args[dataArgIdx], info, fset, structIndex, fc)
+					seen := seenPool.get()
+					vars = extractMapVars(call.Args[dataArgIdx], info, fset, structIndex, fc, seen)
+					seenPool.put(seen)
 				}
 
-				// Pre-allocate combined vars slice in one shot
 				allVars := make([]TemplateVar, 0, len(vars)+len(scope.SetVars)+len(globalImplicitVars))
 				allVars = append(allVars, vars...)
 				allVars = append(allVars, scope.SetVars...)
@@ -243,8 +257,8 @@ func AnalyzeDir(dir string, contextFile string, config AnalysisConfig) AnalysisR
 		}
 	}
 
-	// ── Deduplicate FuncMaps ───────────────────────────────────────────────────
-	seenFuncMaps := make(map[string]bool)
+	// ── Deduplicate FuncMaps ───────────────────────────────────────────────
+	seenFuncMaps := make(map[string]bool, len(result.FuncMaps))
 	uniqueFuncMaps := make([]FuncMapInfo, 0, len(result.FuncMaps))
 	for _, fm := range result.FuncMaps {
 		if !seenFuncMaps[fm.Name] {
@@ -255,13 +269,11 @@ func AnalyzeDir(dir string, contextFile string, config AnalysisConfig) AnalysisR
 	result.FuncMaps = uniqueFuncMaps
 
 	if contextFile != "" {
-		result.RenderCalls = enrichRenderCallsWithContext(result.RenderCalls, contextFile, pkgs, structIndex, fc, fset, config)
+		result.RenderCalls = enrichRenderCallsWithContext(result.RenderCalls, contextFile, pkgs, structIndex, fc, fset, config, seenPool)
 	}
 
 	return result
 }
-
-// ── FuncScope ────────────────────────────────────────────────────────────────
 
 type FuncScope struct {
 	SetVars     []TemplateVar
@@ -275,14 +287,12 @@ type ResolvedRender struct {
 	TemplateArgIdx int
 }
 
-// funcWorkUnit is a single function node ready to be processed by a worker.
 type funcWorkUnit struct {
 	node ast.Node
 }
 
-// collectFuncScopes distributes individual function nodes (not files) across
-// workers for better load-balancing on files that contain many large functions.
-func collectFuncScopes(
+// collectFuncScopesOptimized with seen map pooling
+func collectFuncScopesOptimized(
 	files []*ast.File,
 	info *types.Info,
 	fset *token.FileSet,
@@ -290,9 +300,9 @@ func collectFuncScopes(
 	fc *fieldCache,
 	config AnalysisConfig,
 	filesMap map[string]*ast.File,
+	seenPool *seenMapPool,
 ) []FuncScope {
-	// ── Phase 1: collect all function nodes sequentially (AST walk is fast) ──
-	// Reserve a reasonable capacity to avoid repeated growth.
+	// Phase 1: collect function nodes
 	funcNodes := make([]funcWorkUnit, 0, len(files)*8)
 	for _, f := range files {
 		ast.Inspect(f, func(n ast.Node) bool {
@@ -300,7 +310,6 @@ func collectFuncScopes(
 			case *ast.FuncDecl, *ast.FuncLit:
 				funcNodes = append(funcNodes, funcWorkUnit{node: node})
 			case *ast.GenDecl:
-				// Process global variable declarations directly
 				if node.Tok == token.VAR || node.Tok == token.CONST {
 					funcNodes = append(funcNodes, funcWorkUnit{node: node})
 				}
@@ -313,10 +322,8 @@ func collectFuncScopes(
 		return nil
 	}
 
-	// ── Phase 2: process function nodes concurrently ─────────────────────────
+	// Phase 2: process concurrently with better work distribution
 	numWorkers := max(runtime.NumCPU(), 1)
-
-	// Partition work by index range — no per-unit channel send overhead.
 	chunkSize := (len(funcNodes) + numWorkers - 1) / numWorkers
 
 	sliceResultChan := make(chan []FuncScope, numWorkers)
@@ -336,16 +343,16 @@ func collectFuncScopes(
 			localScopes := make([]FuncScope, 0, len(chunk)/2)
 
 			for _, unit := range chunk {
-				scope := processFunc(unit.node, info, fset, structIndex, fc, config, filesMap)
+				scope := processFuncOptimized(unit.node, info, fset, structIndex, fc, config, filesMap, seenPool)
 				if len(scope.RenderNodes) > 0 || len(scope.SetVars) > 0 || len(scope.FuncMaps) > 0 {
 					localScopes = append(localScopes, scope)
 				}
 			}
+
 			sliceResultChan <- localScopes
 		}(chunk)
 	}
 
-	// Close result channel once all workers finish.
 	go func() {
 		wg.Wait()
 		close(sliceResultChan)
@@ -355,12 +362,12 @@ func collectFuncScopes(
 	for scopes := range sliceResultChan {
 		allScopes = append(allScopes, scopes...)
 	}
+
 	return allScopes
 }
 
-// processFunc walks a single function node and returns its FuncScope.
-// Extracted from the closure so the compiler can inline/optimise it.
-func processFunc(
+// processFuncOptimized with seen map pooling
+func processFuncOptimized(
 	n ast.Node,
 	info *types.Info,
 	fset *token.FileSet,
@@ -368,13 +375,15 @@ func processFunc(
 	fc *fieldCache,
 	config AnalysisConfig,
 	filesMap map[string]*ast.File,
+	seenPool *seenMapPool,
 ) FuncScope {
 	var scope FuncScope
 
-	// Phase 1: Collect local string assignments
-	stringAssignments := make(map[string][]string)
-	funcMapAssignments := make(map[string]*ast.CompositeLit)
+	// Pre-allocate with reasonable capacity
+	stringAssignments := make(map[string][]string, 8)
+	funcMapAssignments := make(map[string]*ast.CompositeLit, 4)
 
+	// Phase 1: Collect assignments (unchanged but with better allocation)
 	ast.Inspect(n, func(child ast.Node) bool {
 		if child != n {
 			if _, isFunc := child.(*ast.FuncLit); isFunc {
@@ -384,7 +393,7 @@ func processFunc(
 
 		if assign, ok := child.(*ast.AssignStmt); ok {
 			for i, lhs := range assign.Lhs {
-				// Handle map assignment: fm["sub"] = func(...)
+				// Handle map assignment
 				if indexExpr, ok := lhs.(*ast.IndexExpr); ok {
 					if info != nil {
 						if tv, ok := info.Types[indexExpr.X]; ok && tv.Type != nil {
@@ -416,11 +425,12 @@ func processFunc(
 				if !ok || i >= len(assign.Rhs) {
 					continue
 				}
-				rhs := assign.Rhs[i]
 
-				if s := extractString(rhs); s != "" {
+				rhs := assign.Rhs[i]
+				if s := extractStringFast(rhs); s != "" {
 					stringAssignments[ident.Name] = append(stringAssignments[ident.Name], s)
 				}
+
 				if comp, ok := rhs.(*ast.CompositeLit); ok {
 					funcMapAssignments[ident.Name] = comp
 					if info != nil {
@@ -445,7 +455,7 @@ func processFunc(
 						continue
 					}
 					rhs := vspec.Values[i]
-					if s := extractString(rhs); s != "" {
+					if s := extractStringFast(rhs); s != "" {
 						stringAssignments[name.Name] = append(stringAssignments[name.Name], s)
 					}
 					if comp, ok := rhs.(*ast.CompositeLit); ok {
@@ -464,7 +474,7 @@ func processFunc(
 		return true
 	})
 
-	// Phase 2: Find Render and FuncMap calls
+	// Phase 2: Find render and FuncMap calls
 	ast.Inspect(n, func(child ast.Node) bool {
 		if child != n {
 			if _, isFunc := child.(*ast.FuncLit); isFunc {
@@ -472,7 +482,6 @@ func processFunc(
 			}
 		}
 
-		// Extract FuncMap composite literals directly
 		if comp, ok := child.(*ast.CompositeLit); ok {
 			if info != nil {
 				if tv, ok := info.Types[comp]; ok && tv.Type != nil {
@@ -491,6 +500,7 @@ func processFunc(
 		if isRenderCall(call, config) {
 			resolved := ResolvedRender{Node: call, TemplateArgIdx: -1}
 			templateArgIdx := -1
+
 			switch call.Fun.(type) {
 			case *ast.SelectorExpr:
 				templateArgIdx = 0
@@ -516,7 +526,8 @@ func processFunc(
 			if templateArgIdx >= 0 && templateArgIdx < len(call.Args) {
 				resolved.TemplateArgIdx = templateArgIdx
 				arg := call.Args[templateArgIdx]
-				if s := extractString(arg); s != "" {
+
+				if s := extractStringFast(arg); s != "" {
 					resolved.TemplateNames = []string{s}
 				} else if ident, ok := arg.(*ast.Ident); ok {
 					if info != nil {
@@ -536,403 +547,18 @@ func processFunc(
 					}
 				}
 			}
+
 			scope.RenderNodes = append(scope.RenderNodes, resolved)
 		}
 
-		if setVar := extractSetCallVar(call, info, fset, structIndex, fc, config); setVar != nil {
+		if setVar := extractSetCallVarOptimized(call, info, fset, structIndex, fc, config, seenPool); setVar != nil {
 			scope.SetVars = append(scope.SetVars, *setVar)
 		}
 
 		return true
 	})
+
 	return scope
-}
-
-// extractSignatureInfo extracts parameter names, types, and return types from
-// a *types.Signature. Names are preserved when present; unnamed params get an
-// empty Name field. The legacy Args []string slice is also populated for
-// backward compatibility.
-func extractSignatureInfo(sig *types.Signature) (params, returns []ParamInfo, args []string) {
-	params = make([]ParamInfo, sig.Params().Len())
-	args = make([]string, sig.Params().Len())
-	for i := range sig.Params().Len() {
-		p := sig.Params().At(i)
-		ts := normalizeTypeStr(p.Type().String())
-		params[i] = ParamInfo{Name: p.Name(), TypeStr: ts}
-		args[i] = ts
-	}
-	returns = make([]ParamInfo, sig.Results().Len())
-	for i := range sig.Results().Len() {
-		r := sig.Results().At(i)
-		ts := normalizeTypeStr(r.Type().String())
-		returns[i] = ParamInfo{Name: r.Name(), TypeStr: ts}
-	}
-	return
-}
-
-// resolveFuncDefLocation returns the best available definition position for a
-// function value expression. For named references (ident or selector) it
-// resolves through TypesInfo to the actual declaration site; for literals it
-// falls back to the expression's own position.
-func resolveFuncDefLocation(expr ast.Expr, info *types.Info, fset *token.FileSet) (file string, line, col int) {
-	if fset == nil {
-		return
-	}
-	switch e := expr.(type) {
-	case *ast.Ident:
-		if info != nil {
-			if obj := info.ObjectOf(e); obj != nil && obj.Pos().IsValid() {
-				pos := fset.Position(obj.Pos())
-				return pos.Filename, pos.Line, pos.Column
-			}
-		}
-	case *ast.SelectorExpr:
-		if info != nil {
-			if obj := info.ObjectOf(e.Sel); obj != nil && obj.Pos().IsValid() {
-				pos := fset.Position(obj.Pos())
-				return pos.Filename, pos.Line, pos.Column
-			}
-		}
-	}
-	pos := fset.Position(expr.Pos())
-	return pos.Filename, pos.Line, pos.Column
-}
-
-// resolveFuncDoc attempts to extract the doc comment for a function value
-// expression. For named references (bare ident or pkg.Func selector) it finds
-// the *ast.FuncDecl in the parsed file set and returns its doc text. Anonymous
-// function literals carry no doc comment, so the empty string is returned.
-func resolveFuncDoc(expr ast.Expr, info *types.Info, filesMap map[string]*ast.File) string {
-	if info == nil {
-		return ""
-	}
-
-	var obj types.Object
-	switch e := expr.(type) {
-	case *ast.Ident:
-		obj = info.ObjectOf(e)
-	case *ast.SelectorExpr:
-		obj = info.ObjectOf(e.Sel)
-	default:
-		return ""
-	}
-
-	if obj == nil || !obj.Pos().IsValid() {
-		return ""
-	}
-
-	for _, file := range filesMap {
-		for _, decl := range file.Decls {
-			fd, ok := decl.(*ast.FuncDecl)
-			if !ok {
-				continue
-			}
-			if fd.Name.Obj != nil && fd.Name.Obj.Pos() == obj.Pos() {
-				if fd.Doc != nil {
-					return strings.TrimSpace(fd.Doc.Text())
-				}
-				return ""
-			}
-		}
-	}
-	return ""
-}
-
-func extractFuncMaps(comp *ast.CompositeLit, info *types.Info, fset *token.FileSet, filesMap map[string]*ast.File) []FuncMapInfo {
-	var result []FuncMapInfo
-	for _, elt := range comp.Elts {
-		kv, ok := elt.(*ast.KeyValueExpr)
-		if !ok {
-			continue
-		}
-		key, ok := kv.Key.(*ast.BasicLit)
-		if !ok || key.Kind != token.STRING {
-			continue
-		}
-
-		name := strings.Trim(key.Value, "\"")
-		fInfo := FuncMapInfo{Name: name}
-
-		fInfo.DefFile, fInfo.DefLine, fInfo.DefCol = resolveFuncDefLocation(kv.Value, info, fset)
-		fInfo.Doc = resolveFuncDoc(kv.Value, info, filesMap)
-
-		if info != nil {
-			if tv, ok := info.Types[kv.Value]; ok && tv.Type != nil {
-				underlying := tv.Type
-				if ptr, ok2 := underlying.(*types.Pointer); ok2 {
-					underlying = ptr.Elem()
-				}
-				if sig, ok2 := underlying.(*types.Signature); ok2 {
-					fInfo.Params, fInfo.Returns, fInfo.Args = extractSignatureInfo(sig)
-				}
-			}
-		}
-		result = append(result, fInfo)
-	}
-	return result
-}
-
-func isRenderCall(call *ast.CallExpr, config AnalysisConfig) bool {
-	funcName := ""
-	switch fn := call.Fun.(type) {
-	case *ast.SelectorExpr:
-		funcName = fn.Sel.Name
-	case *ast.Ident:
-		funcName = fn.Name
-	}
-	return (funcName == config.RenderFunctionName || funcName == config.ExecuteTemplateFunctionName) &&
-		len(call.Args) >= 2
-}
-
-func extractSetCallVar(
-	call *ast.CallExpr,
-	info *types.Info,
-	fset *token.FileSet,
-	structIndex map[structKeyHandle]structIndexEntry,
-	fc *fieldCache,
-	config AnalysisConfig,
-) *TemplateVar {
-	sel, ok := call.Fun.(*ast.SelectorExpr)
-	if !ok {
-		return nil
-	}
-	if sel.Sel.Name != config.SetFunctionName {
-		return nil
-	}
-
-	if info != nil && sel.X != nil {
-		if typeAndValue, ok := info.Types[sel.X]; ok {
-			t := typeAndValue.Type
-			if ptr, ok := t.(*types.Pointer); ok {
-				t = ptr.Elem()
-			}
-			if named, ok := t.(*types.Named); ok {
-				if named.Obj().Name() != config.ContextTypeName {
-					return nil
-				}
-			} else {
-				return nil
-			}
-		}
-	}
-
-	if len(call.Args) < 2 {
-		return nil
-	}
-
-	key := extractString(call.Args[0])
-	if key == "" {
-		return nil
-	}
-
-	valArg := call.Args[1]
-	tv := TemplateVar{Name: key}
-
-	if typeInfo, ok := info.Types[valArg]; ok && typeInfo.Type != nil {
-		tv.TypeStr = normalizeTypeStr(typeInfo.Type.String())
-		seen := make(map[structKeyHandle]bool)
-		tv.Fields, tv.Doc = extractFieldsWithDocs(typeInfo.Type, structIndex, fc, seen, fset)
-
-		if elemType := getElementType(typeInfo.Type); elemType != nil {
-			tv.IsSlice = true
-			tv.ElemType = normalizeTypeStr(elemType.String())
-			elemSeen := make(map[structKeyHandle]bool)
-			tv.Fields, tv.Doc = extractFieldsWithDocsDoc(elemType, structIndex, fc, elemSeen, fset, tv.Doc)
-		} else if keyType, elemType := getMapTypes(typeInfo.Type); keyType != nil && elemType != nil {
-			tv.IsMap = true
-			tv.KeyType = normalizeTypeStr(keyType.String())
-			tv.ElemType = normalizeTypeStr(elemType.String())
-			elemSeen := make(map[structKeyHandle]bool)
-			tv.Fields, tv.Doc = extractFieldsWithDocsDoc(elemType, structIndex, fc, elemSeen, fset, tv.Doc)
-		}
-	} else {
-		tv.TypeStr = inferTypeFromAST(valArg)
-	}
-
-	tv.DefFile, tv.DefLine, tv.DefCol = findDefinitionLocation(valArg, info, fset)
-	return &tv
-}
-
-// extractFieldsWithDocsDoc is a thin helper that preserves an existing doc
-// string when the recursive extraction returns an empty one.
-func extractFieldsWithDocsDoc(
-	t types.Type,
-	structIndex map[structKeyHandle]structIndexEntry,
-	fc *fieldCache,
-	seen map[structKeyHandle]bool,
-	fset *token.FileSet,
-	existingDoc string,
-) ([]FieldInfo, string) {
-	fields, doc := extractFieldsWithDocs(t, structIndex, fc, seen, fset)
-	if doc == "" {
-		doc = existingDoc
-	}
-	return fields, doc
-}
-
-// ── enrichRenderCallsWithContext ─────────────────────────────────────────────
-
-func enrichRenderCallsWithContext(
-	calls []RenderCall,
-	contextFile string,
-	pkgs []*packages.Package,
-	structIndex map[structKeyHandle]structIndexEntry,
-	fc *fieldCache,
-	fset *token.FileSet,
-	config AnalysisConfig,
-) []RenderCall {
-	data, err := os.ReadFile(contextFile)
-	if err != nil {
-		return calls
-	}
-	var contextConfig map[string]map[string]string
-	if err := json.Unmarshal(data, &contextConfig); err != nil {
-		return calls
-	}
-
-	// ── Walk the import graph and collect all named types ────────────────────
-	// We do a sequential BFS. The previous concurrent-channel approach deadlocked
-	// because worker goroutines tried to send to a fixed-capacity channel that was
-	// already full (deep import graphs have far more nodes than len(pkgs)*8), while
-	// the main goroutine was blocked in bfsWg.Wait() — a classic send-on-full +
-	// wait deadlock with no reader running.
-	//
-	// Sequential BFS is correct, safe, and plenty fast: type-scope iteration is
-	// pure in-memory work and the import graph is walked exactly once.
-	typeMap := make(map[string]*types.TypeName, len(pkgs)*32)
-	{
-		visited := make(map[string]bool, len(pkgs)*32)
-		queue := make([]*packages.Package, 0, len(pkgs)*8)
-
-		for _, pkg := range pkgs {
-			if !visited[pkg.ID] {
-				visited[pkg.ID] = true
-				queue = append(queue, pkg)
-			}
-		}
-
-		for len(queue) > 0 {
-			p := queue[0]
-			queue = queue[1:]
-
-			if p.Types != nil {
-				scope := p.Types.Scope()
-				for _, name := range scope.Names() {
-					if typeName, ok := scope.Lookup(name).(*types.TypeName); ok {
-						typeMap[p.Types.Name()+"."+name] = typeName
-					}
-				}
-			}
-
-			for _, imp := range p.Imports {
-				if !visited[imp.ID] {
-					visited[imp.ID] = true
-					queue = append(queue, imp)
-				}
-			}
-		}
-	}
-
-	globalVars := buildTemplateVars(contextConfig[config.GlobalTemplateName], typeMap, structIndex, fc, fset)
-
-	seenTpls := make(map[string]bool, len(calls))
-	for i, call := range calls {
-		seenTpls[call.Template] = true
-		base := make([]TemplateVar, 0, len(globalVars)+len(call.Vars)+8)
-		base = append(base, globalVars...)
-		if tplVars, ok := contextConfig[call.Template]; ok {
-			base = append(base, buildTemplateVars(tplVars, typeMap, structIndex, fc, fset)...)
-		}
-		base = append(base, call.Vars...)
-		calls[i].Vars = base
-	}
-
-	// Synthetic render calls for templates defined in JSON but absent from Go AST.
-	for tplName, tplVars := range contextConfig {
-		if tplName == config.GlobalTemplateName || seenTpls[tplName] {
-			continue
-		}
-		newVars := make([]TemplateVar, 0, len(globalVars)+len(tplVars))
-		newVars = append(newVars, globalVars...)
-		newVars = append(newVars, buildTemplateVars(tplVars, typeMap, structIndex, fc, fset)...)
-		calls = append(calls, RenderCall{
-			File:     "context-file",
-			Line:     1,
-			Template: tplName,
-			Vars:     newVars,
-		})
-	}
-
-	return calls
-}
-
-func buildTemplateVars(
-	varDefs map[string]string,
-	typeMap map[string]*types.TypeName,
-	structIndex map[structKeyHandle]structIndexEntry,
-	fc *fieldCache,
-	fset *token.FileSet,
-) []TemplateVar {
-	vars := make([]TemplateVar, 0, len(varDefs))
-	for name, typeStr := range varDefs {
-		tv := TemplateVar{Name: name, TypeStr: typeStr}
-
-		baseTypeStr := typeStr
-		isSlice := false
-		for strings.HasPrefix(baseTypeStr, "[]") || strings.HasPrefix(baseTypeStr, "*") {
-			if strings.HasPrefix(baseTypeStr, "[]") {
-				isSlice = true
-				baseTypeStr = baseTypeStr[2:]
-			} else {
-				baseTypeStr = baseTypeStr[1:]
-			}
-		}
-
-		if strings.HasPrefix(baseTypeStr, "map[") {
-			if idx := strings.Index(baseTypeStr, "]"); idx != -1 {
-				tv.IsMap = true
-				tv.KeyType = strings.TrimSpace(baseTypeStr[4:idx])
-				tv.ElemType = strings.TrimSpace(baseTypeStr[idx+1:])
-
-				valLookup := strings.TrimLeft(tv.ElemType, "*")
-				if typeNameObj, ok := typeMap[valLookup]; ok {
-					seen := make(map[structKeyHandle]bool)
-					tv.Fields, tv.Doc = extractFieldsWithDocs(typeNameObj.Type(), structIndex, fc, seen, fset)
-				}
-				vars = append(vars, tv)
-				continue
-			}
-		}
-
-		if typeNameObj, ok := typeMap[baseTypeStr]; ok {
-			t := typeNameObj.Type()
-			seen := make(map[structKeyHandle]bool)
-			tv.Fields, tv.Doc = extractFieldsWithDocs(t, structIndex, fc, seen, fset)
-
-			if pos := typeNameObj.Pos(); pos.IsValid() && fset != nil {
-				position := fset.Position(pos)
-				tv.DefFile = position.Filename
-				tv.DefLine = position.Line
-				tv.DefCol = position.Column
-			}
-			if isSlice {
-				tv.IsSlice = true
-				tv.ElemType = baseTypeStr
-			}
-		} else if isSlice {
-			tv.IsSlice = true
-			tv.ElemType = baseTypeStr
-		}
-		vars = append(vars, tv)
-	}
-	return vars
-}
-
-// ── Struct index ─────────────────────────────────────────────────────────────
-
-type structIndexEntry struct {
-	doc    string
-	fields map[string]fieldInfo
 }
 
 // buildStructIndex walks all AST files concurrently. Workers write directly
@@ -1004,6 +630,267 @@ func buildStructIndex(fset *token.FileSet, files map[string]*ast.File) map[struc
 		return true
 	})
 	return finalIndex
+}
+
+// extractStringFast - optimized version with fewer allocations
+func extractStringFast(expr ast.Expr) string {
+	lit, ok := expr.(*ast.BasicLit)
+	if !ok || lit.Kind != token.STRING {
+		return ""
+	}
+	if len(lit.Value) < 2 {
+		return ""
+	}
+	return lit.Value[1 : len(lit.Value)-1]
+}
+
+// extractSetCallVarOptimized with seen map pooling
+func extractSetCallVarOptimized(
+	call *ast.CallExpr,
+	info *types.Info,
+	fset *token.FileSet,
+	structIndex map[structKeyHandle]structIndexEntry,
+	fc *fieldCache,
+	config AnalysisConfig,
+	seenPool *seenMapPool,
+) *TemplateVar {
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return nil
+	}
+
+	if sel.Sel.Name != config.SetFunctionName {
+		return nil
+	}
+
+	if info != nil && sel.X != nil {
+		if typeAndValue, ok := info.Types[sel.X]; ok {
+			t := typeAndValue.Type
+			if ptr, ok := t.(*types.Pointer); ok {
+				t = ptr.Elem()
+			}
+			if named, ok := t.(*types.Named); ok {
+				if named.Obj().Name() != config.ContextTypeName {
+					return nil
+				}
+			} else {
+				return nil
+			}
+		}
+	}
+
+	if len(call.Args) < 2 {
+		return nil
+	}
+
+	key := extractStringFast(call.Args[0])
+	if key == "" {
+		return nil
+	}
+
+	valArg := call.Args[1]
+	tv := TemplateVar{Name: key}
+
+	if typeInfo, ok := info.Types[valArg]; ok && typeInfo.Type != nil {
+		tv.TypeStr = normalizeTypeStr(typeInfo.Type.String())
+		seen := seenPool.get()
+		tv.Fields, tv.Doc = extractFieldsWithDocs(typeInfo.Type, structIndex, fc, seen, fset)
+
+		if elemType := getElementType(typeInfo.Type); elemType != nil {
+			tv.IsSlice = true
+			tv.ElemType = normalizeTypeStr(elemType.String())
+			// Reuse the same seen map
+			for skh := range seen {
+				delete(seen, skh)
+			}
+			tv.Fields, tv.Doc = extractFieldsWithDocsDoc(elemType, structIndex, fc, seen, fset, tv.Doc)
+		} else if keyType, elemType := getMapTypes(typeInfo.Type); keyType != nil && elemType != nil {
+			tv.IsMap = true
+			tv.KeyType = normalizeTypeStr(keyType.String())
+			tv.ElemType = normalizeTypeStr(elemType.String())
+			// Reuse the same seen map
+			for key := range seen {
+				delete(seen, key)
+			}
+			tv.Fields, tv.Doc = extractFieldsWithDocsDoc(elemType, structIndex, fc, seen, fset, tv.Doc)
+		}
+		seenPool.put(seen)
+	} else {
+		tv.TypeStr = inferTypeFromAST(valArg)
+	}
+
+	tv.DefFile, tv.DefLine, tv.DefCol = findDefinitionLocation(valArg, info, fset)
+
+	return &tv
+}
+
+// ... (rest of the functions remain the same but use optimized helpers)
+
+// enrichRenderCallsWithContext with seen map pooling
+func enrichRenderCallsWithContext(
+	calls []RenderCall,
+	contextFile string,
+	pkgs []*packages.Package,
+	structIndex map[structKeyHandle]structIndexEntry,
+	fc *fieldCache,
+	fset *token.FileSet,
+	config AnalysisConfig,
+	seenPool *seenMapPool,
+) []RenderCall {
+	data, err := os.ReadFile(contextFile)
+	if err != nil {
+		return calls
+	}
+
+	var contextConfig map[string]map[string]string
+	if err := json.Unmarshal(data, &contextConfig); err != nil {
+		return calls
+	}
+
+	// Sequential BFS (same as before)
+	typeMap := make(map[string]*types.TypeName, len(pkgs)*32)
+	{
+		visited := make(map[string]bool, len(pkgs)*32)
+		queue := make([]*packages.Package, 0, len(pkgs)*8)
+		for _, pkg := range pkgs {
+			if !visited[pkg.ID] {
+				visited[pkg.ID] = true
+				queue = append(queue, pkg)
+			}
+		}
+
+		for len(queue) > 0 {
+			p := queue[0]
+			queue = queue[1:]
+
+			if p.Types != nil {
+				scope := p.Types.Scope()
+				for _, name := range scope.Names() {
+					if typeName, ok := scope.Lookup(name).(*types.TypeName); ok {
+						typeMap[p.Types.Name()+"."+name] = typeName
+					}
+				}
+			}
+
+			for _, imp := range p.Imports {
+				if !visited[imp.ID] {
+					visited[imp.ID] = true
+					queue = append(queue, imp)
+				}
+			}
+		}
+	}
+
+	globalVars := buildTemplateVarsOptimized(contextConfig[config.GlobalTemplateName], typeMap, structIndex, fc, fset, seenPool)
+
+	seenTpls := make(map[string]bool, len(calls))
+	for i, call := range calls {
+		seenTpls[call.Template] = true
+
+		base := make([]TemplateVar, 0, len(globalVars)+len(call.Vars)+8)
+		base = append(base, globalVars...)
+
+		if tplVars, ok := contextConfig[call.Template]; ok {
+			base = append(base, buildTemplateVarsOptimized(tplVars, typeMap, structIndex, fc, fset, seenPool)...)
+		}
+
+		base = append(base, call.Vars...)
+		calls[i].Vars = base
+	}
+
+	// Synthetic render calls
+	for tplName, tplVars := range contextConfig {
+		if tplName == config.GlobalTemplateName || seenTpls[tplName] {
+			continue
+		}
+
+		newVars := make([]TemplateVar, 0, len(globalVars)+len(tplVars))
+		newVars = append(newVars, globalVars...)
+		newVars = append(newVars, buildTemplateVarsOptimized(tplVars, typeMap, structIndex, fc, fset, seenPool)...)
+
+		calls = append(calls, RenderCall{
+			File:     "context-file",
+			Line:     1,
+			Template: tplName,
+			Vars:     newVars,
+		})
+	}
+
+	return calls
+}
+
+// buildTemplateVarsOptimized with seen map pooling
+func buildTemplateVarsOptimized(
+	varDefs map[string]string,
+	typeMap map[string]*types.TypeName,
+	structIndex map[structKeyHandle]structIndexEntry,
+	fc *fieldCache,
+	fset *token.FileSet,
+	seenPool *seenMapPool,
+) []TemplateVar {
+	vars := make([]TemplateVar, 0, len(varDefs))
+
+	for name, typeStr := range varDefs {
+		tv := TemplateVar{Name: name, TypeStr: typeStr}
+		baseTypeStr := typeStr
+		isSlice := false
+
+		// Faster prefix stripping
+		for {
+			if len(baseTypeStr) >= 2 && baseTypeStr[0] == '[' && baseTypeStr[1] == ']' {
+				isSlice = true
+				baseTypeStr = baseTypeStr[2:]
+			} else if len(baseTypeStr) >= 1 && baseTypeStr[0] == '*' {
+				baseTypeStr = baseTypeStr[1:]
+			} else {
+				break
+			}
+		}
+
+		if len(baseTypeStr) >= 4 && baseTypeStr[:4] == "map[" {
+			if idx := strings.IndexByte(baseTypeStr, ']'); idx != -1 {
+				tv.IsMap = true
+				tv.KeyType = strings.TrimSpace(baseTypeStr[4:idx])
+				tv.ElemType = strings.TrimSpace(baseTypeStr[idx+1:])
+
+				valLookup := strings.TrimLeft(tv.ElemType, "*")
+				if typeNameObj, ok := typeMap[valLookup]; ok {
+					seen := seenPool.get()
+					tv.Fields, tv.Doc = extractFieldsWithDocs(typeNameObj.Type(), structIndex, fc, seen, fset)
+					seenPool.put(seen)
+				}
+
+				vars = append(vars, tv)
+				continue
+			}
+		}
+
+		if typeNameObj, ok := typeMap[baseTypeStr]; ok {
+			t := typeNameObj.Type()
+			seen := seenPool.get()
+			tv.Fields, tv.Doc = extractFieldsWithDocs(t, structIndex, fc, seen, fset)
+			seenPool.put(seen)
+
+			if pos := typeNameObj.Pos(); pos.IsValid() && fset != nil {
+				position := fset.Position(pos)
+				tv.DefFile = position.Filename
+				tv.DefLine = position.Line
+				tv.DefCol = position.Column
+			}
+
+			if isSlice {
+				tv.IsSlice = true
+				tv.ElemType = baseTypeStr
+			}
+		} else if isSlice {
+			tv.IsSlice = true
+			tv.ElemType = baseTypeStr
+		}
+
+		vars = append(vars, tv)
+	}
+
+	return vars
 }
 
 // ── Field extraction with caching ────────────────────────────────────────────
@@ -1155,12 +1042,14 @@ func copySeenMap(src map[structKeyHandle]bool) map[structKeyHandle]bool {
 
 // ── extractMapVars ────────────────────────────────────────────────────────────
 
+// extractMapVars with seen map passed as parameter
 func extractMapVars(
 	expr ast.Expr,
 	info *types.Info,
 	fset *token.FileSet,
 	structIndex map[structKeyHandle]structIndexEntry,
 	fc *fieldCache,
+	seen map[structKeyHandle]bool,
 ) []TemplateVar {
 	comp, ok := expr.(*ast.CompositeLit)
 	if !ok {
@@ -1168,11 +1057,13 @@ func extractMapVars(
 	}
 
 	vars := make([]TemplateVar, 0, len(comp.Elts))
+
 	for _, elt := range comp.Elts {
 		kv, ok := elt.(*ast.KeyValueExpr)
 		if !ok {
 			continue
 		}
+
 		keyLit, ok := kv.Key.(*ast.BasicLit)
 		if !ok {
 			continue
@@ -1182,22 +1073,23 @@ func extractMapVars(
 		tv := TemplateVar{Name: name}
 
 		if typeInfo, ok := info.Types[kv.Value]; ok {
+			// Clear the map for reuse.
+			// For each variable, we need a new map.
+			for key := range seen {
+				delete(seen, key)
+			}
 			tv.TypeStr = normalizeTypeStr(typeInfo.Type.String())
-
-			seen := make(map[structKeyHandle]bool)
 			tv.Fields, tv.Doc = extractFieldsWithDocs(typeInfo.Type, structIndex, fc, seen, fset)
 
 			if elemType := getElementType(typeInfo.Type); elemType != nil {
 				tv.IsSlice = true
 				tv.ElemType = normalizeTypeStr(elemType.String())
-				elemSeen := make(map[structKeyHandle]bool)
-				tv.Fields, tv.Doc = extractFieldsWithDocsDoc(elemType, structIndex, fc, elemSeen, fset, tv.Doc)
+				tv.Fields, tv.Doc = extractFieldsWithDocsDoc(elemType, structIndex, fc, seen, fset, tv.Doc)
 			} else if keyType, elemType := getMapTypes(typeInfo.Type); keyType != nil && elemType != nil {
 				tv.IsMap = true
 				tv.KeyType = normalizeTypeStr(keyType.String())
 				tv.ElemType = normalizeTypeStr(elemType.String())
-				elemSeen := make(map[structKeyHandle]bool)
-				tv.Fields, tv.Doc = extractFieldsWithDocsDoc(elemType, structIndex, fc, elemSeen, fset, tv.Doc)
+				tv.Fields, tv.Doc = extractFieldsWithDocsDoc(elemType, structIndex, fc, seen, fset, tv.Doc)
 			}
 		} else {
 			tv.TypeStr = inferTypeFromAST(kv.Value)
@@ -1206,6 +1098,7 @@ func extractMapVars(
 		tv.DefFile, tv.DefLine, tv.DefCol = findDefinitionLocation(kv.Value, info, fset)
 		vars = append(vars, tv)
 	}
+
 	return vars
 }
 
@@ -1366,14 +1259,6 @@ func isImportRelatedError(msg string) bool {
 	return false
 }
 
-func extractString(expr ast.Expr) string {
-	lit, ok := expr.(*ast.BasicLit)
-	if !ok || lit.Kind != token.STRING || len(lit.Value) < 2 {
-		return ""
-	}
-	return lit.Value[1 : len(lit.Value)-1]
-}
-
 func FindGoFiles(root string) ([]string, error) {
 	var files []string
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
@@ -1386,4 +1271,157 @@ func FindGoFiles(root string) ([]string, error) {
 		return nil
 	})
 	return files, err
+}
+
+// resolveFuncDefLocation returns the best available definition position for a
+// function value expression. For named references (ident or selector) it
+// resolves through TypesInfo to the actual declaration site; for literals it
+// falls back to the expression's own position.
+func resolveFuncDefLocation(expr ast.Expr, info *types.Info, fset *token.FileSet) (file string, line, col int) {
+	if fset == nil {
+		return
+	}
+	switch e := expr.(type) {
+	case *ast.Ident:
+		if info != nil {
+			if obj := info.ObjectOf(e); obj != nil && obj.Pos().IsValid() {
+				pos := fset.Position(obj.Pos())
+				return pos.Filename, pos.Line, pos.Column
+			}
+		}
+	case *ast.SelectorExpr:
+		if info != nil {
+			if obj := info.ObjectOf(e.Sel); obj != nil && obj.Pos().IsValid() {
+				pos := fset.Position(obj.Pos())
+				return pos.Filename, pos.Line, pos.Column
+			}
+		}
+	}
+	pos := fset.Position(expr.Pos())
+	return pos.Filename, pos.Line, pos.Column
+}
+
+// resolveFuncDoc attempts to extract the doc comment for a function value
+// expression. For named references (bare ident or pkg.Func selector) it finds
+// the *ast.FuncDecl in the parsed file set and returns its doc text. Anonymous
+// function literals carry no doc comment, so the empty string is returned.
+func resolveFuncDoc(expr ast.Expr, info *types.Info, filesMap map[string]*ast.File) string {
+	if info == nil {
+		return ""
+	}
+
+	var obj types.Object
+	switch e := expr.(type) {
+	case *ast.Ident:
+		obj = info.ObjectOf(e)
+	case *ast.SelectorExpr:
+		obj = info.ObjectOf(e.Sel)
+	default:
+		return ""
+	}
+
+	if obj == nil || !obj.Pos().IsValid() {
+		return ""
+	}
+
+	for _, file := range filesMap {
+		for _, decl := range file.Decls {
+			fd, ok := decl.(*ast.FuncDecl)
+			if !ok {
+				continue
+			}
+			if fd.Name.Obj != nil && fd.Name.Obj.Pos() == obj.Pos() {
+				if fd.Doc != nil {
+					return strings.TrimSpace(fd.Doc.Text())
+				}
+				return ""
+			}
+		}
+	}
+	return ""
+}
+
+func extractFuncMaps(comp *ast.CompositeLit, info *types.Info, fset *token.FileSet, filesMap map[string]*ast.File) []FuncMapInfo {
+	var result []FuncMapInfo
+	for _, elt := range comp.Elts {
+		kv, ok := elt.(*ast.KeyValueExpr)
+		if !ok {
+			continue
+		}
+		key, ok := kv.Key.(*ast.BasicLit)
+		if !ok || key.Kind != token.STRING {
+			continue
+		}
+
+		name := strings.Trim(key.Value, "\"")
+		fInfo := FuncMapInfo{Name: name}
+
+		fInfo.DefFile, fInfo.DefLine, fInfo.DefCol = resolveFuncDefLocation(kv.Value, info, fset)
+		fInfo.Doc = resolveFuncDoc(kv.Value, info, filesMap)
+
+		if info != nil {
+			if tv, ok := info.Types[kv.Value]; ok && tv.Type != nil {
+				underlying := tv.Type
+				if ptr, ok2 := underlying.(*types.Pointer); ok2 {
+					underlying = ptr.Elem()
+				}
+				if sig, ok2 := underlying.(*types.Signature); ok2 {
+					fInfo.Params, fInfo.Returns, fInfo.Args = extractSignatureInfo(sig)
+				}
+			}
+		}
+		result = append(result, fInfo)
+	}
+	return result
+}
+
+// extractSignatureInfo extracts parameter names, types, and return types from
+// a *types.Signature. Names are preserved when present; unnamed params get an
+// empty Name field. The legacy Args []string slice is also populated for
+// backward compatibility.
+func extractSignatureInfo(sig *types.Signature) (params, returns []ParamInfo, args []string) {
+	params = make([]ParamInfo, sig.Params().Len())
+	args = make([]string, sig.Params().Len())
+	for i := range sig.Params().Len() {
+		p := sig.Params().At(i)
+		ts := normalizeTypeStr(p.Type().String())
+		params[i] = ParamInfo{Name: p.Name(), TypeStr: ts}
+		args[i] = ts
+	}
+	returns = make([]ParamInfo, sig.Results().Len())
+	for i := range sig.Results().Len() {
+		r := sig.Results().At(i)
+		ts := normalizeTypeStr(r.Type().String())
+		returns[i] = ParamInfo{Name: r.Name(), TypeStr: ts}
+	}
+	return
+}
+
+func isRenderCall(call *ast.CallExpr, config AnalysisConfig) bool {
+	funcName := ""
+	switch fn := call.Fun.(type) {
+	case *ast.SelectorExpr:
+		funcName = fn.Sel.Name
+	case *ast.Ident:
+		funcName = fn.Name
+	}
+	return (funcName == config.RenderFunctionName || funcName == config.ExecuteTemplateFunctionName) &&
+		len(call.Args) >= 2
+}
+
+// extractFieldsWithDocsDoc is a thin helper that preserves an existing doc
+// string when the recursive extraction returns an empty one.
+func extractFieldsWithDocsDoc(
+	t types.Type,
+	structIndex map[structKeyHandle]structIndexEntry,
+	fc *fieldCache,
+	seen map[structKeyHandle]bool,
+	fset *token.FileSet,
+	existingDoc string,
+) ([]FieldInfo, string) {
+	fields, doc := extractFieldsWithDocs(t, structIndex, fc, seen, fset)
+	if doc == "" {
+		doc = existingDoc
+	}
+	return fields, doc
 }

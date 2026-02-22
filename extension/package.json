@@ -86,10 +86,10 @@
           "default": 1500,
           "description": "Debounce delay in milliseconds before re-validating on file change."
         },
-        "rex-analyzer.enableAutoValidate": {
+        "rex-analyzer.compress": {
           "type": "boolean",
-          "default": true,
-          "description": "Automatically validate templates on save."
+          "default": false,
+          "description": "Enable GZIP compression from analyzer"
         }
       }
     }
