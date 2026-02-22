@@ -34,10 +34,12 @@ func main() {
 	if *validate {
 		enc.Encode(struct {
 			RenderCalls      []validator.RenderCall       `json:"renderCalls"`
+			FuncMaps         []validator.FuncMapInfo      `json:"funcMaps"`
 			ValidationErrors []validator.ValidationResult `json:"validationErrors"`
 			Errors           []string                     `json:"errors,omitempty"`
 		}{
 			RenderCalls:      result.RenderCalls,
+			FuncMaps:         result.FuncMaps,
 			ValidationErrors: validator.ValidateTemplates(result.RenderCalls, templateBase, *templateRoot),
 			Errors:           result.Errors,
 		})

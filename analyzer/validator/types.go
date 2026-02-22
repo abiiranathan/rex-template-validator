@@ -62,8 +62,17 @@ type ValidationResult struct {
 
 // AnalysisResult is the top-level output
 type AnalysisResult struct {
-	RenderCalls []RenderCall `json:"renderCalls"`
-	Errors      []string     `json:"errors"`
+	RenderCalls []RenderCall  `json:"renderCalls"`
+	FuncMaps    []FuncMapInfo `json:"funcMaps"`
+	Errors      []string      `json:"errors"`
+}
+
+// FuncMapInfo represents a template.FuncMap call found in Go source
+type FuncMapInfo struct {
+	Name    string   `json:"name"`
+	Args    []string `json:"args"`
+	Returns []string `json:"returns"`
+	Doc     string   `json:"doc,omitempty"`
 }
 
 // ScopeType represents the type of a scope (root or element type in a range)

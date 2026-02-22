@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"go/ast"
+	"go/constant"
 	"go/token"
 	"go/types"
 	"maps"
@@ -162,40 +163,41 @@ func AnalyzeDir(dir string, contextFile string, config AnalysisConfig) AnalysisR
 
 	// ── Pre-count render calls to avoid slice re-growth ──────────────────────
 	totalRenders := 0
+	totalFuncMaps := 0
 	for _, scope := range scopes {
 		totalRenders += len(scope.RenderNodes)
+		totalFuncMaps += len(scope.FuncMaps)
 	}
 	result.RenderCalls = make([]RenderCall, 0, totalRenders)
+	result.FuncMaps = make([]FuncMapInfo, 0, totalFuncMaps)
+
+	// ── Aggregate FuncMaps ───────────────────────────────────────────────────
+	for _, scope := range scopes {
+		result.FuncMaps = append(result.FuncMaps, scope.FuncMaps...)
+	}
 
 	// ── Generate render calls from scopes that have renders ──────────────────
 	for _, scope := range scopes {
 		if len(scope.RenderNodes) == 0 {
 			continue
 		}
-		for _, call := range scope.RenderNodes {
-			templateArgIdx := 0
-			switch call.Fun.(type) {
-			case *ast.SelectorExpr:
-				templateArgIdx = 0
-			case *ast.Ident:
-				templateArgIdx = -1
-			}
+		for _, rr := range scope.RenderNodes {
+			call := rr.Node
+			templateArgIdx := rr.TemplateArgIdx
 
-			if templateArgIdx == -1 {
-				for i, arg := range call.Args {
-					if lit, ok := arg.(*ast.BasicLit); ok && lit.Kind == token.STRING {
-						templateArgIdx = i
-						break
-					}
-				}
-			}
-
-			if templateArgIdx == -1 || templateArgIdx >= len(call.Args) {
+			// If no templates resolved, skip
+			if len(rr.TemplateNames) == 0 {
 				continue
 			}
 
+			// We need column info for the template argument expression
+			// Use the first template name's source location?
+			// The original code used templatePathExpr from call.Args[templateArgIdx].
+			// Let's get that expr again.
+			if templateArgIdx < 0 || templateArgIdx >= len(call.Args) {
+				continue
+			}
 			templatePathExpr := call.Args[templateArgIdx]
-			templatePath := extractString(templatePathExpr)
 
 			tplNameStartCol, tplNameEndCol := getExprColumnRange(fset, templatePathExpr)
 			if lit, ok := templatePathExpr.(*ast.BasicLit); ok && lit.Kind == token.STRING {
@@ -203,40 +205,54 @@ func AnalyzeDir(dir string, contextFile string, config AnalysisConfig) AnalysisR
 				tplNameEndCol--
 			}
 
-			if templatePath == "" {
-				continue
-			}
-
-			dataArgIdx := templateArgIdx + 1
-			var vars []TemplateVar
-			if dataArgIdx < len(call.Args) {
-				vars = extractMapVars(call.Args[dataArgIdx], info, fset, structIndex, fc)
-			}
-
-			// Pre-allocate combined vars slice in one shot
-			allVars := make([]TemplateVar, 0, len(vars)+len(scope.SetVars)+len(globalImplicitVars))
-			allVars = append(allVars, vars...)
-			allVars = append(allVars, scope.SetVars...)
-			allVars = append(allVars, globalImplicitVars...)
-
-			pos := fset.Position(call.Pos())
-			relFile := pos.Filename
-			if abs, err := filepath.Abs(pos.Filename); err == nil {
-				if rel, err := filepath.Rel(dir, abs); err == nil {
-					relFile = rel
+			// Process each resolved template name
+			for _, templatePath := range rr.TemplateNames {
+				if templatePath == "" {
+					continue
 				}
-			}
 
-			result.RenderCalls = append(result.RenderCalls, RenderCall{
-				File:                 relFile,
-				Line:                 pos.Line,
-				Template:             templatePath,
-				TemplateNameStartCol: tplNameStartCol,
-				TemplateNameEndCol:   tplNameEndCol,
-				Vars:                 allVars,
-			})
+				dataArgIdx := templateArgIdx + 1
+				var vars []TemplateVar
+				if dataArgIdx < len(call.Args) {
+					vars = extractMapVars(call.Args[dataArgIdx], info, fset, structIndex, fc)
+				}
+
+				// Pre-allocate combined vars slice in one shot
+				allVars := make([]TemplateVar, 0, len(vars)+len(scope.SetVars)+len(globalImplicitVars))
+				allVars = append(allVars, vars...)
+				allVars = append(allVars, scope.SetVars...)
+				allVars = append(allVars, globalImplicitVars...)
+
+				pos := fset.Position(call.Pos())
+				relFile := pos.Filename
+				if abs, err := filepath.Abs(pos.Filename); err == nil {
+					if rel, err := filepath.Rel(dir, abs); err == nil {
+						relFile = rel
+					}
+				}
+
+				result.RenderCalls = append(result.RenderCalls, RenderCall{
+					File:                 relFile,
+					Line:                 pos.Line,
+					Template:             templatePath,
+					TemplateNameStartCol: tplNameStartCol,
+					TemplateNameEndCol:   tplNameEndCol,
+					Vars:                 allVars,
+				})
+			}
 		}
 	}
+
+	// ── Deduplicate FuncMaps ───────────────────────────────────────────────────
+	seenFuncMaps := make(map[string]bool)
+	uniqueFuncMaps := make([]FuncMapInfo, 0, len(result.FuncMaps))
+	for _, fm := range result.FuncMaps {
+		if !seenFuncMaps[fm.Name] {
+			seenFuncMaps[fm.Name] = true
+			uniqueFuncMaps = append(uniqueFuncMaps, fm)
+		}
+	}
+	result.FuncMaps = uniqueFuncMaps
 
 	if contextFile != "" {
 		result.RenderCalls = enrichRenderCallsWithContext(result.RenderCalls, contextFile, pkgs, structIndex, fc, fset, config)
@@ -249,7 +265,14 @@ func AnalyzeDir(dir string, contextFile string, config AnalysisConfig) AnalysisR
 
 type FuncScope struct {
 	SetVars     []TemplateVar
-	RenderNodes []*ast.CallExpr
+	RenderNodes []ResolvedRender
+	FuncMaps    []FuncMapInfo
+}
+
+type ResolvedRender struct {
+	Node           *ast.CallExpr
+	TemplateNames  []string
+	TemplateArgIdx int
 }
 
 // funcWorkUnit is a single function node ready to be processed by a worker.
@@ -275,6 +298,11 @@ func collectFuncScopes(
 			switch n.(type) {
 			case *ast.FuncDecl, *ast.FuncLit:
 				funcNodes = append(funcNodes, funcWorkUnit{node: n})
+			case *ast.GenDecl:
+				// Process global variable declarations directly
+				if decl, ok := n.(*ast.GenDecl); ok && (decl.Tok == token.VAR || decl.Tok == token.CONST) {
+					funcNodes = append(funcNodes, funcWorkUnit{node: n})
+				}
 			}
 			return true
 		})
@@ -308,7 +336,7 @@ func collectFuncScopes(
 
 			for _, unit := range chunk {
 				scope := processFunc(unit.node, info, fset, structIndex, fc, config)
-				if len(scope.RenderNodes) > 0 || len(scope.SetVars) > 0 {
+				if len(scope.RenderNodes) > 0 || len(scope.SetVars) > 0 || len(scope.FuncMaps) > 0 {
 					localScopes = append(localScopes, scope)
 				}
 			}
@@ -340,11 +368,120 @@ func processFunc(
 	config AnalysisConfig,
 ) FuncScope {
 	var scope FuncScope
+
+	// Phase 1: Collect local string assignments
+	stringAssignments := make(map[string][]string)
+	funcMapAssignments := make(map[string]*ast.CompositeLit)
+
 	ast.Inspect(n, func(child ast.Node) bool {
-		// Don't recurse into nested function literals.
 		if child != n {
 			if _, isFunc := child.(*ast.FuncLit); isFunc {
 				return false
+			}
+		}
+
+		if assign, ok := child.(*ast.AssignStmt); ok {
+			for i, lhs := range assign.Lhs {
+				// Handle map assignment: fm["sub"] = func(...)
+				if indexExpr, ok := lhs.(*ast.IndexExpr); ok {
+					if info != nil {
+						if tv, ok := info.Types[indexExpr.X]; ok && tv.Type != nil {
+							if strings.HasSuffix(tv.Type.String(), "template.FuncMap") {
+								if keyLit, ok := indexExpr.Index.(*ast.BasicLit); ok && keyLit.Kind == token.STRING {
+									name := strings.Trim(keyLit.Value, "\"")
+									fInfo := FuncMapInfo{Name: name}
+									if i < len(assign.Rhs) {
+										rhs := assign.Rhs[i]
+										if rtv, ok := info.Types[rhs]; ok && rtv.Type != nil {
+											if sig, ok := rtv.Type.Underlying().(*types.Signature); ok {
+												fInfo.Args = make([]string, sig.Params().Len())
+												for p := 0; p < sig.Params().Len(); p++ {
+													fInfo.Args[p] = normalizeTypeStr(sig.Params().At(p).Type().String())
+												}
+												fInfo.Returns = make([]string, sig.Results().Len())
+												for r := 0; r < sig.Results().Len(); r++ {
+													fInfo.Returns[r] = normalizeTypeStr(sig.Results().At(r).Type().String())
+												}
+											}
+										}
+									}
+									scope.FuncMaps = append(scope.FuncMaps, fInfo)
+								}
+							}
+						}
+					}
+				}
+
+				ident, ok := lhs.(*ast.Ident)
+				if !ok || i >= len(assign.Rhs) {
+					continue
+				}
+				rhs := assign.Rhs[i]
+
+				if s := extractString(rhs); s != "" {
+					stringAssignments[ident.Name] = append(stringAssignments[ident.Name], s)
+				}
+				if comp, ok := rhs.(*ast.CompositeLit); ok {
+					funcMapAssignments[ident.Name] = comp
+					// Check if LHS type is FuncMap
+					if info != nil {
+						if tv, ok := info.Types[ident]; ok && tv.Type != nil {
+							if strings.HasSuffix(tv.Type.String(), "template.FuncMap") {
+								scope.FuncMaps = append(scope.FuncMaps, extractFuncMaps(comp, info)...)
+							}
+						}
+					}
+				}
+			}
+		}
+
+		if decl, ok := child.(*ast.GenDecl); ok && (decl.Tok == token.VAR || decl.Tok == token.CONST) {
+			for _, spec := range decl.Specs {
+				vspec, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				for i, name := range vspec.Names {
+					if i >= len(vspec.Values) {
+						continue
+					}
+					rhs := vspec.Values[i]
+					if s := extractString(rhs); s != "" {
+						stringAssignments[name.Name] = append(stringAssignments[name.Name], s)
+					}
+					if comp, ok := rhs.(*ast.CompositeLit); ok {
+						funcMapAssignments[name.Name] = comp
+						// Check if LHS type is FuncMap
+						if info != nil {
+							if tv, ok := info.Defs[name]; ok && tv.Type() != nil {
+								if strings.HasSuffix(tv.Type().String(), "template.FuncMap") {
+									scope.FuncMaps = append(scope.FuncMaps, extractFuncMaps(comp, info)...)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		return true
+	})
+
+	// Phase 2: Find Render and FuncMap calls
+	ast.Inspect(n, func(child ast.Node) bool {
+		if child != n {
+			if _, isFunc := child.(*ast.FuncLit); isFunc {
+				return false
+			}
+		}
+
+		// Extract FuncMap composite literals directly
+		if comp, ok := child.(*ast.CompositeLit); ok {
+			if info != nil {
+				if tv, ok := info.Types[comp]; ok && tv.Type != nil {
+					if strings.HasSuffix(tv.Type.String(), "template.FuncMap") {
+						scope.FuncMaps = append(scope.FuncMaps, extractFuncMaps(comp, info)...)
+					}
+				}
 			}
 		}
 
@@ -354,14 +491,99 @@ func processFunc(
 		}
 
 		if isRenderCall(call, config) {
-			scope.RenderNodes = append(scope.RenderNodes, call)
+			resolved := ResolvedRender{Node: call, TemplateArgIdx: -1}
+			templateArgIdx := -1
+			switch call.Fun.(type) {
+			case *ast.SelectorExpr:
+				templateArgIdx = 0
+			case *ast.Ident:
+				templateArgIdx = -1
+			}
+
+			if templateArgIdx == -1 {
+				for i, arg := range call.Args {
+					if lit, ok := arg.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+						templateArgIdx = i
+						break
+					}
+					if ident, ok := arg.(*ast.Ident); ok {
+						if _, ok := stringAssignments[ident.Name]; ok {
+							templateArgIdx = i
+							break
+						}
+					}
+				}
+			}
+
+			if templateArgIdx >= 0 && templateArgIdx < len(call.Args) {
+				resolved.TemplateArgIdx = templateArgIdx
+				arg := call.Args[templateArgIdx]
+				if s := extractString(arg); s != "" {
+					resolved.TemplateNames = []string{s}
+				} else if ident, ok := arg.(*ast.Ident); ok {
+					if info != nil {
+						if obj := info.ObjectOf(ident); obj != nil {
+							if c, ok := obj.(*types.Const); ok {
+								val := c.Val()
+								if val.Kind() == constant.String {
+									resolved.TemplateNames = []string{constant.StringVal(val)}
+								}
+							}
+						}
+					}
+					if len(resolved.TemplateNames) == 0 {
+						if vals, ok := stringAssignments[ident.Name]; ok {
+							resolved.TemplateNames = vals
+						}
+					}
+				}
+			}
+			scope.RenderNodes = append(scope.RenderNodes, resolved)
 		}
+
 		if setVar := extractSetCallVar(call, info, fset, structIndex, fc, config); setVar != nil {
 			scope.SetVars = append(scope.SetVars, *setVar)
 		}
+
 		return true
 	})
 	return scope
+}
+
+func extractFuncMaps(comp *ast.CompositeLit, info *types.Info) []FuncMapInfo {
+
+	var result []FuncMapInfo
+	for _, elt := range comp.Elts {
+		kv, ok := elt.(*ast.KeyValueExpr)
+		if !ok {
+			continue
+		}
+		key, ok := kv.Key.(*ast.BasicLit)
+		if !ok || key.Kind != token.STRING {
+			continue
+		}
+
+		name := strings.Trim(key.Value, "\"")
+		fInfo := FuncMapInfo{Name: name}
+
+		if info != nil {
+			if tv, ok := info.Types[kv.Value]; ok {
+				sig, ok := tv.Type.(*types.Signature)
+				if ok {
+					fInfo.Args = make([]string, sig.Params().Len())
+					for i := 0; i < sig.Params().Len(); i++ {
+						fInfo.Args[i] = normalizeTypeStr(sig.Params().At(i).Type().String())
+					}
+					fInfo.Returns = make([]string, sig.Results().Len())
+					for i := 0; i < sig.Results().Len(); i++ {
+						fInfo.Returns[i] = normalizeTypeStr(sig.Results().At(i).Type().String())
+					}
+				}
+			}
+		}
+		result = append(result, fInfo)
+	}
+	return result
 }
 
 func isRenderCall(call *ast.CallExpr, config AnalysisConfig) bool {
