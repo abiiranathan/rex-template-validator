@@ -50,15 +50,15 @@
     {{ template "roles" .roles }}
     <!-- Same-file block -->
     {{ block "user-msg" .currentUser }}
-    <h1>Hello: {{ .Name }}</h1>
+    <h1>Hello: {{ . }}</h1>
     {{ end }}
 
     {{ $large := index $.billedDrugs 0 }}
+    {{ $drugName := $large.Name }}
     {{ $roleValue := index $.roles "name" }}
 
     <h3>Drug Name: {{ $roleValue }}</h3>
-    <p>{{ $num := (add 10 20) }}</p>
-
+    <p>{{ $num := (add 10.5 20.8) }}</p>
 </body>
 
 </html>

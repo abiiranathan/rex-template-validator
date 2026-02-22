@@ -505,8 +505,8 @@ export class TypeInferencer {
         return this.inferIdentType(node.name);
 
       case 'number':
-        return { typeStr: 'float64' };
-
+        // Try to distinguish integers from floats if there's no decimal point
+        return { typeStr: Number.isInteger(node.value) ? 'int' : 'float64' };
       case 'string':
         return { typeStr: 'string' };
 
@@ -687,6 +687,23 @@ export class TypeInferencer {
   }
 
   private inferCallType(func: string, args: ExprNode[]): TypeResult | null {
+    // 1. Prioritize user-defined functions from FuncMap. 
+    // This allows them to override built-ins like 'add' and directly provides the precise return type.
+    if (this.funcMaps?.has(func)) {
+      const fn = this.funcMaps.get(func)!;
+      if (fn.returns && fn.returns.length > 0) {
+        // Use the first return type
+        let retType = fn.returns[0];
+
+        // Clean up basic types (e.g. from pointer or wrapper if applicable)
+        if (retType.startsWith('*')) {
+          retType = retType.substring(1);
+        }
+        return { typeStr: retType };
+      }
+    }
+
+    // 2. Fallback to built-in template functions and operators
     switch (func) {
       case 'index': {
         // index collection key...
@@ -779,21 +796,6 @@ export class TypeInferencer {
       }
 
       default:
-        // Try looking up the function in our discovered funcMaps
-        if (this.funcMaps?.has(func)) {
-          const fn = this.funcMaps.get(func)!;
-          if (fn.returns && fn.returns.length > 0) {
-            // Use the first return type
-            let retType = fn.returns[0];
-            
-            // Clean up basic types (e.g. from pointer or wrapper if applicable)
-            if (retType.startsWith('*')) {
-              retType = retType.substring(1);
-            }
-            
-            return { typeStr: retType };
-          }
-        }
         return null;
     }
   }

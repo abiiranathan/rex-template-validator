@@ -92,7 +92,7 @@ func (h *Handler) RenderTreatmentChart(inpatient bool) rex.HandlerFunc {
 		}
 
 		// Func Map
-		add := func(a, b int) int { return a + b }
+		add := func(a, b int) *User { return &User{} }
 		funcMap := template.FuncMap{
 			"add": add,
 		}

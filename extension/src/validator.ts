@@ -1538,61 +1538,95 @@ export class TemplateValidator {
     return this.findRangeVariableDefinition(pathForDef, stack, ctx);
   }
 
-   async getCompletionItems(
-     document: vscode.TextDocument,
-     position: vscode.Position,
-     ctx: TemplateContext
-   ): Promise<vscode.CompletionItem[]> {
-     const completionItems: vscode.CompletionItem[] = [];
-     const content = document.getText();
-     const nodes = this.parser.parse(content);
- 
-     const hit = this.findNodeAtPosition(nodes, position, ctx.vars, [], nodes);
-     if (!hit) {
-       // If no specific node is hit, provide root context variables
-       // For global variables when no node is hit, the range should start at the current position - 1 if '.' is typed
-       const lineText = document.lineAt(position.line).text;
-       let startCol = position.character;
-       if (startCol > 0 && (lineText[startCol - 1] === '.' || lineText[startCol - 1] === '$')) {
-         startCol--;
-       }
+  async getCompletionItems(
+    document: vscode.TextDocument,
+    position: vscode.Position,
+    ctx: TemplateContext
+  ): Promise<vscode.CompletionItem[]> {
+    const completionItems: vscode.CompletionItem[] = [];
+    const content = document.getText();
+    const nodes = this.parser.parse(content);
+
+    const hit = this.findNodeAtPosition(nodes, position, ctx.vars, [], nodes);
+    if (!hit) {
+      // If no specific node is hit, provide root context variables
+      const lineText = document.lineAt(position.line).text;
+      let startCol = position.character;
+      if (startCol > 0 && (lineText[startCol - 1] === '.' || lineText[startCol - 1] === '$')) {
+        startCol--;
+      }
+
       const replacementRange = new vscode.Range(position.line, startCol, position.line, position.character);
       this.addGlobalVariablesToCompletion(ctx.vars, completionItems, '', replacementRange);
       this.addFunctionsToCompletion(this.graphBuilder.getGraph().funcMaps, completionItems, '', replacementRange);
       return completionItems;
-     }
- 
-     const { node, stack, vars: hitVars, locals: hitLocals } = hit;
- 
-     const lineText = document.lineAt(position.line).text;
-     let startChar = position.character;
-     while (startChar > 0 && (/[a-zA-Z0-9_.]/.test(lineText[startChar - 1]) || lineText[startChar - 1] === '$')) {
-       startChar--;
-     }
- 
-     const currentWord = lineText.substring(startChar, position.character);
- 
-     let prefix = '';
-     let partialName = currentWord;
-     if (currentWord.startsWith('.') || currentWord.startsWith('$')) {
-       prefix = currentWord[0];
-       partialName = currentWord.substring(1);
-     }
-     
-     const replacementRange = new vscode.Range(position.line, startChar, position.line, position.character);
- 
-     if (prefix === '$') {
-       // Suggest local variables
-       this.addLocalVariablesToCompletion(stack, hitLocals, completionItems, partialName, replacementRange);
-     } else if (prefix === '.') {
-       // Suggest global variables and fields of the current context
-       const currentDotContext = this.findDotFrameAtPosition(node, stack, hitVars, hitLocals);
-       this.addFieldsToCompletion(currentDotContext, completionItems, partialName, replacementRange);
-     } else { // No explicit prefix, suggest both global and local that match partial name
-      this.addGlobalVariablesToCompletion(hitVars, completionItems, partialName, replacementRange);
-      this.addLocalVariablesToCompletion(stack, hitLocals, completionItems, partialName, replacementRange);
-      this.addFunctionsToCompletion(this.graphBuilder.getGraph().funcMaps, completionItems, partialName, replacementRange);
     }
+
+    const { node, stack, vars: hitVars, locals: hitLocals } = hit;
+
+    const lineText = document.lineAt(position.line).text;
+    let startChar = position.character;
+
+    // Back up to find the start of the current word/expression
+    while (startChar > 0 && (/[a-zA-Z0-9_.]/.test(lineText[startChar - 1]) || lineText[startChar - 1] === '$')) {
+      startChar--;
+    }
+
+    const currentWord = lineText.substring(startChar, position.character);
+    const replacementRange = new vscode.Range(position.line, startChar, position.line, position.character);
+
+    // Determine what kind of completion this is based on what the user just typed
+    const charBeforeCursor = position.character > 0 ? lineText[position.character - 1] : '';
+
+    // Case 1: User just typed '$' - show local variables only
+    if (charBeforeCursor === '$' || (currentWord === '$' && position.character === startChar + 1)) {
+      this.addLocalVariablesToCompletion(stack, hitLocals, completionItems, '', replacementRange);
+      return completionItems;
+    }
+
+    // Case 2: User just typed '.' - show fields of current context
+    if (charBeforeCursor === '.' && !currentWord.includes('$')) {
+      // Check if this is part of a longer path like ".User." or just a bare "."
+      const beforeDot = startChar > 0 ? lineText.substring(0, startChar) : '';
+      const pathMatch = beforeDot.match(/(\$?[\w.]+)$/);
+
+      if (pathMatch && pathMatch[0].length > 0 && pathMatch[0] !== '.') {
+        // This is like ".User." - need to resolve the path before the dot
+        const pathBeforeDot = this.parser.parseDotPath(pathMatch[0]);
+        const result = resolvePath(pathBeforeDot, hitVars, stack, hitLocals);
+
+        if (result.found && result.fields) {
+          this.addFieldsToCompletion({ fields: result.fields }, completionItems, '', replacementRange);
+          return completionItems;
+        }
+      }
+
+      // This is a bare "." - show current scope fields
+      const currentDotContext = this.findDotFrameAtPosition(node, stack, hitVars, hitLocals);
+      this.addFieldsToCompletion(currentDotContext, completionItems, '', replacementRange);
+      return completionItems;
+    }
+
+    // Case 3: User is typing after '$' - filter local variables
+    if (currentWord.startsWith('$')) {
+      const partialName = currentWord.substring(1);
+      this.addLocalVariablesToCompletion(stack, hitLocals, completionItems, partialName, replacementRange);
+      return completionItems;
+    }
+
+    // Case 4: User is typing after '.' in a path like ".User" or ".Items"
+    if (currentWord.startsWith('.')) {
+      const partialName = currentWord.substring(1);
+      const currentDotContext = this.findDotFrameAtPosition(node, stack, hitVars, hitLocals);
+      this.addFieldsToCompletion(currentDotContext, completionItems, partialName, replacementRange);
+      return completionItems;
+    }
+
+    // Case 5: No explicit prefix - suggest globals, locals, and functions that match
+    const partialName = currentWord;
+    this.addGlobalVariablesToCompletion(hitVars, completionItems, partialName, replacementRange);
+    this.addLocalVariablesToCompletion(stack, hitLocals, completionItems, partialName, replacementRange);
+    this.addFunctionsToCompletion(this.graphBuilder.getGraph().funcMaps, completionItems, partialName, replacementRange);
 
     return completionItems;
   }
@@ -1605,95 +1639,98 @@ export class TemplateValidator {
   ) {
     if (!funcMaps) return;
     for (const [name, fn] of funcMaps) {
+      // Don't suggest functions when filtering with a partial name that doesn't match
+      if (partialName && !name.startsWith(partialName)) {
+        continue;
+      }
+
+      const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Function);
+      const args = fn.args ? fn.args.join(', ') : '';
+      const returnsList = fn.returns || [];
+      let returns = returnsList.join(', ');
+      if (returnsList.length > 1) {
+        returns = `(${returns})`;
+      }
+      item.detail = `func(${args}) ${returns}`;
+      if (fn.doc) {
+        item.documentation = new vscode.MarkdownString(fn.doc);
+      }
+      item.range = replacementRange;
+      completionItems.push(item);
+    }
+  }
+
+  private addGlobalVariablesToCompletion(
+    vars: Map<string, TemplateVar>,
+    completionItems: vscode.CompletionItem[],
+    partialName: string = '',
+    replacementRange: vscode.Range
+  ) {
+    for (const [name, variable] of vars) {
       if (name.startsWith(partialName)) {
-        const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Function);
-        const args = fn.args ? fn.args.join(', ') : '';
-        const returnsList = fn.returns || [];
-        let returns = returnsList.join(', ');
-        if (returnsList.length > 1) {
-          returns = `(${returns})`;
-        }
-        item.detail = `func(${args}) ${returns}`;
-        if (fn.doc) {
-          item.documentation = new vscode.MarkdownString(fn.doc);
-        }
+        const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Variable);
+        item.detail = variable.type;
+        item.documentation = new vscode.MarkdownString(variable.doc);
         item.range = replacementRange;
         completionItems.push(item);
       }
     }
   }
 
-  private addGlobalVariablesToCompletion(
-     vars: Map<string, TemplateVar>,
-     completionItems: vscode.CompletionItem[],
-     partialName: string = '',
-     replacementRange: vscode.Range
-   ) {
-     for (const [name, variable] of vars) {
-       if (name.startsWith(partialName)) {
-         const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Variable);
-         item.detail = variable.type;
-         item.documentation = new vscode.MarkdownString(variable.doc);
-         item.range = replacementRange;
-         completionItems.push(item);
-       }
-     }
-   }
- 
-   private addLocalVariablesToCompletion(
-     scopeStack: ScopeFrame[],
-     blockLocals: Map<string, TemplateVar> | undefined,
-     completionItems: vscode.CompletionItem[],
-     partialName: string = '',
-     replacementRange: vscode.Range
-   ) {
-     // Add block locals
-     if (blockLocals) {
-       for (const [name, variable] of blockLocals) {
-         if (name.startsWith(partialName)) {
-           const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Variable);
-           item.detail = variable.type;
-           item.documentation = new vscode.MarkdownString(variable.doc);
-           item.range = replacementRange;
-           completionItems.push(item);
-         }
-       }
-     }
- 
-     // Add variables from scope stack
-     for (let i = scopeStack.length - 1; i >= 0; i--) {
-       if (scopeStack[i].locals) {
-         for (const [name, variable] of scopeStack[i].locals!) {
-           if (name.startsWith(partialName)) {
-             const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Variable);
-             item.detail = variable.type;
-             item.documentation = new vscode.MarkdownString(variable.doc);
-             item.range = replacementRange;
-             completionItems.push(item);
-           }
-         }
-       }
-     }
-   }
- 
-   private addFieldsToCompletion(
-     context: { fields?: FieldInfo[] },
-     completionItems: vscode.CompletionItem[],
-     partialName: string = '',
-     replacementRange: vscode.Range
-   ) {
-     if (context.fields) {
-       for (const field of context.fields) {
-         if (field.name.startsWith(partialName)) {
-           const item = new vscode.CompletionItem(field.name, vscode.CompletionItemKind.Field);
-           item.detail = field.isSlice ? `[]${field.type}` : field.type;
-           item.documentation = new vscode.MarkdownString(field.doc);
-           item.range = replacementRange;
-           completionItems.push(item);
-         }
-       }
-     }
-   }
+  private addLocalVariablesToCompletion(
+    scopeStack: ScopeFrame[],
+    blockLocals: Map<string, TemplateVar> | undefined,
+    completionItems: vscode.CompletionItem[],
+    partialName: string = '',
+    replacementRange: vscode.Range
+  ) {
+    // Add block locals
+    if (blockLocals) {
+      for (const [name, variable] of blockLocals) {
+        if (name.startsWith(partialName)) {
+          const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Variable);
+          item.detail = variable.type;
+          item.documentation = new vscode.MarkdownString(variable.doc);
+          item.range = replacementRange;
+          completionItems.push(item);
+        }
+      }
+    }
+
+    // Add variables from scope stack
+    for (let i = scopeStack.length - 1; i >= 0; i--) {
+      if (scopeStack[i].locals) {
+        for (const [name, variable] of scopeStack[i].locals!) {
+          if (name.startsWith(partialName)) {
+            const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Variable);
+            item.detail = variable.type;
+            item.documentation = new vscode.MarkdownString(variable.doc);
+            item.range = replacementRange;
+            completionItems.push(item);
+          }
+        }
+      }
+    }
+  }
+
+  private addFieldsToCompletion(
+    context: { fields?: FieldInfo[] },
+    completionItems: vscode.CompletionItem[],
+    partialName: string = '',
+    replacementRange: vscode.Range
+  ) {
+    if (context.fields) {
+      for (const field of context.fields) {
+        if (field.name.startsWith(partialName)) {
+          const item = new vscode.CompletionItem(field.name, vscode.CompletionItemKind.Field);
+          item.detail = field.isSlice ? `[]${field.type}` : field.type;
+          item.documentation = new vscode.MarkdownString(field.doc);
+          item.range = replacementRange;
+          completionItems.push(item);
+        }
+      }
+    }
+  }
 
   private findDotFrameAtPosition(
     node: TemplateNode,
