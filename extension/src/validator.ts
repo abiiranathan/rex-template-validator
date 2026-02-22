@@ -1547,115 +1547,209 @@ export class TemplateValidator {
     const content = document.getText();
     const nodes = this.parser.parse(content);
 
-    const hit = this.findNodeAtPosition(nodes, position, ctx.vars, [], nodes);
-    if (!hit) {
-      // If no specific node is hit, provide root context variables
-      const lineText = document.lineAt(position.line).text;
-      let startCol = position.character;
-      if (startCol > 0 && (lineText[startCol - 1] === '.' || lineText[startCol - 1] === '$')) {
-        startCol--;
-      }
+    // Resolve scope (range vars, with-narrowed types, named block context) at
+    // the cursor. findScopeAtPosition always returns a value, never null.
+    let scopeResult = this.findScopeAtPosition(nodes, position, ctx.vars, [], nodes, ctx);
 
-      const replacementRange = new vscode.Range(position.line, startCol, position.line, position.character);
-      this.addGlobalVariablesToCompletion(ctx.vars, completionItems, '', replacementRange);
-      this.addFunctionsToCompletion(this.graphBuilder.getGraph().funcMaps, completionItems, '', replacementRange);
-      return completionItems;
-    }
-
-    const { node, stack, vars: hitVars, locals: hitLocals } = hit;
-
-    const lineText = document.lineAt(position.line).text;
-    let startChar = position.character;
-
-    // Back up to find the start of the current word/expression
-    while (startChar > 0 && (/[a-zA-Z0-9_.]/.test(lineText[startChar - 1]) || lineText[startChar - 1] === '$')) {
-      startChar--;
-    }
-
-    const currentWord = lineText.substring(startChar, position.character);
-    const replacementRange = new vscode.Range(position.line, startChar, position.line, position.character);
-
-    // Determine what kind of completion this is based on what the user just typed
-    const charBeforeCursor = position.character > 0 ? lineText[position.character - 1] : '';
-
-    // Case 1: User just typed '$' - show local variables only
-    if (charBeforeCursor === '$' || (currentWord === '$' && position.character === startChar + 1)) {
-      this.addLocalVariablesToCompletion(stack, hitLocals, completionItems, '', replacementRange);
-      return completionItems;
-    }
-
-    // Case 2: User just typed '.' - show fields of current context
-    if (charBeforeCursor === '.' && !currentWord.includes('$')) {
-      // Check if this is part of a longer path like ".User." or just a bare "."
-      const beforeDot = startChar > 0 ? lineText.substring(0, startChar) : '';
-      const pathMatch = beforeDot.match(/(\$?[\w.]+)$/);
-
-      if (pathMatch && pathMatch[0].length > 0 && pathMatch[0] !== '.') {
-        // This is like ".User." - need to resolve the path before the dot
-        const pathBeforeDot = this.parser.parseDotPath(pathMatch[0]);
-        const result = resolvePath(pathBeforeDot, hitVars, stack, hitLocals);
-
-        if (result.found && result.fields) {
-          this.addFieldsToCompletion({ fields: result.fields }, completionItems, '', replacementRange);
-          return completionItems;
+    // If we are inside a named block/define, override with that block's call-site
+    // context so completions reflect what the caller passed as the dot value.
+    if (!scopeResult || scopeResult.stack.length === 0) {
+      const enclosing = this.findEnclosingBlockOrDefine(nodes, position);
+      if (enclosing?.blockName) {
+        const callCtx = this.resolveNamedBlockCallCtxForHover(
+          enclosing.blockName,
+          ctx.vars,
+          nodes,
+          document.uri.fsPath
+        );
+        if (callCtx) {
+          scopeResult = {
+            stack: [{
+              key: '.',
+              typeStr: callCtx.typeStr,
+              fields: callCtx.fields ?? [],
+              isMap: callCtx.isMap,
+              keyType: callCtx.keyType,
+              elemType: callCtx.elemType,
+              isSlice: callCtx.isSlice,
+            }],
+            locals: new Map(),
+          };
         }
       }
+    }
 
-      // This is a bare "." - show current scope fields
-      const currentDotContext = this.findDotFrameAtPosition(node, stack, hitVars, hitLocals);
-      this.addFieldsToCompletion(currentDotContext, completionItems, '', replacementRange);
+    const { stack, locals } = scopeResult ?? {
+      stack: [] as ScopeFrame[],
+      locals: new Map<string, TemplateVar>(),
+    };
+
+    const lineText = document.lineAt(position.line).text;
+    // linePrefix: everything on this line up to (not including) the cursor.
+    // We do all path matching against linePrefix so the trigger character '.'
+    // is always captured at the start of the matched token rather than being
+    // missed by a manual backward-scan of charBeforeCursor.
+    const linePrefix = lineText.slice(0, position.character);
+
+    // ── Handle complex expressions: after a pipe or open paren ───────────────
+    // e.g. "{{ .Items | " → suggest functions; "{{ (call " → suggest functions
+    const inComplexExpr = /\(\s*[^)]*$|\|\s*[^|}]*$/.test(linePrefix);
+    if (inComplexExpr) {
+      const pipeMatch = linePrefix.match(/(?:\(|\|)\s*(.*)$/);
+      if (pipeMatch) {
+        const partialExpr = pipeMatch[1].trim();
+        try {
+          const exprType = inferExpressionType(
+            partialExpr, ctx.vars, stack, locals,
+            this.graphBuilder.getGraph().funcMaps
+          );
+          if (exprType?.fields) {
+            return exprType.fields.map(f => {
+              const item = new vscode.CompletionItem(
+                f.name,
+                f.type === 'method' ? vscode.CompletionItemKind.Method : vscode.CompletionItemKind.Field
+              );
+              item.detail = f.isSlice ? `[]${f.type}` : f.type;
+              if (f.doc) item.documentation = new vscode.MarkdownString(f.doc);
+              return item;
+            });
+          }
+        } catch { /* fall through */ }
+      }
+    }
+
+    // ── Identify the path token the user is currently typing ─────────────────
+    // Match the rightmost dot-or-dollar-prefixed token in linePrefix.
+    // Using linePrefix (not a manually backed-up index) ensures the '.' trigger
+    // character is always the first char of the match.
+    //
+    // Examples:
+    //   linePrefix "{{ ."          → rawPath "."
+    //   linePrefix "{{ .User."     → rawPath ".User."
+    //   linePrefix "{{ .User.Na"   → rawPath ".User.Na"
+    //   linePrefix "{{ $item."     → rawPath "$item."
+    //   linePrefix "{{ $item.Pri"  → rawPath "$item.Pri"
+    const pathMatch = linePrefix.match(/(?:\$|\.)[\w.]*$/);
+
+    if (!pathMatch) {
+      // No dot/dollar prefix — cursor is at a bare identifier or whitespace.
+      // Offer globals, locals, and template functions without a replacement range
+      // (let VSCode handle insertion naturally).
+      this.addGlobalVariablesToCompletion(ctx.vars, completionItems, '', null);
+      this.addLocalVariablesToCompletion(stack, locals, completionItems, '', null);
+      this.addFunctionsToCompletion(this.graphBuilder.getGraph().funcMaps, completionItems, '', null);
       return completionItems;
     }
 
-    // Case 3: User is typing after '$' - filter local variables
-    if (currentWord.startsWith('$')) {
-      const partialName = currentWord.substring(1);
-      this.addLocalVariablesToCompletion(stack, hitLocals, completionItems, partialName, replacementRange);
+    const rawPath = pathMatch[0];
+    // matchStart: column where rawPath begins in the line.
+    const matchStart = position.character - rawPath.length;
+
+    // Split rawPath into:
+    //   lookupPath   — the part we resolve to get a type/fields
+    //   filterPrefix — the partial field name the user is typing (used to filter results)
+    //
+    // If rawPath ends with '.', the user just typed the separator and wants all
+    // fields of the resolved object (filterPrefix is empty).
+    // Otherwise, the last segment after the final '.' is the filter.
+    let lookupPath: string[];
+    let filterPrefix: string;
+    // Column where the filter prefix starts; completions replace only this suffix.
+    let filterStart: number;
+
+    if (rawPath.endsWith('.')) {
+      lookupPath = this.parser.parseDotPath(rawPath);
+      filterPrefix = '';
+      filterStart = position.character; // nothing to replace, insert after dot
+    } else {
+      const lastDot = rawPath.lastIndexOf('.');
+      if (lastDot === -1) {
+        // e.g. "$someVar" — no dot, treat the whole token as the filter
+        filterPrefix = rawPath.startsWith('$') ? rawPath.slice(1) : rawPath.slice(1);
+        filterStart = matchStart + 1; // skip the leading $ or .
+        // For a bare "$..." token resolve against root vars and locals.
+        if (rawPath.startsWith('$')) {
+          const repRange = new vscode.Range(position.line, matchStart, position.line, position.character);
+          this.addGlobalVariablesToCompletion(ctx.vars, completionItems, filterPrefix, repRange);
+          this.addLocalVariablesToCompletion(stack, locals, completionItems, filterPrefix, repRange);
+        } else {
+          // Bare "." followed immediately by letters — filter the dot-frame fields.
+          const repRange = new vscode.Range(position.line, matchStart, position.line, position.character);
+          const dotFrame = stack.slice().reverse().find(f => f.key === '.');
+          const fields: FieldInfo[] = dotFrame?.fields ?? [...ctx.vars.values()].map(v => ({
+            name: v.name, type: v.type, fields: v.fields,
+            isSlice: v.isSlice ?? false, doc: v.doc,
+          } as FieldInfo));
+          this.addFieldsToCompletion({ fields }, completionItems, filterPrefix, repRange);
+        }
+        return completionItems;
+      }
+      filterPrefix = rawPath.slice(lastDot + 1);
+      filterStart = matchStart + lastDot + 1;
+      // Keep the trailing dot so parseDotPath sees a complete path.
+      lookupPath = this.parser.parseDotPath(rawPath.slice(0, lastDot + 1));
+    }
+
+    // The replacement range covers only the filter suffix (the partial field name
+    // the user is currently typing). It does NOT cover the leading dot or the
+    // path prefix, so those characters are preserved in the editor.
+    // When filterPrefix is empty (just typed '.'), the range is a zero-width
+    // insertion point immediately after the dot — nothing is replaced.
+    const repRange = new vscode.Range(
+      position.line, filterStart,
+      position.line, position.character
+    );
+
+    // ── Bare "." — show current dot-context fields ────────────────────────────
+    if (lookupPath.length === 1 && (lookupPath[0] === '.' || lookupPath[0] === '')) {
+      const dotFrame = stack.slice().reverse().find(f => f.key === '.');
+      const fields: FieldInfo[] = dotFrame?.fields ?? [...ctx.vars.values()].map(v => ({
+        name: v.name, type: v.type, fields: v.fields,
+        isSlice: v.isSlice ?? false, doc: v.doc,
+      } as FieldInfo));
+      this.addFieldsToCompletion({ fields }, completionItems, filterPrefix, repRange);
       return completionItems;
     }
 
-    // Case 4: User is typing after '.' in a path like ".User" or ".Items"
-    if (currentWord.startsWith('.')) {
-      const partialName = currentWord.substring(1);
-      const currentDotContext = this.findDotFrameAtPosition(node, stack, hitVars, hitLocals);
-      this.addFieldsToCompletion(currentDotContext, completionItems, partialName, replacementRange);
+    // ── Bare "$" — show root vars and locals ──────────────────────────────────
+    if (lookupPath.length === 1 && lookupPath[0] === '$') {
+      this.addGlobalVariablesToCompletion(ctx.vars, completionItems, filterPrefix, repRange);
+      this.addLocalVariablesToCompletion(stack, locals, completionItems, filterPrefix, repRange);
       return completionItems;
     }
 
-    // Case 5: No explicit prefix - suggest globals, locals, and functions that match
-    const partialName = currentWord;
-    this.addGlobalVariablesToCompletion(hitVars, completionItems, partialName, replacementRange);
-    this.addLocalVariablesToCompletion(stack, hitLocals, completionItems, partialName, replacementRange);
-    this.addFunctionsToCompletion(this.graphBuilder.getGraph().funcMaps, completionItems, partialName, replacementRange);
+    // ── Complex path: resolve to a type and show its fields ───────────────────
+    // e.g. ".User." → resolve User → show User's fields
+    //      "$item." → resolve $item local var → show its fields
+    const res = resolvePath(lookupPath, ctx.vars, stack, locals);
+    if (res.found && res.fields) {
+      this.addFieldsToCompletion({ fields: res.fields }, completionItems, filterPrefix, repRange);
+    }
 
     return completionItems;
   }
+
+  // addFunctionsToCompletion, addGlobalVariablesToCompletion,
+  // addLocalVariablesToCompletion, addFieldsToCompletion now accept
+  // null for replacementRange (meaning: let VSCode handle insertion).
 
   private addFunctionsToCompletion(
     funcMaps: Map<string, FuncMapInfo> | undefined,
     completionItems: vscode.CompletionItem[],
     partialName: string = '',
-    replacementRange: vscode.Range
+    replacementRange: vscode.Range | null
   ) {
     if (!funcMaps) return;
     for (const [name, fn] of funcMaps) {
-      // Don't suggest functions when filtering with a partial name that doesn't match
-      if (partialName && !name.startsWith(partialName)) {
-        continue;
-      }
-
+      if (partialName && !name.startsWith(partialName)) continue;
       const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Function);
       const args = fn.args ? fn.args.join(', ') : '';
       const returnsList = fn.returns || [];
       let returns = returnsList.join(', ');
-      if (returnsList.length > 1) {
-        returns = `(${returns})`;
-      }
+      if (returnsList.length > 1) returns = `(${returns})`;
       item.detail = `func(${args}) ${returns}`;
-      if (fn.doc) {
-        item.documentation = new vscode.MarkdownString(fn.doc);
-      }
-      item.range = replacementRange;
+      if (fn.doc) item.documentation = new vscode.MarkdownString(fn.doc);
+      if (replacementRange) item.range = replacementRange;
       completionItems.push(item);
     }
   }
@@ -1664,40 +1758,38 @@ export class TemplateValidator {
     vars: Map<string, TemplateVar>,
     completionItems: vscode.CompletionItem[],
     partialName: string = '',
-    replacementRange: vscode.Range
+    replacementRange: vscode.Range | null
   ) {
     for (const [name, variable] of vars) {
       if (name.startsWith(partialName)) {
         const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Variable);
         item.detail = variable.type;
         item.documentation = new vscode.MarkdownString(variable.doc);
-        item.range = replacementRange;
+        if (replacementRange) item.range = replacementRange;
         completionItems.push(item);
       }
     }
   }
+
 
   private addLocalVariablesToCompletion(
     scopeStack: ScopeFrame[],
     blockLocals: Map<string, TemplateVar> | undefined,
     completionItems: vscode.CompletionItem[],
     partialName: string = '',
-    replacementRange: vscode.Range
+    replacementRange: vscode.Range | null
   ) {
-    // Add block locals
     if (blockLocals) {
       for (const [name, variable] of blockLocals) {
         if (name.startsWith(partialName)) {
           const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Variable);
           item.detail = variable.type;
           item.documentation = new vscode.MarkdownString(variable.doc);
-          item.range = replacementRange;
+          if (replacementRange) item.range = replacementRange;
           completionItems.push(item);
         }
       }
     }
-
-    // Add variables from scope stack
     for (let i = scopeStack.length - 1; i >= 0; i--) {
       if (scopeStack[i].locals) {
         for (const [name, variable] of scopeStack[i].locals!) {
@@ -1705,7 +1797,7 @@ export class TemplateValidator {
             const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Variable);
             item.detail = variable.type;
             item.documentation = new vscode.MarkdownString(variable.doc);
-            item.range = replacementRange;
+            if (replacementRange) item.range = replacementRange;
             completionItems.push(item);
           }
         }
@@ -1713,21 +1805,25 @@ export class TemplateValidator {
     }
   }
 
+
   private addFieldsToCompletion(
     context: { fields?: FieldInfo[] },
     completionItems: vscode.CompletionItem[],
     partialName: string = '',
-    replacementRange: vscode.Range
+    replacementRange: vscode.Range | null
   ) {
-    if (context.fields) {
-      for (const field of context.fields) {
-        if (field.name.startsWith(partialName)) {
-          const item = new vscode.CompletionItem(field.name, vscode.CompletionItemKind.Field);
-          item.detail = field.isSlice ? `[]${field.type}` : field.type;
-          item.documentation = new vscode.MarkdownString(field.doc);
-          item.range = replacementRange;
-          completionItems.push(item);
-        }
+    if (!context.fields) return;
+    for (const field of context.fields) {
+      if (field.name.toLowerCase().startsWith(partialName.toLowerCase())) {
+        const item = new vscode.CompletionItem(field.name, vscode.CompletionItemKind.Field);
+        item.detail = field.isSlice ? `[]${field.type}` : field.type;
+        item.documentation = new vscode.MarkdownString(field.doc);
+        // Range covers only the filter suffix. This means:
+        //   - Typing "." then selecting "Name" inserts "Name" after the dot → ".Name" ✓
+        //   - Typing ".Na" then selecting "Name" replaces "Na" with "Name" → ".Name" ✓
+        // The dot itself is never part of the replacement range so it is preserved.
+        if (replacementRange) item.range = replacementRange;
+        completionItems.push(item);
       }
     }
   }
@@ -2356,11 +2452,39 @@ export class TemplateValidator {
     position: vscode.Position,
     ctx: TemplateContext
   ): vscode.CompletionItem[] {
+    const completionItems: vscode.CompletionItem[] = [];
     const content = document.getText();
     const nodes = this.parser.parse(content);
 
-    // Get accurate scope at cursor
-    const scopeResult = this.findScopeAtPosition(nodes, position, ctx.vars, [], nodes, ctx);
+    // 1. Determine Scope
+    let scopeResult = this.findScopeAtPosition(nodes, position, ctx.vars, [], nodes, ctx);
+
+    // Fallback: Check if we are inside a named block (define/block) that implies a specific context
+    if (!scopeResult) {
+      const enclosing = this.findEnclosingBlockOrDefine(nodes, position);
+      if (enclosing?.blockName) {
+        const callCtx = this.resolveNamedBlockCallCtxForHover(
+          enclosing.blockName,
+          ctx.vars,
+          nodes,
+          document.uri.fsPath
+        );
+        if (callCtx) {
+          scopeResult = {
+            stack: [{
+              key: '.',
+              typeStr: callCtx.typeStr,
+              fields: callCtx.fields ?? [],
+              isMap: callCtx.isMap,
+              keyType: callCtx.keyType,
+              elemType: callCtx.elemType,
+              isSlice: callCtx.isSlice
+            }],
+            locals: new Map(),
+          };
+        }
+      }
+    }
 
     const { stack, locals } = scopeResult ?? {
       stack: [] as ScopeFrame[],
@@ -2369,8 +2493,10 @@ export class TemplateValidator {
 
     const lineText = document.lineAt(position.line).text;
     const linePrefix = lineText.slice(0, position.character);
+    const replacementRange = new vscode.Range(position.line, position.character, position.line, position.character);
 
-    // Handle partial/complex expressions (pipe, function args, etc.)
+    // 2. Handle Complex Expressions (Pipes, Function Args)
+    //    e.g. " | len" or " (call "
     const inComplexExpr = /\(\s*[^)]*$|\|\s*[^|}]*$/.test(linePrefix);
     if (inComplexExpr) {
       const match = linePrefix.match(/(?:\(|\|)\s*(.*)$/);
@@ -2390,73 +2516,71 @@ export class TemplateValidator {
             });
           }
         } catch {
-          // silent fail — fall through to dot/path completion
+          // Fall through to standard completion
         }
       }
     }
 
-    // Standard dot / $ completion
-    const pathMatch = linePrefix.match(/(?:\$|\.)[\w.]*$/);
-    if (!pathMatch) return [];
+    // 3. Standard Path Completion (Dot or Dollar)
+    //    Matches: ".", "$", ".User", "$var.Field", "$user."
+    const match = linePrefix.match(/(?:\$|\.)[\w.]*$/);
 
-    const rawPath = pathMatch[0];
-    const parts = rawPath.split('.');
+    // Case A: No dot/dollar prefix (e.g. typing a function name or start of a var)
+    if (!match) {
+      // Suggest Globals, Locals, and Functions
+      this.addGlobalVariablesToCompletion(ctx.vars, completionItems, '', replacementRange);
+      this.addLocalVariablesToCompletion(stack, locals, completionItems, '', replacementRange);
+      this.addFunctionsToCompletion(this.graphBuilder.getGraph().funcMaps, completionItems, '', replacementRange);
+      return completionItems;
+    }
+
+    // Case B: Path resolution
+    const rawPath = match[0];
     let lookupPath: string[];
     let filterPrefix: string;
 
     if (rawPath.endsWith('.')) {
+      // Example: "$user." -> lookup "$user", filter ""
+      // Example: "."      -> lookup ".", filter ""
       lookupPath = this.parser.parseDotPath(rawPath);
       filterPrefix = '';
     } else {
+      // Example: "$user.Nam" -> lookup "$user", filter "Nam"
+      const parts = rawPath.split('.');
       filterPrefix = parts[parts.length - 1];
-      lookupPath = this.parser.parseDotPath(rawPath.slice(0, rawPath.length - filterPrefix.length));
+      const pathOnly = rawPath.slice(0, rawPath.length - filterPrefix.length);
+      lookupPath = this.parser.parseDotPath(pathOnly);
     }
 
-    let fields: FieldInfo[] = [];
-
-    if (lookupPath.length === 0) return [];
-
+    // 3a. Bare Dot "." -> Current Context Fields
     if (lookupPath.length === 1 && (lookupPath[0] === '.' || lookupPath[0] === '')) {
-      // . → current context
       const dotFrame = stack.slice().reverse().find(f => f.key === '.');
-      fields = dotFrame?.fields ?? [...ctx.vars.values()].map(v => ({
+      const fields = dotFrame?.fields ?? [...ctx.vars.values()].map(v => ({
         name: v.name,
         type: v.type,
         fields: v.fields,
         isSlice: v.isSlice ?? false,
         doc: v.doc,
       } as FieldInfo));
-    } else if (lookupPath[0] === '$') {
-      // $var or just $ → top-level variables
-      fields = [...ctx.vars.values()].map(v => ({
-        name: v.name,
-        type: v.type,
-        fields: v.fields,
-        isSlice: v.isSlice ?? false,
-        doc: v.doc,
-      } as FieldInfo));
-    } else {
-      // Resolve arbitrary path using both stack and locals
-      const resolveResult = resolvePath(lookupPath, ctx.vars, stack, locals);
-      if (resolveResult.found && resolveResult.fields) {
-        fields = resolveResult.fields;
-      }
+
+      this.addFieldsToCompletion({ fields }, completionItems, filterPrefix, replacementRange);
+      return completionItems;
     }
 
-    // Filter and create completion items
-    return fields
-      .filter(f => f.name.toLowerCase().startsWith(filterPrefix.toLowerCase()))
-      .map(f => {
-        const item = new vscode.CompletionItem(
-          f.name,
-          f.type === 'method' ? vscode.CompletionItemKind.Method : vscode.CompletionItemKind.Field
-        );
-        item.detail = f.isSlice ? `[]${f.type}` : f.type;
-        if (f.doc) {
-          item.documentation = new vscode.MarkdownString(f.doc);
-        }
-        return item;
-      });
+    // 3b. Bare Dollar "$" -> Root Vars + Locals
+    if (lookupPath.length === 1 && lookupPath[0] === '$') {
+      this.addGlobalVariablesToCompletion(ctx.vars, completionItems, filterPrefix, replacementRange);
+      this.addLocalVariablesToCompletion(stack, locals, completionItems, filterPrefix, replacementRange);
+      return completionItems;
+    }
+
+    // 3c. Complex Path -> Resolve and show fields
+    //     e.g. "$user", "$user.Profile", ".Items"
+    const res = resolvePath(lookupPath, ctx.vars, stack, locals);
+    if (res.found && res.fields) {
+      this.addFieldsToCompletion({ fields: res.fields }, completionItems, filterPrefix, replacementRange);
+    }
+    return completionItems;
   }
 
   private findScopeAtPosition(

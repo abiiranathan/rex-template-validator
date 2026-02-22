@@ -98,7 +98,10 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.languages.registerCompletionItemProvider(
       TEMPLATE_SELECTOR,
       {
-        provideCompletionItems(document, position) {
+        // provideCompletionItems must be async so VSCode receives the resolved
+        // CompletionItem[] rather than a discarded Promise object. The original
+        // omission of async caused VSCode to silently discard all completions.
+        async provideCompletionItems(document, position) {
           if (!validator || !graphBuilder) return;
           let ctx = graphBuilder.findContextForFile(document.uri.fsPath);
           if (!ctx || ctx.renderCalls.length === 0) {
@@ -106,10 +109,10 @@ export async function activate(context: vscode.ExtensionContext) {
             if (partialCtx) ctx = partialCtx;
           }
           if (!ctx) return [];
-           return validator.getCompletionItems(document, position, ctx);
-         },
-       },
-       '.', '$'
+          return await validator.getCompletionItems(document, position, ctx);
+        },
+      },
+      '.', '$'
     )
   );
 
