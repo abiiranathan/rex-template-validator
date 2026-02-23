@@ -96,7 +96,7 @@ export interface NamedBlockEntry {
   /** 1-based column of the opening tag */
   col: number;
   /** The AST node, stored so validators can walk its children */
-  node: import('./types').TemplateNode;
+  node: TemplateNode;
 }
 
 /**

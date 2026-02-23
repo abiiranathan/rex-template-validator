@@ -158,6 +158,7 @@ export class KnowledgeGraphBuilder {
         const locations = entries
           .map(e => `${e.templatePath}:${e.line}`)
           .join(', ');
+
         namedBlockErrors.push({
           name,
           entries,

@@ -6,11 +6,8 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 )
-
-var actionPattern = regexp.MustCompile(`\{\{\s*(.+?)\s*\}\}`)
 
 // NamedTemplate stores information about defined blocks and named templates
 type NamedTemplate struct {
@@ -18,11 +15,6 @@ type NamedTemplate struct {
 	Content  string
 	FilePath string
 	LineNum  int
-}
-
-// countLines counts newlines in a string
-func countLines(s string) int {
-	return strings.Count(s, "\n")
 }
 
 // parseAllNamedTemplates extracts all define and block declarations from template files
@@ -57,69 +49,119 @@ func parseAllNamedTemplates(baseDir, templateRoot string) map[string]NamedTempla
 
 // extractNamedTemplatesFromContent finds defined templates within content
 func extractNamedTemplatesFromContent(content, templateName string, registry map[string]NamedTemplate) {
-
-	matches := actionPattern.FindAllStringSubmatchIndex(content, -1)
-
 	var activeName string
 	var startIndex int
 	var startLine int
 	depth := 0
 
-	for _, match := range matches {
-		if len(match) < 4 {
-			continue
+	lineStart := 0
+	lineNum := 1
+
+	for lineStart < len(content) {
+		lineEnd := strings.IndexByte(content[lineStart:], '\n')
+		var line string
+		if lineEnd == -1 {
+			line = content[lineStart:]
+		} else {
+			lineEnd += lineStart
+			line = content[lineStart:lineEnd]
 		}
 
-		fullActionStart := match[0]
-		fullActionEnd := match[1]
-		actionStart := match[2]
-		actionEnd := match[3]
-
-		action := strings.TrimSpace(content[actionStart:actionEnd])
-		if strings.HasPrefix(action, "/*") || strings.HasPrefix(action, "//") {
-			continue
-		}
-
-		words := strings.Fields(action)
-		if len(words) == 0 {
-			continue
-		}
-
-		first := words[0]
-
-		switch first {
-		case "if", "with", "range", "block":
-			if activeName != "" {
-				depth++
-			} else if first == "block" && len(words) >= 2 {
-				activeName = strings.Trim(words[1], `"`)
-				startIndex = fullActionEnd
-				startLine = countLines(content[:fullActionEnd]) + 1
-				depth = 1
+		cur := 0
+		for {
+			openRel := strings.Index(line[cur:], "{{")
+			if openRel == -1 {
+				break
 			}
-		case "define":
-			if activeName != "" {
-				depth++
-			} else if len(words) >= 2 {
-				activeName = strings.Trim(words[1], `"`)
-				startIndex = fullActionEnd
-				startLine = countLines(content[:fullActionEnd]) + 1
-				depth = 1
+			open := cur + openRel
+
+			closeRel := strings.Index(line[open:], "}}")
+			if closeRel == -1 {
+				break
 			}
-		case "end":
-			if activeName != "" {
-				depth--
-				if depth == 0 {
-					registry[activeName] = NamedTemplate{
-						Name:     activeName,
-						Content:  content[startIndex:fullActionStart],
-						FilePath: templateName,
-						LineNum:  startLine,
+			close := open + closeRel
+			fullActionEndRel := close + 2
+
+			// Absolute positions
+			fullActionStart := lineStart + open
+			fullActionEnd := lineStart + fullActionEndRel
+
+			// Content extraction
+			contentStart := open + 2
+			for contentStart < close {
+				r := line[contentStart]
+				if r != ' ' && r != '\t' {
+					break
+				}
+				contentStart++
+			}
+
+			contentEnd := close
+			for contentEnd > contentStart {
+				r := line[contentEnd-1]
+				if r != ' ' && r != '\t' {
+					break
+				}
+				contentEnd--
+			}
+
+			action := line[contentStart:contentEnd]
+
+			// Advance for next iteration
+			cur = fullActionEndRel
+
+			if strings.HasPrefix(action, "/*") || strings.HasPrefix(action, "//") {
+				continue
+			}
+
+			words := strings.Fields(action)
+			if len(words) == 0 {
+				continue
+			}
+
+			first := words[0]
+
+			switch first {
+			case "if", "with", "range", "block":
+				if activeName != "" {
+					depth++
+				} else if first == "block" && len(words) >= 2 {
+					activeName = strings.Trim(words[1], `"`)
+					startIndex = fullActionEnd
+					startLine = lineNum
+					depth = 1
+				}
+			case "define":
+				if activeName != "" {
+					depth++
+				} else if len(words) >= 2 {
+					activeName = strings.Trim(words[1], `"`)
+					startIndex = fullActionEnd
+					startLine = lineNum
+					depth = 1
+				}
+			case "end":
+				if activeName != "" {
+					depth--
+					if depth == 0 {
+						registry[activeName] = NamedTemplate{
+							Name:     activeName,
+							Content:  content[startIndex:fullActionStart],
+							FilePath: templateName,
+							LineNum:  startLine,
+						}
+						activeName = ""
 					}
-					activeName = ""
 				}
 			}
 		}
+
+		if lineEnd == -1 {
+			lineStart = len(content)
+		} else {
+			lineStart = lineEnd + 1
+		}
+		lineNum++
 	}
 }
 
@@ -194,22 +236,67 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 	}
 	scopeStack = append(scopeStack, rootScope)
 
-	lines := strings.Split(content, "\n")
-
 	// defineSkipDepth tracks depth inside {{ define "..." }} blocks.
 	defineSkipDepth := 0
 
-	for i, line := range lines {
-		actualLineNum := i + lineOffset
-		matches := actionPattern.FindAllStringSubmatchIndex(line, -1)
+	lineStart := 0
+	lineNum := 0
 
-		for _, match := range matches {
-			if len(match) < 4 {
-				continue
+	for lineStart < len(content) {
+		lineEnd := strings.IndexByte(content[lineStart:], '\n')
+		var line string
+		if lineEnd == -1 {
+			line = content[lineStart:]
+			// Move lineStart to end to break loop after this
+		} else {
+			lineEnd += lineStart
+			line = content[lineStart:lineEnd]
+		}
+
+		actualLineNum := lineNum + lineOffset
+		lineNum++
+
+		cur := 0
+
+		for {
+			openRel := strings.Index(line[cur:], "{{")
+			if openRel == -1 {
+				break
+			}
+			open := cur + openRel
+
+			closeRel := strings.Index(line[open:], "}}")
+			if closeRel == -1 {
+				break
+			}
+			close := open + closeRel
+			fullActionEnd := close + 2
+
+			// Mimic regex behavior: find content start/end skipping whitespace
+			contentStart := open + 2
+			for contentStart < close {
+				r := line[contentStart]
+				if r != ' ' && r != '\t' {
+					break
+				}
+				contentStart++
 			}
 
-			action := strings.TrimSpace(line[match[2]:match[3]])
-			col := match[2] + 1
+			contentEnd := close
+			for contentEnd > contentStart {
+				r := line[contentEnd-1]
+				if r != ' ' && r != '\t' {
+					break
+				}
+				contentEnd--
+			}
+
+			// action is the trimmed content
+			action := line[contentStart:contentEnd]
+			col := contentStart + 1
+
+			// Advance for next iteration
+			cur = fullActionEnd
 
 			if strings.HasPrefix(action, "/*") || strings.HasPrefix(action, "//") {
 				continue
@@ -248,12 +335,11 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 			// validates the context argument itself, so scanning here would
 			// produce duplicate errors for invalid context args like .NonExistent.
 			if first != "template" {
-				varsInAction := extractVariablesFromAction(action)
-				for _, v := range varsInAction {
+				extractVariablesFromAction(action, func(v string) {
 					if err := validateVariableInScope(v, scopeStack, varMap, actualLineNum, col, templateName); err != nil {
 						errors = append(errors, *err)
 					}
-				}
+				})
 			}
 
 			// Handle range
@@ -344,6 +430,12 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 				}
 				continue
 			}
+		}
+
+		if lineEnd == -1 {
+			lineStart = len(content)
+		} else {
+			lineStart = lineEnd + 1
 		}
 	}
 
@@ -744,49 +836,51 @@ func parseTemplateAction(action string) []string {
 }
 
 // extractVariablesFromAction extracts all valid variables from an action string.
-func extractVariablesFromAction(action string) []string {
-	var vars []string
-	var current strings.Builder
+func extractVariablesFromAction(action string, onVar func(string)) {
+	start := -1
 	inString := false
 	stringChar := rune(0)
 
-	for _, r := range action {
-		switch {
-		case !inString && (r == '"' || r == '`'):
+	for i, r := range action {
+		if inString {
+			if r == stringChar {
+				inString = false
+			}
+			continue
+		}
+
+		switch r {
+		case '"', '`':
+			if start != -1 {
+				emitVar(action[start:i], onVar)
+				start = -1
+			}
 			inString = true
 			stringChar = r
-			if current.Len() > 0 {
-				vars = append(vars, current.String())
-				current.Reset()
+
+		case ' ', '(', ')', '|', '=', ',', '+', '-', '*', '/', '!', '<', '>', '%', '&':
+			if start != -1 {
+				emitVar(action[start:i], onVar)
+				start = -1
 			}
-		case inString && r == stringChar:
-			inString = false
-			current.Reset()
-		case !inString && (r == ' ' || r == '(' || r == ')' || r == '|' || r == '=' || r == ',' || r == '+' || r == '-' || r == '*' || r == '/' || r == '!' || r == '<' || r == '>' || r == '%' || r == '&'):
-			if current.Len() > 0 {
-				vars = append(vars, current.String())
-				current.Reset()
-			}
+
 		default:
-			if !inString {
-				current.WriteRune(r)
+			if start == -1 {
+				start = i
 			}
 		}
 	}
 
-	if current.Len() > 0 && !inString {
-		vars = append(vars, current.String())
+	if start != -1 {
+		emitVar(action[start:], onVar)
 	}
+}
 
-	var validVars []string
-	for _, v := range vars {
-		v = strings.TrimSpace(v)
-		if (strings.HasPrefix(v, ".") || strings.HasPrefix(v, "$.")) && v != "." && v != "$" && !strings.HasPrefix(v, "..") {
-			validVars = append(validVars, v)
-		}
+func emitVar(v string, onVar func(string)) {
+	v = strings.TrimSpace(v)
+	if (strings.HasPrefix(v, ".") || strings.HasPrefix(v, "$.")) && v != "." && v != "$" && !strings.HasPrefix(v, "..") {
+		onVar(v)
 	}
-
-	return validVars
 }
 
 // validateContextArg checks whether a template call context expression resolves
