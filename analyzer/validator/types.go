@@ -98,6 +98,23 @@ type ScopeType struct {
 	IsMap    bool
 }
 
+// NamedBlockEntry represents a {{define}} or {{block}} found inside a template.
+type NamedBlockEntry struct {
+	Name         string `json:"name"`
+	AbsolutePath string `json:"absolutePath"`
+	TemplatePath string `json:"templatePath"`
+	Line         int    `json:"line"`
+	Col          int    `json:"col"`
+	Content      string `json:"-"`
+}
+
+// NamedBlockDuplicateError is reported when block names conflict project-wide.
+type NamedBlockDuplicateError struct {
+	Name    string            `json:"name"`
+	Entries []NamedBlockEntry `json:"entries"`
+	Message string            `json:"message"`
+}
+
 // AnalysisConfig defines the customizable function and type names for analysis
 type AnalysisConfig struct {
 	// RenderFunctionName is the name of the function/method used to render templates (default: "Render")

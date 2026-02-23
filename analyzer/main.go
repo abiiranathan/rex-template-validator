@@ -28,6 +28,12 @@ type ValidationOutput struct {
 
 	// Errors contains non-fatal analysis errors (optional).
 	Errors []string `json:"errors,omitempty"`
+
+	// NamedBlocks contains all defined blocks across the project.
+	NamedBlocks map[string][]validator.NamedBlockEntry `json:"namedBlocks"`
+
+	// NamedBlockErrors contains duplicate block declarations.
+	NamedBlockErrors []validator.NamedBlockDuplicateError `json:"namedBlockErrors"`
 }
 
 // main is the CLI entry point for the template analyzer.
@@ -60,14 +66,14 @@ func main() {
 	var output any
 
 	if *validate || *showNamedTemplates {
-		ve, namedTemplates := validator.ValidateTemplates(
+		ve, namedBlocks, namedBlockErrors := validator.ValidateTemplates(
 			result.RenderCalls,
 			templateBase,
 			*templateRoot,
 		)
 		if *showNamedTemplates {
-			keys := make([]string, 0, len(namedTemplates))
-			for k := range namedTemplates {
+			keys := make([]string, 0, len(namedBlocks))
+			for k := range namedBlocks {
 				keys = append(keys, k)
 			}
 			output = keys
@@ -78,6 +84,8 @@ func main() {
 				FuncMaps:         result.FuncMaps,
 				ValidationErrors: ve,
 				Errors:           result.Errors,
+				NamedBlocks:      namedBlocks,
+				NamedBlockErrors: namedBlockErrors,
 			}
 		}
 	} else {

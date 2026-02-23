@@ -76,6 +76,8 @@ export interface AnalysisResult {
   funcMaps?: FuncMapInfo[];
   errors: string[];
   validationErrors?: GoValidationError[];
+  namedBlocks?: Record<string, NamedBlockEntry[]>;
+  namedBlockErrors?: NamedBlockDuplicateError[];
 }
 
 // ─── Named Block Registry ──────────────────────────────────────────────────────
@@ -95,8 +97,8 @@ export interface NamedBlockEntry {
   line: number;
   /** 1-based column of the opening tag */
   col: number;
-  /** The AST node, stored so validators can walk its children */
-  node: TemplateNode;
+  /** The AST node, loaded lazily so validators can walk its children */
+  node?: TemplateNode;
 }
 
 /**

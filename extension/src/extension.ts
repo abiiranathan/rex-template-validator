@@ -154,21 +154,9 @@ export async function activate(context: vscode.ExtensionContext) {
   const tplWatcher = vscode.workspace.createFileSystemWatcher('**/*.{html,tmpl,tpl,gohtml}');
   context.subscriptions.push(
     tplWatcher,
-    tplWatcher.onDidChange(async (uri) => {
-      // A template file changed: rebuild named-block registry first (fast), then
-      // re-validate all open templates since parent/partial relationships may have changed.
-      if (graphBuilder) graphBuilder.rebuildNamedBlocks();
-      applyNamedBlockDiagnostics();
-      scheduleValidateAllOpenTemplates();
-    }),
-
-    tplWatcher.onDidCreate(() => {
-      scheduleRebuild(workspaceRoot);
-    }),
-    tplWatcher.onDidDelete(() => {
-      if (graphBuilder) graphBuilder.rebuildNamedBlocks();
-      applyNamedBlockDiagnostics();
-    })
+    tplWatcher.onDidChange(() => scheduleRebuild(workspaceRoot)),
+    tplWatcher.onDidCreate(() => scheduleRebuild(workspaceRoot)),
+    tplWatcher.onDidDelete(() => scheduleRebuild(workspaceRoot))
   );
 
   context.subscriptions.push(
@@ -181,12 +169,8 @@ export async function activate(context: vscode.ExtensionContext) {
     }),
 
     vscode.workspace.onDidSaveTextDocument((doc) => {
-      if (doc.fileName.endsWith('.go') || doc.fileName.endsWith('go.mod') || doc.fileName.endsWith('.json')) {
+      if (doc.fileName.endsWith('.go') || doc.fileName.endsWith('go.mod') || doc.fileName.endsWith('.json') || isTemplate(doc)) {
         scheduleRebuild(workspaceRoot);
-      } else if (isTemplate(doc)) {
-        if (graphBuilder) graphBuilder.rebuildNamedBlocks();
-        applyNamedBlockDiagnostics();
-        scheduleValidateAllOpenTemplates();
       }
     })
   );

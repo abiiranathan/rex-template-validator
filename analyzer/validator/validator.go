@@ -9,17 +9,9 @@ import (
 	"strings"
 )
 
-// NamedTemplate stores information about defined blocks and named templates
-type NamedTemplate struct {
-	Name     string
-	Content  string
-	FilePath string
-	LineNum  int
-}
-
 // parseAllNamedTemplates extracts all define and block declarations from template files
-func parseAllNamedTemplates(baseDir, templateRoot string) map[string]NamedTemplate {
-	registry := make(map[string]NamedTemplate)
+func parseAllNamedTemplates(baseDir, templateRoot string) (map[string][]NamedBlockEntry, []NamedBlockDuplicateError) {
+	registry := make(map[string][]NamedBlockEntry)
 	root := filepath.Join(baseDir, templateRoot)
 
 	filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
@@ -34,24 +26,39 @@ func parseAllNamedTemplates(baseDir, templateRoot string) map[string]NamedTempla
 		if err != nil {
 			rel = path
 		}
+		// Normalize rel path to use forward slashes for cross-platform TS consistency
+		rel = filepath.ToSlash(rel)
 
 		content, err := os.ReadFile(path)
 		if err != nil {
 			return nil
 		}
 
-		extractNamedTemplatesFromContent(string(content), rel, registry)
+		extractNamedTemplatesFromContent(string(content), path, rel, registry)
 		return nil
 	})
 
-	return registry
+	var errors []NamedBlockDuplicateError
+	for name, entries := range registry {
+		if len(entries) > 1 {
+			msg := fmt.Sprintf(`Duplicate named block "%s" found`, name)
+			errors = append(errors, NamedBlockDuplicateError{
+				Name:    name,
+				Entries: entries,
+				Message: msg,
+			})
+		}
+	}
+
+	return registry, errors
 }
 
 // extractNamedTemplatesFromContent finds defined templates within content
-func extractNamedTemplatesFromContent(content, templateName string, registry map[string]NamedTemplate) {
+func extractNamedTemplatesFromContent(content, absolutePath, templatePath string, registry map[string][]NamedBlockEntry) {
 	var activeName string
 	var startIndex int
 	var startLine int
+	var startCol int
 	depth := 0
 
 	lineStart := 0
@@ -129,6 +136,7 @@ func extractNamedTemplatesFromContent(content, templateName string, registry map
 					activeName = strings.Trim(words[1], `"`)
 					startIndex = fullActionEnd
 					startLine = lineNum
+					startCol = open + 1
 					depth = 1
 				}
 			case "define":
@@ -138,18 +146,21 @@ func extractNamedTemplatesFromContent(content, templateName string, registry map
 					activeName = strings.Trim(words[1], `"`)
 					startIndex = fullActionEnd
 					startLine = lineNum
+					startCol = open + 1
 					depth = 1
 				}
 			case "end":
 				if activeName != "" {
 					depth--
 					if depth == 0 {
-						registry[activeName] = NamedTemplate{
-							Name:     activeName,
-							Content:  content[startIndex:fullActionStart],
-							FilePath: templateName,
-							LineNum:  startLine,
-						}
+						registry[activeName] = append(registry[activeName], NamedBlockEntry{
+							Name:         activeName,
+							Content:      content[startIndex:fullActionStart],
+							AbsolutePath: absolutePath,
+							TemplatePath: templatePath,
+							Line:         startLine,
+							Col:          startCol,
+						})
 						activeName = ""
 					}
 				}
@@ -166,24 +177,24 @@ func extractNamedTemplatesFromContent(content, templateName string, registry map
 }
 
 // ValidateTemplates validates all templates against their render calls
-func ValidateTemplates(renderCalls []RenderCall, baseDir string, templateRoot string) ([]ValidationResult, map[string]NamedTemplate) {
-	namedTemplates := parseAllNamedTemplates(baseDir, templateRoot)
+func ValidateTemplates(renderCalls []RenderCall, baseDir string, templateRoot string) ([]ValidationResult, map[string][]NamedBlockEntry, []NamedBlockDuplicateError) {
+	namedBlocks, namedBlockErrors := parseAllNamedTemplates(baseDir, templateRoot)
 
 	var allErrors = []ValidationResult{}
 	for _, rc := range renderCalls {
 		templatePath := filepath.Join(baseDir, templateRoot, rc.Template)
-		errors := validateTemplateFile(templatePath, rc.Vars, rc.Template, baseDir, templateRoot, namedTemplates)
+		errors := validateTemplateFile(templatePath, rc.Vars, rc.Template, baseDir, templateRoot, namedBlocks)
 		for i := range errors {
 			errors[i].GoFile = rc.File
 			errors[i].GoLine = rc.Line
 		}
 		allErrors = append(allErrors, errors...)
 	}
-	return allErrors, namedTemplates
+	return allErrors, namedBlocks, namedBlockErrors
 }
 
 // validateTemplateFile validates a single template file
-func validateTemplateFile(templatePath string, vars []TemplateVar, templateName string, baseDir, templateRoot string, registry map[string]NamedTemplate) []ValidationResult {
+func validateTemplateFile(templatePath string, vars []TemplateVar, templateName string, baseDir, templateRoot string, registry map[string][]NamedBlockEntry) []ValidationResult {
 	content, err := os.ReadFile(templatePath)
 	if err != nil {
 		return []ValidationResult{{
@@ -217,7 +228,7 @@ func isFileBasedPartial(name string) bool {
 }
 
 // validateTemplateContent validates template content with proper scope tracking
-func validateTemplateContent(content string, varMap map[string]TemplateVar, templateName string, baseDir, templateRoot string, lineOffset int, registry map[string]NamedTemplate) []ValidationResult {
+func validateTemplateContent(content string, varMap map[string]TemplateVar, templateName string, baseDir, templateRoot string, lineOffset int, registry map[string][]NamedBlockEntry) []ValidationResult {
 	var errors []ValidationResult
 
 	var scopeStack []ScopeType
@@ -402,10 +413,11 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 						}
 					}
 
-					if nt, ok := registry[tmplName]; ok {
+					if entries, ok := registry[tmplName]; ok && len(entries) > 0 {
+						nt := entries[0]
 						partialScope := resolvePartialScope(contextArg, scopeStack, varMap)
 						partialVarMap := buildPartialVarMap(contextArg, partialScope, scopeStack, varMap)
-						partialErrors := validateTemplateContent(nt.Content, partialVarMap, nt.FilePath, baseDir, templateRoot, nt.LineNum, registry)
+						partialErrors := validateTemplateContent(nt.Content, partialVarMap, nt.TemplatePath, baseDir, templateRoot, nt.Line, registry)
 						errors = append(errors, partialErrors...)
 
 					} else if isFileBasedPartial(tmplName) {
@@ -894,7 +906,7 @@ func validateContextArg(contextArg string, scopeStack []ScopeType, varMap map[st
 }
 
 // ValidateTemplateFileStr exposes internal method for testing
-func ValidateTemplateFileStr(content string, vars []TemplateVar, templateName string, baseDir, templateRoot string, registry map[string]NamedTemplate) []ValidationResult {
+func ValidateTemplateFileStr(content string, vars []TemplateVar, templateName string, baseDir, templateRoot string, registry map[string][]NamedBlockEntry) []ValidationResult {
 	varMap := make(map[string]TemplateVar)
 	for _, v := range vars {
 		varMap[v.Name] = v
@@ -903,11 +915,11 @@ func ValidateTemplateFileStr(content string, vars []TemplateVar, templateName st
 }
 
 // ParseAllNamedTemplates exposes for testing
-func ParseAllNamedTemplates(baseDir, templateRoot string) map[string]NamedTemplate {
+func ParseAllNamedTemplates(baseDir, templateRoot string) (map[string][]NamedBlockEntry, []NamedBlockDuplicateError) {
 	return parseAllNamedTemplates(baseDir, templateRoot)
 }
 
 // ExtractNamedTemplatesFromContent exposes for testing
-func ExtractNamedTemplatesFromContent(content, templateName string, registry map[string]NamedTemplate) {
-	extractNamedTemplatesFromContent(content, templateName, registry)
+func ExtractNamedTemplatesFromContent(content, absolutePath, templatePath string, registry map[string][]NamedBlockEntry) {
+	extractNamedTemplatesFromContent(content, absolutePath, templatePath, registry)
 }

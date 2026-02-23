@@ -15,10 +15,12 @@ func TestExtractNamedTemplates(t *testing.T) {
 		
 		{{ block "footer" .Data }}<footer>{{ .Copyright }}</footer>{{ end }}
 	`
-	reg := make(map[string]NamedTemplate)
-	extractNamedTemplatesFromContent(content, "test.html", reg)
-	for k, v := range reg {
-		t.Logf("Found %s at line %d:\n%q", k, v.LineNum, v.Content)
+	reg := make(map[string][]NamedBlockEntry)
+	extractNamedTemplatesFromContent(content, "/fake/path/test.html", "test.html", reg)
+	for k, entries := range reg {
+		for _, v := range entries {
+			t.Logf("Found %s at line %d:\n%q", k, v.Line, v.Content)
+		}
 	}
 	if len(reg) != 2 {
 		t.Errorf("Expected 2 templates, got %d", len(reg))

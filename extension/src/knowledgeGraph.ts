@@ -78,8 +78,43 @@ export class KnowledgeGraphBuilder {
       }
     }
 
-    // Build the cross-file named block registry
-    const { namedBlocks, namedBlockErrors } = this.buildNamedBlockRegistry(templates, templateBase);
+    // Build the cross-file named block registry directly from the Go analyzer's output
+    const namedBlocks: NamedBlockRegistry = new Map();
+    if (analysisResult.namedBlocks) {
+      for (const [name, entries] of Object.entries(analysisResult.namedBlocks)) {
+        const fullEntries: NamedBlockEntry[] = entries.map(e => ({
+          ...e,
+          get node() {
+            // Lazy-loading mechanism to read AST of the define block only on hover queries
+            if (!(this as any)._node) {
+              try {
+                const openDoc = vscode.workspace.textDocuments.find(d => d.uri.fsPath === e.absolutePath);
+                const content = openDoc ? openDoc.getText() : fs.readFileSync(e.absolutePath, 'utf8');
+                const parser = new TemplateParser();
+                const nodes = parser.parse(content);
+                const findNode = (ns: TemplateNode[]): TemplateNode | undefined => {
+                  for (const n of ns) {
+                    if ((n.kind === 'define' || n.kind === 'block') && n.blockName === name) return n;
+                    if (n.children) {
+                      const f = findNode(n.children);
+                      if (f) return f;
+                    }
+                  }
+                  return undefined;
+                };
+                (this as any)._node = findNode(nodes) || { kind: 'define', path: [], rawText: '', line: e.line, col: e.col, blockName: name };
+              } catch {
+                (this as any)._node = { kind: 'define', path: [], rawText: '', line: e.line, col: e.col, blockName: name };
+              }
+            }
+            return (this as any)._node;
+          }
+        }));
+        namedBlocks.set(name, fullEntries);
+      }
+    }
+
+    const namedBlockErrors = analysisResult.namedBlockErrors ?? [];
 
     const funcMaps = new Map<string, FuncMapInfo>();
     for (const fm of analysisResult.funcMaps ?? []) {
@@ -110,123 +145,6 @@ export class KnowledgeGraphBuilder {
     return this.graph;
   }
 
-  /**
-   * Walk all template files on disk (from templateBase) and collect every
-   * {{ define "name" }} and {{ block "name" ... }} declaration into a
-   * cross-file registry.  Also detects duplicates.
-   */
-  private buildNamedBlockRegistry(
-    templates: Map<string, TemplateContext>,
-    templateBase: string
-  ): { namedBlocks: NamedBlockRegistry; namedBlockErrors: NamedBlockDuplicateError[] } {
-    const namedBlocks: NamedBlockRegistry = new Map();
-    const parser = new TemplateParser();
-
-    // Gather all absolute paths to scan — include both known render-call targets
-    // and any additional template files discovered on disk.
-    const toScan = new Set<string>();
-
-    for (const ctx of templates.values()) {
-      if (ctx.absolutePath) toScan.add(path.normalize(ctx.absolutePath));
-    }
-
-    // Also walk the template base directory for any files not in the render graph
-    // (e.g. pure partial files that are only {{ define }}'d).
-    this.walkTemplateDir(templateBase, toScan);
-
-    for (const absPath of toScan) {
-      if (!fs.existsSync(absPath)) continue;
-
-      let content: string;
-      try {
-        // Prefer the in-editor version if open.
-        const openDoc = vscode.workspace.textDocuments.find(d => d.uri.fsPath === absPath);
-        content = openDoc ? openDoc.getText() : fs.readFileSync(absPath, 'utf8');
-      } catch {
-        continue;
-      }
-
-      const logicalPath = path.relative(templateBase, absPath).replace(/\\/g, '/');
-      const nodes = parser.parse(content);
-      this.collectNamedBlocksFromNodes(nodes, absPath, logicalPath, namedBlocks);
-    }
-
-    // Detect duplicates
-    const namedBlockErrors: NamedBlockDuplicateError[] = [];
-    for (const [name, entries] of namedBlocks) {
-      if (entries.length > 1) {
-        const locations = entries
-          .map(e => `${e.templatePath}:${e.line}`)
-          .join(', ');
-
-        namedBlockErrors.push({
-          name,
-          entries,
-          message: `Duplicate named block "${name}" found in: ${locations}`,
-        });
-        this.outputChannel.appendLine(
-          `[KnowledgeGraph] ERROR: Duplicate named block "${name}" declared in: ${locations}`
-        );
-      }
-    }
-
-    return { namedBlocks, namedBlockErrors };
-  }
-
-  /**
-   * Recursively walk a directory and add all template files (.html, .tmpl,
-   * .gohtml, .tpl, .htm) to the toScan set.
-   */
-  private walkTemplateDir(dir: string, toScan: Set<string>) {
-    if (!fs.existsSync(dir)) return;
-    try {
-      const entries = fs.readdirSync(dir, { withFileTypes: true });
-      for (const entry of entries) {
-        const full = path.normalize(path.join(dir, entry.name));
-        if (entry.isDirectory()) {
-          this.walkTemplateDir(full, toScan);
-        } else if (isTemplateFile(entry.name)) {
-          toScan.add(full);
-        }
-      }
-    } catch {
-      // permission errors etc — skip silently
-    }
-  }
-
-  /**
-   * Walk an AST and register every `define` and `block` node.
-   * We descend into children so nested defines are found too (though unusual).
-   */
-  private collectNamedBlocksFromNodes(
-    nodes: TemplateNode[],
-    absPath: string,
-    logicalPath: string,
-    registry: NamedBlockRegistry
-  ) {
-    for (const node of nodes) {
-      if ((node.kind === 'define' || node.kind === 'block') && node.blockName) {
-        const entry: NamedBlockEntry = {
-          name: node.blockName,
-          absolutePath: absPath,
-          templatePath: logicalPath,
-          line: node.line,
-          col: node.col,
-          node,
-        };
-
-        const existing = registry.get(node.blockName) ?? [];
-        existing.push(entry);
-        registry.set(node.blockName, existing);
-      }
-
-      // Recurse into children (handles nested blocks / defines inside range etc.)
-      if (node.children) {
-        this.collectNamedBlocksFromNodes(node.children, absPath, logicalPath, registry);
-      }
-    }
-  }
-
   getGraph(): KnowledgeGraph {
     return this.graph;
   }
@@ -255,19 +173,6 @@ export class KnowledgeGraphBuilder {
    */
   getAllDuplicateErrors(): NamedBlockDuplicateError[] {
     return this.graph.namedBlockErrors;
-  }
-
-  /**
-   * Rebuild only the named block registry (fast path: called when a template
-   * file changes without needing a full Go re-analysis).
-   */
-  rebuildNamedBlocks() {
-    const templateBase = this.getTemplateBase();
-    const { namedBlocks, namedBlockErrors } = this.buildNamedBlockRegistry(
-      this.graph.templates,
-      templateBase
-    );
-    this.graph = { ...this.graph, namedBlocks, namedBlockErrors };
   }
 
   /**
@@ -591,10 +496,4 @@ function maxFieldDepth(fields: FieldInfo[]): number {
     if (d > max) max = d;
   }
   return max;
-}
-
-function isTemplateFile(name: string): boolean {
-  return ['.html', '.tmpl', '.gohtml', '.tpl', '.htm'].some(ext =>
-    name.toLowerCase().endsWith(ext)
-  );
 }

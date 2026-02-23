@@ -978,7 +978,7 @@ export class TemplateValidator {
                 : scopeStack;
         }
 
-        if (!entry.node.children || entry.node.children.length === 0) return;
+        if (!entry?.node?.children || entry?.node?.children.length === 0) return;
 
         if (entry.absolutePath === filePath) {
             const blockErrors: ValidationError[] = [];
