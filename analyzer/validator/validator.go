@@ -10,6 +10,8 @@ import (
 	"strings"
 )
 
+var actionPattern = regexp.MustCompile(`\{\{\s*(.+?)\s*\}\}`)
+
 // NamedTemplate stores information about defined blocks and named templates
 type NamedTemplate struct {
 	Name     string
@@ -55,7 +57,7 @@ func parseAllNamedTemplates(baseDir, templateRoot string) map[string]NamedTempla
 
 // extractNamedTemplatesFromContent finds defined templates within content
 func extractNamedTemplatesFromContent(content, templateName string, registry map[string]NamedTemplate) {
-	actionPattern := regexp.MustCompile(`\{\{\s*(.+?)\s*\}\}`)
+
 	matches := actionPattern.FindAllStringSubmatchIndex(content, -1)
 
 	var activeName string
@@ -122,7 +124,7 @@ func extractNamedTemplatesFromContent(content, templateName string, registry map
 }
 
 // ValidateTemplates validates all templates against their render calls
-func ValidateTemplates(renderCalls []RenderCall, baseDir string, templateRoot string) []ValidationResult {
+func ValidateTemplates(renderCalls []RenderCall, baseDir string, templateRoot string) ([]ValidationResult, map[string]NamedTemplate) {
 	namedTemplates := parseAllNamedTemplates(baseDir, templateRoot)
 
 	var allErrors = []ValidationResult{}
@@ -135,7 +137,7 @@ func ValidateTemplates(renderCalls []RenderCall, baseDir string, templateRoot st
 		}
 		allErrors = append(allErrors, errors...)
 	}
-	return allErrors
+	return allErrors, namedTemplates
 }
 
 // validateTemplateFile validates a single template file
@@ -192,7 +194,6 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 	}
 	scopeStack = append(scopeStack, rootScope)
 
-	actionPattern := regexp.MustCompile(`\{\{\s*(.+?)\s*\}\}`)
 	lines := strings.Split(content, "\n")
 
 	// defineSkipDepth tracks depth inside {{ define "..." }} blocks.
