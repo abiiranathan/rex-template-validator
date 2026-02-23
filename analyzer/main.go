@@ -39,7 +39,7 @@ func main() {
 	validate := flag.Bool("validate", false, "Validate templates against render calls")
 	contextFile := flag.String("context-file", "", "Path to JSON file with additional context variables")
 	compress := flag.Bool("compress", false, "Output gzip-compressed JSON")
-	namedTemplates := flag.Bool("named-templates", false, "Return all named template as JSON")
+	showNamedTemplates := flag.Bool("named-templates", false, "Return all named template as JSON")
 	flag.Parse()
 
 	// Resolve absolute paths
@@ -59,15 +59,15 @@ func main() {
 	// Prepare output payload
 	var output any
 
-	if *validate || *namedTemplates {
-		ve, namdedTemplates := validator.ValidateTemplates(
+	if *validate || *showNamedTemplates {
+		ve, namedTemplates := validator.ValidateTemplates(
 			result.RenderCalls,
 			templateBase,
 			*templateRoot,
 		)
-		if *namedTemplates {
-			keys := make([]string, 0, len(namdedTemplates))
-			for k := range namdedTemplates {
+		if *showNamedTemplates {
+			keys := make([]string, 0, len(namedTemplates))
+			for k := range namedTemplates {
 				keys = append(keys, k)
 			}
 			output = keys
