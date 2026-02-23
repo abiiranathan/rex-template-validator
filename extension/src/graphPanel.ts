@@ -50,8 +50,6 @@ export class KnowledgeGraphPanel {
   }
 
   private shortType(typeStr: string): string {
-    // "github.com/example/pkg.TypeName" -> "TypeName"
-    // "*github.com/example/pkg.TypeName" -> "*TypeName"
     const prefix = typeStr.startsWith('*') ? '*' : '';
     const base = typeStr.replace(/^\*/, '');
     const parts = base.split('.');
@@ -59,53 +57,95 @@ export class KnowledgeGraphPanel {
   }
 
   private buildHTML(graph: KnowledgeGraph): string {
-    const nodes: { id: string; label: string; group: string }[] = [];
-    const edges: { from: string; to: string; label?: string }[] = [];
+    const nodes: { id: string; label: string; group: string; level?: number }[] = [];
+    const edges: { from: string; to: string; label?: string; arrows?: string }[] = [];
 
     for (const [tplPath, ctx] of graph.templates) {
       const tplId = `tpl:${tplPath}`;
+      const tplName = tplPath.split('/').slice(-2).join('/');
+
       nodes.push({
         id: tplId,
-        label: tplPath.split('/').slice(-2).join('/'),
+        label: tplName,
         group: 'template',
+        level: 1,
       });
 
-      for (const [varName, v] of ctx.vars) {
-        const varId = `var:${tplPath}:${varName}`;
-        nodes.push({
-          id: varId,
-          label: `${varName}\n(${this.shortType(v.type)})`,
-          group: 'variable',
-        });
-        edges.push({ from: tplId, to: varId });
-
-        // Show fields
-        if (v.fields) {
-          for (const f of v.fields.slice(0, 8)) {
-            const fId = `field:${tplPath}:${varName}:${f.name}`;
-            nodes.push({
-              id: fId,
-              label: `${f.name}\n(${this.shortType(f.type)})`,
-              group: 'field',
-            });
-            edges.push({ from: varId, to: fId, label: '' });
-          }
-        }
-      }
-
-      // Go source -> template edges
+      // Add Go source files
       for (const rc of ctx.renderCalls) {
         const srcId = `src:${rc.file}:${rc.line}`;
         const existingNode = nodes.find((n) => n.id === srcId);
+
         if (!existingNode) {
           const shortFile = rc.file.split('/').slice(-2).join('/');
           nodes.push({
             id: srcId,
-            label: `${shortFile}\nL${rc.line}`,
+            label: `${shortFile}:${rc.line}`,
             group: 'gofile',
+            level: 0,
           });
         }
-        edges.push({ from: srcId, to: tplId, label: 'Render()' });
+
+        edges.push({
+          from: srcId,
+          to: tplId,
+          label: 'renders',
+          arrows: 'to'
+        });
+      }
+
+      // Add variables
+      for (const [varName, v] of ctx.vars) {
+        const varId = `var:${tplPath}:${varName}`;
+        nodes.push({
+          id: varId,
+          label: `${varName}: ${this.shortType(v.type)}`,
+          group: 'variable',
+          level: 2,
+        });
+
+        edges.push({
+          from: tplId,
+          to: varId,
+          arrows: 'to'
+        });
+
+        // Add fields (limit to prevent overcrowding)
+        if (v.fields && v.fields.length > 0) {
+          const fieldsToShow = v.fields.slice(0, 6);
+
+          for (const f of fieldsToShow) {
+            const fId = `field:${tplPath}:${varName}:${f.name}`;
+            nodes.push({
+              id: fId,
+              label: `${f.name}: ${this.shortType(f.type)}`,
+              group: 'field',
+              level: 3,
+            });
+
+            edges.push({
+              from: varId,
+              to: fId,
+              arrows: 'to'
+            });
+          }
+
+          // Add indicator for more fields
+          if (v.fields.length > 6) {
+            const moreId = `more:${tplPath}:${varName}`;
+            nodes.push({
+              id: moreId,
+              label: `+${v.fields.length - 6} more fields`,
+              group: 'more',
+              level: 3,
+            });
+            edges.push({
+              from: varId,
+              to: moreId,
+              arrows: 'to'
+            });
+          }
+        }
       }
     }
 
@@ -113,405 +153,483 @@ export class KnowledgeGraphPanel {
     const edgesJson = JSON.stringify(edges);
     const analyzedAt = graph.analyzedAt.toLocaleTimeString();
 
+    const stats = {
+      templates: graph.templates.size,
+      handlers: new Set(Array.from(graph.templates.values()).flatMap(ctx => ctx.renderCalls.map(rc => rc.file))).size,
+      variables: Array.from(graph.templates.values()).reduce((sum, ctx) => sum + ctx.vars.size, 0),
+    };
+
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<title>Rex Template Knowledge Graph</title>
-<style>
-  :root {
-    --bg: #0f1117;
-    --surface: #1a1d27;
-    --border: #2a2d3a;
-    --accent: #6c63ff;
-    --green: #00d9a3;
-    --yellow: #ffd166;
-    --red: #ef476f;
-    --text: #e2e8f0;
-    --muted: #64748b;
-    --font: 'Fira Code', 'Cascadia Code', monospace;
-  }
-
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-
-  body {
-    background: var(--bg);
-    color: var(--text);
-    font-family: var(--font);
-    height: 100vh;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-  }
-
-  header {
-    padding: 12px 20px;
-    background: var(--surface);
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    align-items: center;
-    gap: 16px;
-  }
-
-  header h1 {
-    font-size: 13px;
-    font-weight: 600;
-    color: var(--accent);
-    letter-spacing: 0.05em;
-    text-transform: uppercase;
-  }
-
-  .badge {
-    font-size: 11px;
-    padding: 2px 8px;
-    border-radius: 4px;
-    background: rgba(108,99,255,0.15);
-    color: var(--accent);
-    border: 1px solid rgba(108,99,255,0.3);
-  }
-
-  .time {
-    margin-left: auto;
-    font-size: 11px;
-    color: var(--muted);
-  }
-
-  .legend {
-    display: flex;
-    gap: 16px;
-    padding: 8px 20px;
-    background: var(--surface);
-    border-bottom: 1px solid var(--border);
-    font-size: 11px;
-  }
-
-  .legend-item {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    color: var(--muted);
-  }
-
-  .dot {
-    width: 10px; height: 10px;
-    border-radius: 50%;
-  }
-
-  .dot.template { background: var(--accent); }
-  .dot.variable { background: var(--green); }
-  .dot.field    { background: var(--yellow); }
-  .dot.gofile   { background: #ff6b9d; }
-
-  #graph-container {
-    flex: 1;
-    position: relative;
-    overflow: hidden;
-  }
-
-  canvas {
-    width: 100%;
-    height: 100%;
-  }
-</style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Knowledge Graph</title>
+  <script src="https://unpkg.com/vis-network@9.1.2/dist/vis-network.min.js"></script>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    
+    body {
+      font-family: var(--vscode-font-family);
+      color: var(--vscode-foreground);
+      background: var(--vscode-editor-background);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    
+    .header {
+      padding: 16px 20px;
+      background: var(--vscode-sideBar-background);
+      border-bottom: 1px solid var(--vscode-panel-border);
+      flex-shrink: 0;
+    }
+    
+    .header h1 {
+      font-size: 16px;
+      font-weight: 600;
+      margin-bottom: 8px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    
+    .header h1::before {
+      content: '⬡';
+      color: var(--vscode-textLink-foreground);
+      font-size: 20px;
+    }
+    
+    .stats {
+      display: flex;
+      gap: 20px;
+      font-size: 12px;
+      color: var(--vscode-descriptionForeground);
+      margin-bottom: 8px;
+    }
+    
+    .stat-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    
+    .stat-value {
+      font-weight: 600;
+      color: var(--vscode-foreground);
+    }
+    
+    .controls {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    
+    .control-group {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    
+    .control-group label {
+      font-size: 11px;
+      color: var(--vscode-descriptionForeground);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    
+    select, button {
+      background: var(--vscode-dropdown-background);
+      color: var(--vscode-dropdown-foreground);
+      border: 1px solid var(--vscode-dropdown-border);
+      padding: 4px 8px;
+      font-size: 12px;
+      border-radius: 2px;
+      cursor: pointer;
+    }
+    
+    button:hover {
+      background: var(--vscode-button-hoverBackground);
+    }
+    
+    #graph-container {
+      flex: 1;
+      position: relative;
+      overflow: hidden;
+    }
+    
+    #network {
+      width: 100%;
+      height: 100%;
+    }
+    
+    .empty-state {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      color: var(--vscode-descriptionForeground);
+      text-align: center;
+      padding: 40px;
+    }
+    
+    .empty-state-icon {
+      font-size: 48px;
+      margin-bottom: 16px;
+      opacity: 0.5;
+    }
+    
+    .empty-state h2 {
+      font-size: 14px;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+    
+    .empty-state p {
+      font-size: 12px;
+      max-width: 300px;
+    }
+    
+    .legend {
+      position: absolute;
+      bottom: 16px;
+      right: 16px;
+      background: var(--vscode-sideBar-background);
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: 4px;
+      padding: 12px;
+      font-size: 11px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+    }
+    
+    .legend-title {
+      font-weight: 600;
+      margin-bottom: 8px;
+      color: var(--vscode-foreground);
+    }
+    
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 4px;
+    }
+    
+    .legend-color {
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    
+    .info-panel {
+      position: absolute;
+      top: 16px;
+      left: 16px;
+      background: var(--vscode-sideBar-background);
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: 4px;
+      padding: 12px;
+      max-width: 300px;
+      display: none;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+    }
+    
+    .info-panel.visible {
+      display: block;
+    }
+    
+    .info-panel h3 {
+      font-size: 12px;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+    
+    .info-panel p {
+      font-size: 11px;
+      color: var(--vscode-descriptionForeground);
+      margin-bottom: 4px;
+    }
+  </style>
 </head>
 <body>
-<header>
-  <h1>⬡ Rex Template Knowledge Graph</h1>
-  <span class="badge">${nodes.length} nodes · ${edges.length} edges</span>
-  <span class="time">Analyzed at ${analyzedAt}</span>
-</header>
-<div class="legend">
-  <div class="legend-item"><div class="dot gofile"></div> Go Handler</div>
-  <div class="legend-item"><div class="dot template"></div> Template</div>
-  <div class="legend-item"><div class="dot variable"></div> Variable</div>
-  <div class="legend-item"><div class="dot field"></div> Field</div>
-</div>
-<div id="graph-container">
-  ${nodes.length === 0 ? `
-    <div class="no-data">
-      <div class="icon">🔍</div>
-      <div>No render calls found. Rebuild the index first.</div>
-    </div>` : '<canvas id="canvas"></canvas>'}
-  <div class="tooltip" id="tooltip"></div>
-</div>
-
-<script>
-const RAW_NODES = ${nodesJson};
-const RAW_EDGES = ${edgesJson};
-
-function log(msg) {
-    console.log(msg);
-}
-
-if (RAW_NODES.length > 0) {
-  const canvas = document.getElementById('canvas');
-  const tooltip = document.getElementById('tooltip');
-  const container = document.getElementById('graph-container');
-  const ctx = canvas.getContext('2d');
-
-  const COLORS = {
-    template: '#6c63ff',
-    variable: '#00d9a3',
-    field: '#ffd166',
-    gofile: '#ff6b9d',
-  };
-
-  let width = 0, height = 0;
-  let nodes = [], edges = [];
-  let transform = { x: 0, y: 0, scale: 1 };
-  let dragging = null, panning = false, lastMouse = null;
-  let animFrame;
-
-  function resize() {
-    if (!container) return;
-    width = canvas.width = container.clientWidth;
-    height = canvas.height = container.clientHeight;
-    log(\`Size: \${width}x\${height} | Nodes: \${nodes.length}\`);
+  <div class="header">
+    <h1>Rex Template Knowledge Graph</h1>
     
-    // Center the graph if offset
-    transform.x = width / 2;
-    transform.y = height / 2;
-    // We render relative to center (0,0 is center)
-  }
-
-  function initNodes() {
-    // Need dimensions to place initially
-    if (width === 0 || height === 0) return;
-
-    const angleStep = (2 * Math.PI) / Math.max(RAW_NODES.length, 1);
-    const radius = Math.min(width, height) * 0.35;
+    <div class="stats">
+      <div class="stat-item">
+        <span class="stat-value">${stats.templates}</span>
+        <span>templates</span>
+      </div>
+      <div class="stat-item">
+        <span class="stat-value">${stats.handlers}</span>
+        <span>handlers</span>
+      </div>
+      <div class="stat-item">
+        <span class="stat-value">${stats.variables}</span>
+        <span>variables</span>
+      </div>
+      <div class="stat-item">
+        <span>•</span>
+        <span>Updated ${analyzedAt}</span>
+      </div>
+    </div>
     
-    nodes = RAW_NODES.map((n, i) => ({
-      ...n,
-      // Initialize around (0,0) which we will center with transform
-      x: radius * Math.cos(i * angleStep),
-      y: radius * Math.sin(i * angleStep),
-      vx: 0, vy: 0,
-    }));
-    
-    edges = RAW_EDGES.map(e => ({
-      ...e,
-      source: nodes.find(n => n.id === e.from),
-      target: nodes.find(n => n.id === e.to),
-    })).filter(e => e.source && e.target);
-    
-    log(\`Initialized \${nodes.length} nodes\`);
-  }
-
-  // Force-directed layout
-  function tick() {
-    const repulse = 5000; // Stronger repulsion
-    const attract = 0.05;
-
-    // Repulsion
-    for (let i = 0; i < nodes.length; i++) {
-      for (let j = i + 1; j < nodes.length; j++) {
-        const a = nodes[i], b = nodes[j];
-        let dx = b.x - a.x;
-        let dy = b.y - a.y;
-        let dist = Math.sqrt(dx*dx + dy*dy);
-        
-        // Jitter if overlapping
-        if (dist < 0.1) {
-            dx = (Math.random() - 0.5);
-            dy = (Math.random() - 0.5);
-            dist = Math.sqrt(dx*dx + dy*dy) || 1;
-        }
-        
-        const force = repulse / (dist * dist);
-        a.vx -= force * dx / dist;
-        a.vy -= force * dy / dist;
-        b.vx += force * dx / dist;
-        b.vy += force * dy / dist;
-      }
-    }
-
-    // Attraction along edges
-    for (const e of edges) {
-      if (!e.source || !e.target) continue;
-      const dx = e.target.x - e.source.x;
-      const dy = e.target.y - e.source.y;
-      const dist = Math.sqrt(dx*dx + dy*dy) || 1;
-      const force = attract * (dist - 100);
-      e.source.vx += force * dx / dist;
-      e.source.vy += force * dy / dist;
-      e.target.vx -= force * dx / dist;
-      e.target.vy -= force * dy / dist;
-    }
-    
-    // Center gravity (pull to 0,0)
-    for (const n of nodes) {
-        const dist = Math.sqrt(n.x*n.x + n.y*n.y) || 1;
-        const force = 0.01 * dist; // Weak pull to center
-        n.vx -= force * n.x / dist;
-        n.vy -= force * n.y / dist;
-    }
-
-    // Damping + integrate
-    for (const n of nodes) {
-      n.vx *= 0.85; n.vy *= 0.85;
-      n.x += n.vx; n.y += n.vy;
-    }
-  }
-
-  function draw() {
-    try {
-        ctx.clearRect(0, 0, width, height);
-        
-        // Debug border
-        ctx.strokeStyle = '#333';
-        ctx.lineWidth = 1;
-        ctx.strokeRect(0, 0, width, height);
-
-        ctx.save();
-        // Move origin to center + transform offset
-        ctx.translate(transform.x, transform.y);
-        ctx.scale(transform.scale, transform.scale);
-
-        // Edges
-        ctx.strokeStyle = 'rgba(100,116,139,0.35)';
-        ctx.lineWidth = 1;
-        for (const e of edges) {
-          if (!e.source || !e.target) continue;
-          ctx.beginPath();
-          ctx.moveTo(e.source.x, e.source.y);
-          ctx.lineTo(e.target.x, e.target.y);
-          ctx.stroke();
-        }
-
-        // Nodes
-        for (const n of nodes) {
-          const r = n.group === 'template' ? 28 : n.group === 'gofile' ? 22 : 18;
-          const color = COLORS[n.group] || '#888';
-
-          // Glow
-          const grd = ctx.createRadialGradient(n.x, n.y, 0, n.x, n.y, r + 8);
-          grd.addColorStop(0, color + '33');
-          grd.addColorStop(1, 'transparent');
-          ctx.beginPath();
-          ctx.arc(n.x, n.y, r + 8, 0, Math.PI * 2);
-          ctx.fillStyle = grd;
-          ctx.fill();
-
-          // Circle
-          ctx.beginPath();
-          ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
-          ctx.fillStyle = '#1a1d27';
-          ctx.fill();
-          ctx.strokeStyle = color;
-          ctx.lineWidth = 2;
-          ctx.stroke();
-
-          // Label
-          ctx.fillStyle = color;
-          ctx.font = '9px Fira Code, monospace';
-          ctx.textAlign = 'center';
-          ctx.textBaseline = 'middle';
-          const lines = n.label.split('\\n');
-          lines.forEach((line, i) => {
-            ctx.fillText(line, n.x, n.y + (i - (lines.length-1)/2) * 11);
-          });
-        }
-
-        ctx.restore();
-    } catch(e) {
-        log('Draw error: ' + e);
-    }
-  }
-
-  function loop() {
-    tick();
-    draw();
-    animFrame = requestAnimationFrame(loop);
-  }
-
-  // Mouse interaction
-  function screenToWorld(x, y) {
-    return {
-      x: (x - transform.x) / transform.scale,
-      y: (y - transform.y) / transform.scale,
-    };
-  }
-
-  function nodeAt(wx, wy) {
-    for (const n of nodes) {
-      const r = n.group === 'template' ? 28 : 20;
-      const dx = n.x - wx, dy = n.y - wy;
-      if (dx*dx + dy*dy <= r*r) return n;
-    }
-    return null;
-  }
-
-  canvas.addEventListener('mousedown', e => {
-    const w = screenToWorld(e.offsetX, e.offsetY);
-    const n = nodeAt(w.x, w.y);
-    if (n) { dragging = n; }
-    else { panning = true; lastMouse = { x: e.offsetX, y: e.offsetY }; }
-  });
-
-  canvas.addEventListener('mousemove', e => {
-    if (dragging) {
-      const w = screenToWorld(e.offsetX, e.offsetY);
-      dragging.x = w.x; dragging.y = w.y;
-      dragging.vx = 0; dragging.vy = 0;
-    } else if (panning && lastMouse) {
-      transform.x += e.offsetX - lastMouse.x;
-      transform.y += e.offsetY - lastMouse.y;
-      lastMouse = { x: e.offsetX, y: e.offsetY };
-    } else {
-      const w = screenToWorld(e.offsetX, e.offsetY);
-      const n = nodeAt(w.x, w.y);
-      if (n) {
-        tooltip.style.display = 'block';
-        tooltip.style.left = (e.offsetX + 12) + 'px';
-        tooltip.style.top = (e.offsetY - 8) + 'px';
-        tooltip.textContent = n.id;
-      } else {
-        tooltip.style.display = 'none';
-      }
-    }
-  });
-
-  canvas.addEventListener('mouseup', () => { dragging = null; panning = false; lastMouse = null; });
-  canvas.addEventListener('mouseleave', () => { dragging = null; panning = false; tooltip.style.display = 'none'; });
-
-  canvas.addEventListener('wheel', e => {
-    e.preventDefault();
-    const factor = e.deltaY > 0 ? 0.9 : 1.1;
-    // Zoom towards cursor (cx, cy)
-    // transform.x and y are translation.
-    // screenX = worldX * scale + transX
-    // newScale = scale * factor
-    // transX' = cx - (cx - transX) * factor
-    const cx = e.offsetX, cy = e.offsetY;
-    transform.x = cx - factor * (cx - transform.x);
-    transform.y = cy - factor * (cy - transform.y);
-    transform.scale *= factor;
-  }, { passive: false });
-
-  window.addEventListener('resize', () => {
-      resize();
-      // If we haven't initialized nodes yet (because width was 0), do it now
-      if (nodes.length === 0 && width > 0) {
-          initNodes();
-      }
-  });
+    <div class="controls">
+      <div class="control-group">
+        <label>Layout:</label>
+        <select id="layout-select">
+          <option value="hierarchical">Hierarchical</option>
+          <option value="force">Force-directed</option>
+          <option value="circular">Circular</option>
+        </select>
+      </div>
+      
+      <div class="control-group">
+        <label>Direction:</label>
+        <select id="direction-select">
+          <option value="UD">Top → Down</option>
+          <option value="LR">Left → Right</option>
+          <option value="DU">Bottom → Up</option>
+          <option value="RL">Right → Left</option>
+        </select>
+      </div>
+      
+      <button id="fit-btn">Fit to Screen</button>
+      <button id="reset-btn">Reset View</button>
+    </div>
+  </div>
   
-  if (window.ResizeObserver) {
-    const ro = new ResizeObserver(() => {
-        resize();
-        if (nodes.length === 0 && width > 0) {
-             initNodes();
-        }
-    });
-    ro.observe(container);
-  }
+  <div id="graph-container">
+    ${nodes.length === 0 ? `
+      <div class="empty-state">
+        <div class="empty-state-icon">🔍</div>
+        <h2>No render calls found</h2>
+        <p>Rebuild the index to analyze your templates and handler relationships.</p>
+      </div>
+    ` : `
+      <div id="network"></div>
+      
+      <div id="info-panel" class="info-panel">
+        <h3 id="info-title">Select a node</h3>
+        <div id="info-content"></div>
+      </div>
+      
+      <div class="legend">
+        <div class="legend-title">Legend</div>
+        <div class="legend-item">
+          <div class="legend-color" style="background: #4CAF50;"></div>
+          <span>Go Handler</span>
+        </div>
+        <div class="legend-item">
+          <div class="legend-color" style="background: #2196F3;"></div>
+          <span>Template</span>
+        </div>
+        <div class="legend-item">
+          <div class="legend-color" style="background: #FF9800;"></div>
+          <span>Variable</span>
+        </div>
+        <div class="legend-item">
+          <div class="legend-color" style="background: #9C27B0;"></div>
+          <span>Field</span>
+        </div>
+      </div>
+    `}
+  </div>
 
-  resize();
-  initNodes();
-  loop();
-}
-</script>
+  <script>
+    (function() {
+      const nodes = ${nodesJson};
+      const edges = ${edgesJson};
+      
+      if (nodes.length === 0) return;
+      
+      const container = document.getElementById('network');
+      const infoPanel = document.getElementById('info-panel');
+      const infoTitle = document.getElementById('info-title');
+      const infoContent = document.getElementById('info-content');
+      
+      const colorMap = {
+        gofile: '#4CAF50',
+        template: '#2196F3',
+        variable: '#FF9800',
+        field: '#9C27B0',
+        more: '#757575'
+      };
+      
+      const shapeMap = {
+        gofile: 'box',
+        template: 'diamond',
+        variable: 'ellipse',
+        field: 'dot',
+        more: 'text'
+      };
+      
+      const nodesDataset = new vis.DataSet(
+        nodes.map(n => ({
+          id: n.id,
+          label: n.label,
+          group: n.group,
+          level: n.level,
+          color: {
+            background: colorMap[n.group],
+            border: colorMap[n.group],
+            highlight: {
+              background: colorMap[n.group],
+              border: '#FFF'
+            }
+          },
+          shape: shapeMap[n.group],
+          font: {
+            color: '#FFF',
+            size: n.group === 'more' ? 10 : 12,
+            face: 'monospace'
+          },
+          size: n.group === 'template' ? 20 : n.group === 'variable' ? 15 : 10
+        }))
+      );
+      
+      const edgesDataset = new vis.DataSet(
+        edges.map(e => ({
+          from: e.from,
+          to: e.to,
+          label: e.label,
+          arrows: e.arrows || 'to',
+          color: { color: '#666', highlight: '#FFF' },
+          smooth: { type: 'cubicBezier' },
+          font: { size: 10, color: '#999', strokeWidth: 0 }
+        }))
+      );
+      
+      let currentLayout = 'hierarchical';
+      let currentDirection = 'UD';
+      
+      function getOptions() {
+        const baseOptions = {
+          nodes: {
+            borderWidth: 2,
+            borderWidthSelected: 3
+          },
+          edges: {
+            width: 1.5,
+            selectionWidth: 3
+          },
+          physics: {
+            enabled: currentLayout !== 'hierarchical',
+            stabilization: {
+              iterations: 200
+            }
+          },
+          interaction: {
+            hover: true,
+            navigationButtons: true,
+            keyboard: true
+          }
+        };
+        
+        if (currentLayout === 'hierarchical') {
+          baseOptions.layout = {
+            hierarchical: {
+              enabled: true,
+              direction: currentDirection,
+              sortMethod: 'directed',
+              nodeSpacing: 150,
+              levelSeparation: 200,
+              treeSpacing: 200
+            }
+          };
+        } else if (currentLayout === 'force') {
+          baseOptions.layout = {
+            randomSeed: 42
+          };
+          baseOptions.physics = {
+            enabled: true,
+            barnesHut: {
+              gravitationalConstant: -2000,
+              springConstant: 0.001,
+              springLength: 200
+            },
+            stabilization: {
+              iterations: 300
+            }
+          };
+        } else if (currentLayout === 'circular') {
+          baseOptions.layout = {
+            randomSeed: undefined
+          };
+          baseOptions.physics = {
+            enabled: false
+          };
+        }
+        
+        return baseOptions;
+      }
+      
+      let network = new vis.Network(container, {
+        nodes: nodesDataset,
+        edges: edgesDataset
+      }, getOptions());
+      
+      // Event handlers
+      network.on('click', function(params) {
+        if (params.nodes.length > 0) {
+          const nodeId = params.nodes[0];
+          const node = nodesDataset.get(nodeId);
+          
+          infoTitle.textContent = node.label;
+          
+          let content = '';
+          content += '<p><strong>Type:</strong> ' + node.group + '</p>';
+          
+          const connected = network.getConnectedNodes(nodeId);
+          if (connected.length > 0) {
+            content += '<p><strong>Connected:</strong> ' + connected.length + ' nodes</p>';
+          }
+          
+          infoContent.innerHTML = content;
+          infoPanel.classList.add('visible');
+        } else {
+          infoPanel.classList.remove('visible');
+        }
+      });
+      
+      // Controls
+      document.getElementById('layout-select').addEventListener('change', function(e) {
+        currentLayout = e.target.value;
+        network.setOptions(getOptions());
+        network.fit();
+      });
+      
+      document.getElementById('direction-select').addEventListener('change', function(e) {
+        currentDirection = e.target.value;
+        if (currentLayout === 'hierarchical') {
+          network.setOptions(getOptions());
+          network.fit();
+        }
+      });
+      
+      document.getElementById('fit-btn').addEventListener('click', function() {
+        network.fit({ animation: true });
+      });
+      
+      document.getElementById('reset-btn').addEventListener('click', function() {
+        network.moveTo({
+          position: {x: 0, y: 0},
+          scale: 1,
+          animation: true
+        });
+      });
+      
+      // Initial fit
+      setTimeout(() => network.fit(), 100);
+    })();
+  </script>
 </body>
 </html>`;
   }

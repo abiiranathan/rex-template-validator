@@ -70,7 +70,10 @@ type Management struct {
 type Handler struct{}
 
 // getAuthUser returns the logged in user.
-func getAuthUser(userId int) *User { return &User{} }
+func getAuthUser(userID int) *User {
+	fmt.Println(userID)
+	return &User{}
+}
 
 // RenderTreatmentChart renders the treatment chart
 func (h *Handler) RenderTreatmentChart(inpatient bool) rex.HandlerFunc {
@@ -120,6 +123,18 @@ func (h *Handler) RenderTreatmentChart(inpatient bool) rex.HandlerFunc {
 				{Label: visit.Patient.Name, URL: fmt.Sprintf("/patients/%d", visit.PatientID)},
 				{Label: "Treatment Chart", IsLast: true},
 			},
+		})
+	}
+}
+
+func (h *Handler) RenderDashboard(inpatient bool) rex.HandlerFunc {
+	return func(c *rex.Context) error {
+		visitID := c.ParamUint("visit_id")
+		templateName := "views/dashboard.html" // Dynamic template
+
+		// Magic happens here. Try renaming template name to something not found!
+		return c.Render(templateName, rex.Map{
+			"visitID": visitID,
 		})
 	}
 }
