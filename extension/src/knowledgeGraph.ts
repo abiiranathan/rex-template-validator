@@ -86,7 +86,28 @@ export class KnowledgeGraphBuilder {
       if (analysisResult.namedBlocks && analysisResult.namedBlocks[logicalPath]) {
         const entries = analysisResult.namedBlocks[logicalPath];
         if (entries.length > 0) {
-          mergeRenderCall(entries[0].templatePath, entries[0].absolutePath, rc);
+          const entry = entries[0];
+          mergeRenderCall(entry.templatePath, entry.absolutePath, rc);
+
+          // ALSO register the named block itself as a template context
+          // so it can be looked up by block name (e.g., "role_item")
+          let blockCtx = templates.get(logicalPath);
+          if (!blockCtx) {
+            blockCtx = {
+              templatePath: entry.templatePath,
+              absolutePath: entry.absolutePath,
+              vars: new Map(),
+              renderCalls: [],
+            };
+            templates.set(logicalPath, blockCtx);
+          }
+          blockCtx.renderCalls.push(rc);
+          for (const v of rc.vars ?? []) {
+            const existing = blockCtx.vars.get(v.name);
+            if (!existing || isMoreComplete(v, existing)) {
+              blockCtx.vars.set(v.name, v);
+            }
+          }
         }
       }
     }
@@ -265,6 +286,31 @@ export class KnowledgeGraphBuilder {
       `[KnowledgeGraph] Looking for partial: ${partialRelPath} (basename: ${partialBasename})`
     );
 
+    // ── Priority 1: Check if this file contains a named block with context-file vars ──
+    for (const [blockName, entries] of this.graph.namedBlocks) {
+      for (const entry of entries) {
+        if (path.normalize(entry.absolutePath).toLowerCase() === path.normalize(absolutePath).toLowerCase()) {
+          // Found a named block in this file - check if it has context-file vars
+          const blockCtx = this.graph.templates.get(blockName);
+          if (blockCtx && blockCtx.renderCalls.some(rc => rc.file === 'context-file')) {
+            this.outputChannel.appendLine(
+              `[KnowledgeGraph] Found named block "${blockName}" with context-file vars`
+            );
+
+            return {
+              templatePath: partialRelPath,
+              absolutePath: absolutePath,
+              vars: blockCtx.vars,
+              renderCalls: blockCtx.renderCalls,
+              isMap: false,
+              isSlice: false,
+            };
+          }
+        }
+      }
+    }
+
+    // ── Priority 2: Scan parent templates for {{ template }} calls ──
     const parser = new TemplateParser();
     const normalizedTargetAbsPath = path.normalize(absolutePath).toLowerCase();
 

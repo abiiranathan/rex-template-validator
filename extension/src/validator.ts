@@ -207,6 +207,23 @@ export class TemplateValidator {
             };
         }
 
+        const graph = this.graphBuilder.getGraph();
+        const blockCtx = graph.templates.get(name);
+        if (blockCtx) {
+            return {
+                childVars: blockCtx.vars,
+                childStack: [{
+                    key: '.',
+                    typeStr: blockCtx.rootTypeStr ?? 'context',
+                    fields: [...blockCtx.vars.values()] as unknown as FieldInfo[],
+                    isMap: blockCtx.isMap,
+                    keyType: blockCtx.keyType,
+                    elemType: blockCtx.elemType,
+                    isSlice: blockCtx.isSlice
+                }],
+            };
+        }
+
         if (node.kind === 'block' && node.path.length > 0) {
             const result = resolvePath(node.path, vars, []);
             if (result.found) {
@@ -751,6 +768,28 @@ export class TemplateValidator {
     ): { childVars: Map<string, TemplateVar>; childStack: ScopeFrame[] } | null {
         const name = node.blockName!;
 
+        // 1. Check for context-file definition FIRST (Highest Priority)
+        const graph = this.graphBuilder.getGraph();
+        const blockCtx = graph.templates.get(name);
+        if (blockCtx) {
+            const cfCall = blockCtx.renderCalls.find(rc => rc.file === 'context-file');
+            if (cfCall && cfCall.vars) {
+                const childVars = new Map<string, TemplateVar>();
+                for (const v of cfCall.vars) childVars.set(v.name, v);
+
+                return {
+                    childVars,
+                    childStack: [{
+                        key: '.',
+                        typeStr: 'context',
+                        fields: cfCall.vars as unknown as FieldInfo[],
+                        isMap: false,
+                        isSlice: false
+                    }],
+                };
+            }
+        }
+
         let currentFileNodes: TemplateNode[] = [];
         try {
             const openDoc = vscode.workspace.textDocuments.find(
@@ -780,7 +819,6 @@ export class TemplateValidator {
             };
         }
 
-        const graph = this.graphBuilder.getGraph();
         for (const [, templateCtx] of graph.templates) {
             if (!templateCtx.absolutePath || templateCtx.absolutePath === currentFilePath) continue;
             if (!fs.existsSync(templateCtx.absolutePath)) continue;
@@ -825,6 +863,65 @@ export class TemplateValidator {
         }
 
         return null;
+    }
+
+    private enrichScopeWithContextFile(
+        blockName: string,
+        partialVars: Map<string, TemplateVar>,
+        childStack: ScopeFrame[]
+    ): ScopeFrame[] {
+        const graph = this.graphBuilder.getGraph();
+        const blockCtx = graph.templates.get(blockName);
+        if (!blockCtx) return childStack;
+
+        const cfCall = blockCtx.renderCalls.find(rc => rc.file === 'context-file');
+        if (!cfCall || !cfCall.vars) return childStack;
+
+        // Merge vars
+        for (const v of cfCall.vars) {
+            if (!partialVars.has(v.name)) {
+                partialVars.set(v.name, v);
+            }
+        }
+
+        const globalFields: FieldInfo[] = cfCall.vars.map(v => ({
+            name: v.name,
+            type: v.type,
+            fields: v.fields,
+            isSlice: v.isSlice ?? false,
+            doc: v.doc,
+            defFile: v.defFile,
+            defLine: v.defLine,
+            defCol: v.defCol
+        }));
+
+        // Merge fields into dot frame
+        const activeDotFrame = childStack.slice().reverse().find(f => f.key === '.');
+        if (!activeDotFrame) {
+            return [...childStack, {
+                key: '.',
+                typeStr: 'context',
+                fields: globalFields,
+                isMap: false,
+                isSlice: false,
+            }];
+        }
+
+        const mergedFields = [...(activeDotFrame.fields ?? [])];
+        const existingNames = new Set(mergedFields.map(f => f.name));
+
+        for (const gf of globalFields) {
+            if (!existingNames.has(gf.name)) {
+                mergedFields.push(gf);
+            }
+        }
+
+        const newFrame: ScopeFrame = {
+            ...activeDotFrame,
+            fields: mergedFields,
+        };
+
+        return [...childStack, newFrame];
     }
 
     private validatePartial(
@@ -978,6 +1075,9 @@ export class TemplateValidator {
                 : scopeStack;
         }
 
+        // Enrich scope with global context vars for this block (e.g. from rex.Render)
+        childStack = this.enrichScopeWithContextFile(callNode.partialName, partialVars, childStack);
+
         if (!entry?.node?.children || entry?.node?.children.length === 0) return;
 
         if (entry.absolutePath === filePath) {
@@ -1093,6 +1193,9 @@ export class TemplateValidator {
                     }]
                     : scopeStack;
             }
+
+            // Enrich scope with global context vars for this block (e.g. from rex.Render)
+            childStack = this.enrichScopeWithContextFile(callNode.partialName, partialVars, childStack);
 
             const blockErrors: ValidationError[] = [];
             this.validateNodes(
@@ -1341,9 +1444,14 @@ export class TemplateValidator {
             md.appendMarkdown(varInfo.doc);
         }
 
-        if (result.fields?.length) {
+        // Prefer result.fields (from resolvePath/inferExpressionType); fall back to
+        // varInfo.fields for context-file vars where the stack is empty and resolvePath
+        // may not hydrate fields for top-level vars.
+        const fieldsToShow = (result.fields?.length ? result.fields : varInfo?.fields) ?? [];
+
+        if (fieldsToShow.length) {
             md.appendMarkdown('\n\n---\n\n**Fields:**\n\n');
-            for (const f of result.fields.slice(0, 30)) {
+            for (const f of fieldsToShow.slice(0, 30)) {
                 md.appendMarkdown(`**${f.name}** \`${f.isSlice ? `[]${f.type}` : f.type}\`\n`);
                 if (f.doc) md.appendMarkdown(`\n${f.doc}\n`);
                 md.appendMarkdown('\n');
@@ -1359,10 +1467,33 @@ export class TemplateValidator {
         currentFileNodes: TemplateNode[],
         currentFilePath: string
     ): { typeStr: string; fields?: FieldInfo[]; isMap?: boolean; keyType?: string; elemType?: string; isSlice?: boolean } | null {
-        const localCtx = this.findCallSiteContext(currentFileNodes, blockName, vars, []);
-        if (localCtx) return localCtx;
-
         const graph = this.graphBuilder.getGraph();
+        const blockCtx = graph.templates.get(blockName);
+        if (blockCtx) {
+            const cfCall = blockCtx.renderCalls.find(rc => rc.file === 'context-file');
+            if (cfCall && cfCall.vars) {
+                return {
+                    typeStr: 'context',
+                    fields: cfCall.vars as unknown as FieldInfo[],
+                    isMap: false,
+                    isSlice: false,
+                };
+            }
+        }
+
+        const localCtx = this.findCallSiteContext(currentFileNodes, blockName, vars, []);
+        if (localCtx) {
+            // If the call site resolved to a map/unknown type with no fields,
+            // but the knowledge graph has vars for this block, use those instead.
+            if ((!localCtx.fields || localCtx.fields.length === 0) && blockCtx) {
+                const synthFields = [...blockCtx.vars.values()] as unknown as FieldInfo[];
+                if (synthFields.length > 0) {
+                    return { ...localCtx, fields: synthFields };
+                }
+            }
+            return localCtx;
+        }
+
         for (const [, templateCtx] of graph.templates) {
             if (!templateCtx.absolutePath || templateCtx.absolutePath === currentFilePath) continue;
             if (!fs.existsSync(templateCtx.absolutePath)) continue;
@@ -1375,7 +1506,16 @@ export class TemplateValidator {
                     : fs.readFileSync(templateCtx.absolutePath, 'utf8');
                 const fileNodes = this.parser.parse(content);
                 const callCtx = this.findCallSiteContext(fileNodes, blockName, templateCtx.vars, []);
-                if (callCtx) return callCtx;
+                if (callCtx) {
+                    // Same fallback: if fields empty but graph has vars, synthesize.
+                    if ((!callCtx.fields || callCtx.fields.length === 0) && blockCtx) {
+                        const synthFields = [...blockCtx.vars.values()] as unknown as FieldInfo[];
+                        if (synthFields.length > 0) {
+                            return { ...callCtx, fields: synthFields };
+                        }
+                    }
+                    return callCtx;
+                }
             } catch { /* ignore */ }
         }
         return null;
@@ -1395,6 +1535,9 @@ export class TemplateValidator {
                 fields: v.fields,
                 isSlice: v.isSlice ?? false,
                 doc: v.doc,
+                isMap: v.isMap,
+                keyType: v.keyType,
+                elemType: v.elemType,
             } as FieldInfo));
 
         const md = new vscode.MarkdownString();
@@ -1412,13 +1555,12 @@ export class TemplateValidator {
 
         return new vscode.Hover(md);
     }
-
     private findVariableInfo(
         path: string[],
         vars: Map<string, TemplateVar>,
         scopeStack: ScopeFrame[],
         blockLocals?: Map<string, TemplateVar>
-    ): { typeStr: string; doc?: string } | null {
+    ): { typeStr: string; doc?: string; fields?: FieldInfo[] } | null {  // ← add fields
         if (path.length === 0) return null;
 
         let topVarName = path[0];
@@ -1448,20 +1590,25 @@ export class TemplateValidator {
                     .reverse()
                     .find(f => f.key === '.')
                     ?.fields?.find(f => f.name === topVarName);
-                if (field) return { typeStr: field.type, doc: field.doc };
+                if (field) return { typeStr: field.type, doc: field.doc, fields: field.fields };  // ← fields
                 return null;
             }
         }
 
         if (!topVar) return null;
-        if (searchPath.length === 1) return { typeStr: topVar.type, doc: topVar.doc };
+        // Single-segment path: return the var's own fields too
+        if (searchPath.length === 1) return {
+            typeStr: topVar.type,
+            doc: topVar.doc,
+            fields: topVar.fields
+        };
 
         let fields = topVar.fields ?? [];
         for (let i = 1; i < searchPath.length; i++) {
             if (searchPath[i] === '[]') continue;
             const field = fields.find(f => f.name === searchPath[i]);
             if (!field) return null;
-            if (i === searchPath.length - 1) return { typeStr: field.type, doc: field.doc };
+            if (i === searchPath.length - 1) return { typeStr: field.type, doc: field.doc, fields: field.fields };  // ← fields
             fields = field.fields ?? [];
         }
         return null;
@@ -1614,14 +1761,9 @@ export class TemplateValidator {
         };
 
         const lineText = document.lineAt(position.line).text;
-        // linePrefix: everything on this line up to (not including) the cursor.
-        // We do all path matching against linePrefix so the trigger character '.'
-        // is always captured at the start of the matched token rather than being
-        // missed by a manual backward-scan of charBeforeCursor.
         const linePrefix = lineText.slice(0, position.character);
 
         // ── Handle complex expressions: after a pipe or open paren ───────────────
-        // e.g. "{{ .Items | " → suggest functions; "{{ (call " → suggest functions
         const inComplexExpr = /\(\s*[^)]*$|\|\s*[^|}]*$/.test(linePrefix);
         if (inComplexExpr) {
             const pipeMatch = linePrefix.match(/(?:\(|\|)\s*(.*)$/);
@@ -1650,22 +1792,10 @@ export class TemplateValidator {
         }
 
         // ── Identify the path token the user is currently typing ─────────────────
-        // Match the rightmost dot-or-dollar-prefixed token in linePrefix.
-        // Using linePrefix (not a manually backed-up index) ensures the '.' trigger
-        // character is always the first char of the match.
-        //
-        // Examples:
-        //   linePrefix "{{ ."          → rawPath "."
-        //   linePrefix "{{ .User."     → rawPath ".User."
-        //   linePrefix "{{ .User.Na"   → rawPath ".User.Na"
-        //   linePrefix "{{ $item."     → rawPath "$item."
-        //   linePrefix "{{ $item.Pri"  → rawPath "$item.Pri"
         const pathMatch = linePrefix.match(/(?:\$|\.)[\w.]*$/);
 
         if (!pathMatch) {
-            // No dot/dollar prefix — cursor is at a bare identifier or whitespace.
-            // Offer globals, locals, and template functions without a replacement range
-            // (let VSCode handle insertion naturally).
+            // No dot/dollar prefix — offer globals, locals, and template functions.
             this.addGlobalVariablesToCompletion(ctx.vars, completionItems, '', null);
             this.addLocalVariablesToCompletion(stack, locals, completionItems, '', null);
             this.addFunctionsToCompletion(this.graphBuilder.getGraph().funcMaps, completionItems, '', null);
@@ -1673,43 +1803,37 @@ export class TemplateValidator {
         }
 
         const rawPath = pathMatch[0];
-        // matchStart: column where rawPath begins in the line.
         const matchStart = position.character - rawPath.length;
 
-        // Split rawPath into:
-        //   lookupPath   — the part we resolve to get a type/fields
-        //   filterPrefix — the partial field name the user is typing (used to filter results)
-        //
-        // If rawPath ends with '.', the user just typed the separator and wants all
-        // fields of the resolved object (filterPrefix is empty).
-        // Otherwise, the last segment after the final '.' is the filter.
         let lookupPath: string[];
         let filterPrefix: string;
-        // Column where the filter prefix starts; completions replace only this suffix.
         let filterStart: number;
 
         if (rawPath.endsWith('.')) {
             lookupPath = this.parser.parseDotPath(rawPath);
             filterPrefix = '';
-            filterStart = position.character; // nothing to replace, insert after dot
+            filterStart = position.character;
         } else {
             const lastDot = rawPath.lastIndexOf('.');
             if (lastDot === -1) {
-                // e.g. "$someVar" — no dot, treat the whole token as the filter
                 filterPrefix = rawPath.startsWith('$') ? rawPath.slice(1) : rawPath.slice(1);
-                filterStart = matchStart + 1; // skip the leading $ or .
-                // For a bare "$..." token resolve against root vars and locals.
+                filterStart = matchStart + 1;
                 if (rawPath.startsWith('$')) {
                     const repRange = new vscode.Range(position.line, matchStart, position.line, position.character);
                     this.addGlobalVariablesToCompletion(ctx.vars, completionItems, filterPrefix, repRange);
                     this.addLocalVariablesToCompletion(stack, locals, completionItems, filterPrefix, repRange);
                 } else {
-                    // Bare "." followed immediately by letters — filter the dot-frame fields.
                     const repRange = new vscode.Range(position.line, matchStart, position.line, position.character);
                     const dotFrame = stack.slice().reverse().find(f => f.key === '.');
                     const fields: FieldInfo[] = dotFrame?.fields ?? [...ctx.vars.values()].map(v => ({
-                        name: v.name, type: v.type, fields: v.fields,
-                        isSlice: v.isSlice ?? false, doc: v.doc,
+                        name: v.name,
+                        type: v.type,
+                        fields: v.fields,
+                        isSlice: v.isSlice ?? false,
+                        doc: v.doc,
+                        isMap: v.isMap,
+                        keyType: v.keyType,
+                        elemType: v.elemType,
                     } as FieldInfo));
                     this.addFieldsToCompletion({ fields }, completionItems, filterPrefix, repRange);
                 }
@@ -1717,15 +1841,9 @@ export class TemplateValidator {
             }
             filterPrefix = rawPath.slice(lastDot + 1);
             filterStart = matchStart + lastDot + 1;
-            // Keep the trailing dot so parseDotPath sees a complete path.
             lookupPath = this.parser.parseDotPath(rawPath.slice(0, lastDot + 1));
         }
 
-        // The replacement range covers only the filter suffix (the partial field name
-        // the user is currently typing). It does NOT cover the leading dot or the
-        // path prefix, so those characters are preserved in the editor.
-        // When filterPrefix is empty (just typed '.'), the range is a zero-width
-        // insertion point immediately after the dot — nothing is replaced.
         const repRange = new vscode.Range(
             position.line, filterStart,
             position.line, position.character
@@ -1735,8 +1853,14 @@ export class TemplateValidator {
         if (lookupPath.length === 1 && (lookupPath[0] === '.' || lookupPath[0] === '')) {
             const dotFrame = stack.slice().reverse().find(f => f.key === '.');
             const fields: FieldInfo[] = dotFrame?.fields ?? [...ctx.vars.values()].map(v => ({
-                name: v.name, type: v.type, fields: v.fields,
-                isSlice: v.isSlice ?? false, doc: v.doc,
+                name: v.name,
+                type: v.type,
+                fields: v.fields,
+                isSlice: v.isSlice ?? false,
+                doc: v.doc,
+                isMap: v.isMap,
+                keyType: v.keyType,
+                elemType: v.elemType,
             } as FieldInfo));
             this.addFieldsToCompletion({ fields }, completionItems, filterPrefix, repRange);
             return completionItems;
@@ -1750,8 +1874,6 @@ export class TemplateValidator {
         }
 
         // ── Complex path: resolve to a type and show its fields ───────────────────
-        // e.g. ".User." → resolve User → show User's fields
-        //      "$item." → resolve $item local var → show its fields
         const res = resolvePath(lookupPath, ctx.vars, stack, locals);
         if (res.found && res.fields) {
             this.addFieldsToCompletion({ fields: res.fields }, completionItems, filterPrefix, repRange);
@@ -2499,7 +2621,7 @@ export class TemplateValidator {
         let scopeResult = this.findScopeAtPosition(nodes, position, ctx.vars, [], nodes, ctx);
 
         // Fallback: Check if we are inside a named block (define/block) that implies a specific context
-        if (!scopeResult) {
+        if (!scopeResult || scopeResult.stack.length === 0) {
             const enclosing = this.findEnclosingBlockOrDefine(nodes, position);
             if (enclosing?.blockName) {
                 const callCtx = this.resolveNamedBlockCallCtxForHover(
@@ -2658,26 +2780,42 @@ export class TemplateValidator {
 
             // Special handling for named blocks / defines
             if ((node.kind === 'define' || node.kind === 'block') && node.blockName) {
-                const callCtx = this.resolveNamedBlockCallCtxForHover(
-                    node.blockName,
-                    vars,
-                    rootNodes,
-                    ctx.absolutePath
-                );
-                if (callCtx) {
-                    childVars = this.fieldsToVarMap(callCtx.fields ?? []);
+                const graph = this.graphBuilder.getGraph();
+                const blockCtx = graph.templates.get(node.blockName);
+
+                let cfCall = blockCtx?.renderCalls.find(rc => rc.file === 'context-file');
+
+                if (cfCall && cfCall.vars) {
+                    childVars = this.fieldsToVarMap(cfCall.vars as unknown as FieldInfo[]);
                     childStack = [{
                         key: '.',
-                        typeStr: callCtx.typeStr,
-                        fields: callCtx.fields ?? [],
-                        isMap: callCtx.isMap,
-                        keyType: callCtx.keyType,
-                        elemType: callCtx.elemType,
-                        isSlice: callCtx.isSlice
+                        typeStr: 'context',
+                        fields: cfCall.vars as unknown as FieldInfo[],
+                        isMap: false,
+                        isSlice: false
                     }];
-                    // Note: we do NOT inherit outer blockLocals inside a named block body
-                    // because named blocks usually get fresh context from caller
-                    childLocals = new Map();
+                    childLocals = new Map(); // Fresh context
+                } else {
+                    // Fallback to resolving from call sites if no context-file entry
+                    const callCtx = this.resolveNamedBlockCallCtxForHover(
+                        node.blockName,
+                        vars,
+                        rootNodes,
+                        ctx.absolutePath
+                    );
+                    if (callCtx) {
+                        childVars = this.fieldsToVarMap(callCtx.fields ?? []);
+                        childStack = [{
+                            key: '.',
+                            typeStr: callCtx.typeStr,
+                            fields: callCtx.fields ?? [],
+                            isMap: callCtx.isMap,
+                            keyType: callCtx.keyType,
+                            elemType: callCtx.elemType,
+                            isSlice: callCtx.isSlice
+                        }];
+                        childLocals = new Map();
+                    }
                 }
             }
 

@@ -357,23 +357,29 @@ export function resolvePath(
   }
 
   // Bare dot → current scope
-  if (path.length === 1 && path[0] === '.') {
+  if (path[0] === '.') {
     const frame = findDotFrame(scopeStack);
     if (frame) {
-      return {
-        typeStr: frame.typeStr,
-        found: true,
-        fields: frame.fields,
-        // Propagate map/slice metadata stored on the frame so that
-        // `range $k, $v := .` over a map context correctly identifies
-        // the key and value types.
-        isMap: frame.isMap,
-        keyType: frame.keyType,
-        elemType: frame.elemType,
-        isSlice: frame.isSlice,
-      };
+      if (path.length === 1) {
+        return {
+          typeStr: frame.typeStr,
+          found: true,
+          fields: frame.fields,
+          isMap: frame.isMap,
+          keyType: frame.keyType,
+          elemType: frame.elemType,
+          isSlice: frame.isSlice,
+        };
+      } else { // Handle paths like ".key.subkey"
+        const res = resolveFieldsDeep(path.slice(1), frame.fields ?? []);
+        if (res.found) return res;
+      }
     }
-    return { typeStr: 'context', found: true };
+    // If no dotFrame is found but path is just '.', still consider it found (global context)
+    if (path.length === 1) {
+        return { typeStr: 'context', found: true };
+    }
+    return { typeStr: 'unknown', found: false };
   }
 
   // Root context "$" — exposes all top-level vars

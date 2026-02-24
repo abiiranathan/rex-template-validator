@@ -2,12 +2,9 @@
 {{ range $key, $v := . }}
 <!-- 1. Create a map with your dict function -->
 {{ $ctx := dict "key" $key "value" $v }}
-
-<!-- 2. Pass the map to the block -->
-{{ template "role_item" $ctx }}
 {{ end }}
 {{ end}}
 
 {{ define "role_item" }}
-{{ }}
+{{ .key }}: {{ .value }}
 {{ end }}

@@ -421,6 +421,7 @@ async function applyAnalyzerDiagnostics(
         ? path.join(workspaceRoot, templateBaseDir)
         : path.join(workspaceRoot, sourceDir);
       diagnosticFilePath = path.join(baseDir, templateRoot, err.template);
+
       diagnosticLine = Math.max(0, err.line - 1);
       diagnosticCol = Math.max(0, err.column - 1);
       diagnosticEndCol = diagnosticCol + (err.variable?.length || 1);
