@@ -403,10 +403,39 @@ export function resolvePath(
   // Path inside a with/range scope → check the active dot frame first.
   const dotFrame = findDotFrame(scopeStack);
   if (dotFrame) {
-    if (dotFrame.fields) {
+    if (dotFrame.isMap) {
+      // It's a map context, any key is valid
+      if (path.length === 2) { // e.g. [".", "key"]
+        return { typeStr: dotFrame.elemType || 'unknown', found: true };
+      } else if (path.length > 2) {
+        return resolveFields(path.slice(2), [], false, undefined);
+      }
+    } else if (dotFrame.fields && dotFrame.fields.length > 0) {
       const res = resolveFieldsDeep(path, dotFrame.fields);
       if (res.found) return res;
     }
+
+    // Fallback for isolated block validation:
+    // If the dotFrame has no fields, it means the block's context couldn't be statically resolved.
+    // We fall back to checking the file's root vars, which contain the injected context-file definitions.
+    if (!dotFrame.fields || dotFrame.fields.length === 0) {
+      const topVar = vars.get(path[0]);
+      if (topVar) {
+        if (path.length === 1) {
+          return {
+            typeStr: topVar.type,
+            found: true,
+            fields: topVar.fields,
+            isSlice: topVar.isSlice,
+            isMap: topVar.isMap,
+            elemType: topVar.elemType,
+            keyType: topVar.keyType,
+          };
+        }
+        return resolveFields(path.slice(1), topVar.fields ?? [], topVar.isMap, topVar.elemType);
+      }
+    }
+
     return { typeStr: 'unknown', found: false };
   }
 
@@ -492,6 +521,17 @@ function resolveFields(
       };
     }
     return resolveFields(rest, fields, nextIsMap, nextElemType, nextIsSlice);
+  }
+
+  if (isMap) {
+    if (parts.length === 1) {
+      return {
+        typeStr: elemType || 'unknown',
+        found: true,
+        fields: [],
+      };
+    }
+    return resolveFields(parts.slice(1), fields, false, undefined);
   }
 
   return resolveFieldsDeep(parts, fields);

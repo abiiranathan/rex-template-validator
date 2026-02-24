@@ -40,6 +40,8 @@
     {{ template "views/partials/footer.html" .visit }}
     {{ block "billed-drug" }}
     <div>{{ .Name }}</div>
+    <div>{{ .Price }}</div>
+    <div>{{ .Quantity }}</div>
     {{ end }}
 
     <!-- Passed through a context-file -->

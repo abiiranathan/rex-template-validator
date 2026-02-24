@@ -12,6 +12,7 @@ import {
   TemplateNode,
   FieldInfo,
   FuncMapInfo,
+  RenderCall,
 } from './types';
 import { TemplateParser, resolvePath } from './templateParser';
 
@@ -53,10 +54,7 @@ export class KnowledgeGraphBuilder {
     const templates = new Map<string, TemplateContext>();
     const templateBase = this.getTemplateBase();
 
-    for (const rc of analysisResult.renderCalls ?? []) {
-      const logicalPath = rc.template.replace(/^\.\//, '');
-      const absPath = path.join(templateBase, logicalPath);
-
+    const mergeRenderCall = (logicalPath: string, absPath: string, rc: RenderCall) => {
       let ctx = templates.get(logicalPath);
       if (!ctx) {
         ctx = {
@@ -76,9 +74,23 @@ export class KnowledgeGraphBuilder {
           ctx.vars.set(v.name, v);
         }
       }
+    };
+
+    for (const rc of analysisResult.renderCalls ?? []) {
+      const logicalPath = rc.template.replace(/^\.\//, '');
+      const absPath = path.join(templateBase, logicalPath);
+
+      mergeRenderCall(logicalPath, absPath, rc);
+
+      // If this render call targets a named block, ALSO inject its variables into the file where the block is defined
+      if (analysisResult.namedBlocks && analysisResult.namedBlocks[logicalPath]) {
+        const entries = analysisResult.namedBlocks[logicalPath];
+        if (entries.length > 0) {
+          mergeRenderCall(entries[0].templatePath, entries[0].absolutePath, rc);
+        }
+      }
     }
 
-    // Build the cross-file named block registry directly from the Go analyzer's output
     const namedBlocks: NamedBlockRegistry = new Map();
     if (analysisResult.namedBlocks) {
       for (const [name, entries] of Object.entries(analysisResult.namedBlocks)) {

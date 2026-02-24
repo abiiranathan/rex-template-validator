@@ -244,7 +244,8 @@ async function rebuildIndex(workspaceRoot: string) {
     const extensionGeneratedErrors: GoValidationError[] = [];
 
     for (const [logicalPath, ctx] of currentGraph.templates) {
-      if (!fs.existsSync(ctx.absolutePath)) {
+      const isNamedBlock = currentGraph.namedBlocks.has(logicalPath);
+      if (!fs.existsSync(ctx.absolutePath) && !isNamedBlock) {
         for (const rc of ctx.renderCalls) {
           extensionGeneratedErrors.push({
             template: logicalPath,
@@ -266,15 +267,13 @@ async function rebuildIndex(workspaceRoot: string) {
     const finalValidationErrors: GoValidationError[] = [];
 
     for (const analyzerErr of initialValidationErrors) {
-      if (
-        analyzerErr.message.includes('Could not read template file:') &&
-        extensionMissingTemplateLogicalPaths.has(analyzerErr.template)
-      ) {
+      const isNotFoundMsg = analyzerErr.message.includes('Could not read template file:') ||
+        analyzerErr.message.includes('Template or named block not found');
+      if (isNotFoundMsg && extensionMissingTemplateLogicalPaths.has(analyzerErr.template)) {
         continue;
       }
       finalValidationErrors.push(analyzerErr);
     }
-
     finalValidationErrors.push(...extensionGeneratedErrors);
 
     await applyAnalyzerDiagnostics(finalValidationErrors, workspaceRoot, sourceDir, templateRoot, templateBaseDir);
@@ -369,6 +368,8 @@ async function applyAnalyzerDiagnostics(
   templateBaseDir: string
 ) {
   analyzerCollection.clear();
+  const config = vscode.workspace.getConfiguration('rex-analyzer');
+  const contextFile: string = config.get('contextFile') ?? '';
 
   const issuesByFile = new Map<string, vscode.Diagnostic[]>();
 
@@ -379,7 +380,34 @@ async function applyAnalyzerDiagnostics(
     let diagnosticEndCol: number;
     let relatedInfo: vscode.DiagnosticRelatedInformation[] | undefined;
 
-    if (err.message.includes('Template file not found') && err.goFile && err.goLine !== undefined) {
+    const isNotFound = err.message.includes('not found') || err.message.includes('Could not read template file');
+
+    if (err.goFile === "context-file") {
+      if (isNotFound) {
+        diagnosticFilePath = contextFile ? path.resolve(workspaceRoot, contextFile) : path.join(workspaceRoot, sourceDir, err.goFile);
+        diagnosticLine = 0;
+        diagnosticCol = 0;
+        diagnosticEndCol = 100;
+      } else {
+        const baseDir = templateBaseDir ? path.resolve(workspaceRoot, templateBaseDir) : path.resolve(workspaceRoot, sourceDir);
+        diagnosticFilePath = path.join(baseDir, templateRoot, err.template);
+        diagnosticLine = Math.max(0, err.line - 1);
+        diagnosticCol = Math.max(0, err.column - 1);
+        diagnosticEndCol = diagnosticCol + (err.variable?.length || 1);
+
+        if (contextFile) {
+          relatedInfo = [
+            new vscode.DiagnosticRelatedInformation(
+              new vscode.Location(
+                vscode.Uri.file(path.resolve(workspaceRoot, contextFile)),
+                new vscode.Position(0, 0)
+              ),
+              'Context provided by context-file'
+            )
+          ];
+        }
+      }
+    } else if (isNotFound && err.goFile && err.goLine !== undefined) {
       diagnosticFilePath = path.join(workspaceRoot, sourceDir, err.goFile);
       diagnosticLine = Math.max(0, err.goLine - 1);
       diagnosticCol = Math.max(0, (err.templateNameStartCol ?? 1) - 1);

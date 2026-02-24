@@ -197,18 +197,26 @@ func ValidateTemplates(renderCalls []RenderCall, baseDir string, templateRoot st
 func validateTemplateFile(templatePath string, vars []TemplateVar, templateName string, baseDir, templateRoot string, registry map[string][]NamedBlockEntry) []ValidationResult {
 	content, err := os.ReadFile(templatePath)
 	if err != nil {
-		ext := filepath.Ext(templateName)
-		// namedTemplates are not real files.
-		if ext != "" {
-			return []ValidationResult{{
-				Template: templateName,
-				Line:     0,
-				Column:   0,
-				Variable: "",
-				Message:  fmt.Sprintf("Could not read template file: %v", err),
-				Severity: "error",
-			}}
+		// If the template is a named block, validate its content
+		if entries, ok := registry[templateName]; ok && len(entries) > 0 {
+			varMap := make(map[string]TemplateVar)
+			for _, v := range vars {
+				varMap[v.Name] = v
+			}
+			// Use entries[0].TemplatePath so the error maps to the correct file
+			// Use entries[0].Line so the error maps to the correct line in the file
+			return validateTemplateContent(entries[0].Content, varMap, entries[0].TemplatePath, baseDir, templateRoot, entries[0].Line, registry)
 		}
+
+		return []ValidationResult{{
+			Template: templateName,
+			Line:     1,
+			Column:   1,
+			Variable: "",
+			Message:  fmt.Sprintf("Template or named block not found: %s", templateName),
+			Severity: "error",
+		}}
+
 	}
 
 	varMap := make(map[string]TemplateVar)
@@ -419,6 +427,12 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 
 					if entries, ok := registry[tmplName]; ok && len(entries) > 0 {
 						nt := entries[0]
+
+						// Skip deep validation if context is an untracked local var ($var) to prevent false positives
+						if contextArg != "" && contextArg != "." && !strings.HasPrefix(contextArg, ".") {
+							continue
+						}
+
 						partialScope := resolvePartialScope(contextArg, scopeStack, varMap)
 						partialVarMap := buildPartialVarMap(contextArg, partialScope, scopeStack, varMap)
 						partialErrors := validateTemplateContent(nt.Content, partialVarMap, nt.TemplatePath, baseDir, templateRoot, nt.Line, registry)
@@ -435,6 +449,11 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 								Message:  fmt.Sprintf(`Partial template "%s" could not be found at %s`, tmplName, fullPath),
 								Severity: "error",
 							})
+							continue
+						}
+
+						// Skip deep validation if context is an untracked local var ($var) to prevent false positives
+						if contextArg != "" && contextArg != "." && !strings.HasPrefix(contextArg, ".") {
 							continue
 						}
 
@@ -642,6 +661,13 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 		currentScope := scopeStack[len(scopeStack)-1]
 		fieldName := parts[1]
 
+		if currentScope.IsMap {
+			if len(parts) > 2 {
+				return validateNestedFields(parts[2:], nil, currentScope.ElemType, false, "", varExpr, line, col, templateName)
+			}
+			return nil // Valid map access!
+		}
+
 		var foundField *FieldInfo
 		for _, f := range currentScope.Fields {
 			if f.Name == fieldName {
@@ -692,6 +718,9 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 		rootScope := scopeStack[0]
 		for _, f := range rootScope.Fields {
 			if f.Name == rootVar {
+				if f.IsMap && len(parts) == 3 {
+					return nil
+				}
 				return validateNestedFields(parts[2:], f.Fields, f.TypeStr, f.IsMap, f.ElemType, varExpr, line, col, templateName)
 			}
 		}
@@ -704,6 +733,10 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 			Message:  fmt.Sprintf(`Template variable %q is not defined in the render context`, varExpr),
 			Severity: "error",
 		}
+	}
+
+	if rootVarInfo.IsMap && len(parts) == 3 {
+		return nil
 	}
 
 	return validateNestedFields(parts[2:], rootVarInfo.Fields, rootVarInfo.TypeStr, rootVarInfo.IsMap, rootVarInfo.ElemType, varExpr, line, col, templateName)
