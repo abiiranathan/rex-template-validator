@@ -2,6 +2,7 @@
 package handlers
 
 import (
+	"errors"
 	"fmt"
 	"html/template"
 
@@ -75,6 +76,23 @@ func getAuthUser(userID int) *User {
 	return &User{}
 }
 
+// dict function that creates a map from a list of key-value pairs.
+func dict(values ...any) (map[string]any, error) {
+	if len(values)%2 != 0 {
+		return nil, errors.New("invalid dict call")
+	}
+
+	d := make(map[string]any, len(values)/2)
+	for i := 0; i < len(values); i += 2 {
+		key, ok := values[i].(string)
+		if !ok {
+			return nil, errors.New("dict keys must be strings")
+		}
+		d[key] = values[i+1]
+	}
+	return d, nil
+}
+
 // RenderTreatmentChart renders the treatment chart
 func (h *Handler) RenderTreatmentChart(inpatient bool) rex.HandlerFunc {
 	return func(c *rex.Context) error {
@@ -100,6 +118,7 @@ func (h *Handler) RenderTreatmentChart(inpatient bool) rex.HandlerFunc {
 		// Func Map
 		funcMap := template.FuncMap{
 			"getAuthUser": getAuthUser,
+			"dict":        dict,
 		}
 
 		template.New("").Funcs(funcMap)

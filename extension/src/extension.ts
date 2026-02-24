@@ -362,7 +362,7 @@ function applyNamedBlockDiagnostics() {
 }
 
 async function applyAnalyzerDiagnostics(
-  validationErrors: import('./types').GoValidationError[],
+  validationErrors: GoValidationError[],
   workspaceRoot: string,
   sourceDir: string,
   templateRoot: string,

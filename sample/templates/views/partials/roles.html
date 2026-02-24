@@ -1,6 +1,13 @@
 {{ define "roles" }}
 {{ $value := index . "key" }}
 {{ range $key, $v := . }}
-{{ $key }}: {{ $v }}
+{{ $ctx := dict "key" $key "value" $v }}
+{{ template "role_item" $ctx }}
 {{ end }}
 {{ end}}
+
+{{ define "role_item" }}
+{{ range $key, $v := . }}
+<p>{{ $key}}: {{ $v }}</p>
+{{ end }}
+{{ end }}

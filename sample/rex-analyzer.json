@@ -9,5 +9,9 @@
         "user": "*handlers.User",
         "availableRoles": "[]string",
         "roles": "map[string]*handlers.User"
+    },
+    "role_item": {
+        "key": "string",
+        "value": "string"
     }
 }

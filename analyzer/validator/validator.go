@@ -197,14 +197,18 @@ func ValidateTemplates(renderCalls []RenderCall, baseDir string, templateRoot st
 func validateTemplateFile(templatePath string, vars []TemplateVar, templateName string, baseDir, templateRoot string, registry map[string][]NamedBlockEntry) []ValidationResult {
 	content, err := os.ReadFile(templatePath)
 	if err != nil {
-		return []ValidationResult{{
-			Template: templateName,
-			Line:     0,
-			Column:   0,
-			Variable: "",
-			Message:  fmt.Sprintf("Could not read template file: %v", err),
-			Severity: "error",
-		}}
+		ext := filepath.Ext(templateName)
+		// namedTemplates are not real files.
+		if ext != "" {
+			return []ValidationResult{{
+				Template: templateName,
+				Line:     0,
+				Column:   0,
+				Variable: "",
+				Message:  fmt.Sprintf("Could not read template file: %v", err),
+				Severity: "error",
+			}}
+		}
 	}
 
 	varMap := make(map[string]TemplateVar)
