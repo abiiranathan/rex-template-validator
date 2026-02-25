@@ -1483,7 +1483,26 @@ export class TemplateValidator {
 
         const md = new vscode.MarkdownString();
         md.isTrusted = true;
-        md.appendCodeblock(`${varName}: ${result.typeStr}`, 'go');
+
+        if (result.typeStr === 'method' || (result.params && result.params.length > 0) || (result.returns && result.returns.length > 0)) {
+            const params = result.params ?? [];
+            const returns = result.returns ?? [];
+
+            const paramsStr = params
+                .map((p, i) => p.name ? `${p.name} ${p.type}` : `${String.fromCharCode(97 + i)} ${p.type}`)
+                .join(', ');
+
+            const returnsStr = returns.length === 0
+                ? ''
+                : returns.length === 1
+                    ? (returns[0].name ? `${returns[0].name} ${returns[0].type}` : returns[0].type)
+                    : `(${returns.map(r => r.name ? `${r.name} ${r.type}` : r.type).join(', ')})`;
+
+            const methodName = path[path.length - 1];
+            md.appendCodeblock(`func ${methodName}(${paramsStr})${returnsStr ? ' ' + returnsStr : ''}`, 'go');
+        } else {
+            md.appendCodeblock(`${varName}: ${result.typeStr}`, 'go');
+        }
 
         const varInfo = this.findVariableInfo(path, vars, stack, locals);
         if (varInfo?.doc) {
@@ -1829,7 +1848,19 @@ export class TemplateValidator {
                                 f.name,
                                 f.type === 'method' ? vscode.CompletionItemKind.Method : vscode.CompletionItemKind.Field
                             );
-                            item.detail = f.isSlice ? `[]${f.type}` : f.type;
+                            if (f.type === 'method' && (f.params || f.returns)) {
+                                const paramsStr = (f.params ?? [])
+                                    .map((p, i) => p.name ? `${p.name} ${p.type}` : `${String.fromCharCode(97 + i)} ${p.type}`)
+                                    .join(', ');
+                                const returnsStr = (f.returns ?? []).length === 0
+                                    ? ''
+                                    : (f.returns ?? []).length === 1
+                                        ? (f.returns![0].name ? `${f.returns![0].name} ${f.returns![0].type}` : f.returns![0].type)
+                                        : `(${f.returns!.map(r => r.name ? `${r.name} ${r.type}` : r.type).join(', ')})`;
+                                item.detail = `func(${paramsStr})${returnsStr ? ` ${returnsStr}` : ''}`;
+                            } else {
+                                item.detail = f.isSlice ? `[]${f.type}` : f.type;
+                            }
                             if (f.doc) item.documentation = new vscode.MarkdownString(f.doc);
                             return item;
                         });
@@ -2023,8 +2054,23 @@ export class TemplateValidator {
         if (!context.fields) return;
         for (const field of context.fields) {
             if (field.name.toLowerCase().startsWith(partialName.toLowerCase())) {
-                const item = new vscode.CompletionItem(field.name, vscode.CompletionItemKind.Field);
-                item.detail = field.isSlice ? `[]${field.type}` : field.type;
+                const item = new vscode.CompletionItem(
+                    field.name,
+                    field.type === 'method' ? vscode.CompletionItemKind.Method : vscode.CompletionItemKind.Field
+                );
+                if (field.type === 'method' && (field.params || field.returns)) {
+                    const paramsStr = (field.params ?? [])
+                        .map((p, i) => p.name ? `${p.name} ${p.type}` : `${String.fromCharCode(97 + i)} ${p.type}`)
+                        .join(', ');
+                    const returnsStr = (field.returns ?? []).length === 0
+                        ? ''
+                        : (field.returns ?? []).length === 1
+                            ? (field.returns![0].name ? `${field.returns![0].name} ${field.returns![0].type}` : field.returns![0].type)
+                            : `(${field.returns!.map(r => r.name ? `${r.name} ${r.type}` : r.type).join(', ')})`;
+                    item.detail = `func(${paramsStr})${returnsStr ? ` ${returnsStr}` : ''}`;
+                } else {
+                    item.detail = field.isSlice ? `[]${field.type}` : field.type;
+                }
                 item.documentation = new vscode.MarkdownString(field.doc);
                 // Range covers only the filter suffix. This means:
                 //   - Typing "." then selecting "Name" inserts "Name" after the dot → ".Name" ✓

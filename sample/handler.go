@@ -51,8 +51,9 @@ type User struct {
 	Name string
 }
 
-func (u *User) GetName() string {
-	return u.Name
+// PrintName prints the name of the user.
+func (u *User) PrintName(name string) {
+	fmt.Println(name)
 }
 
 // Prescription represents a prescription

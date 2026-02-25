@@ -7,6 +7,8 @@ export interface FieldInfo {
   keyType?: string;
   elemType?: string;
   methods?: string[];
+  params?: ParamInfo[];
+  returns?: ParamInfo[];
   // Definition location in Go source (for go-to-definition)
   defFile?: string;  // Go file where the field is defined
   defLine?: number;  // Line number where the field is defined (1-based)

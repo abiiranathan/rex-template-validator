@@ -1,4 +1,4 @@
-import { FieldInfo, ScopeFrame, TemplateNode, TemplateVar } from './types';
+import { FieldInfo, ScopeFrame, TemplateNode, TemplateVar, ParamInfo } from './types';
 
 /**
  * Go template parser that produces a proper nested AST.
@@ -305,6 +305,8 @@ export interface ResolveResult {
   isMap?: boolean;
   elemType?: string;
   keyType?: string;
+  params?: ParamInfo[];
+  returns?: ParamInfo[];
 }
 
 /**
@@ -377,7 +379,7 @@ export function resolvePath(
     }
     // If no dotFrame is found but path is just '.', still consider it found (global context)
     if (path.length === 1) {
-        return { typeStr: 'context', found: true };
+      return { typeStr: 'context', found: true };
     }
     return { typeStr: 'unknown', found: false };
   }
@@ -573,5 +575,7 @@ function resolveFieldsDeep(
     isMap: field.isMap,
     elemType: field.elemType,
     keyType: field.keyType,
+    params: field.params,
+    returns: field.returns,
   };
 }

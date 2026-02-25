@@ -629,6 +629,48 @@ func buildStructIndex(fset *token.FileSet, files map[string]*ast.File) map[struc
 		finalIndex[k.(structKeyHandle)] = v.(structIndexEntry)
 		return true
 	})
+
+	// Second pass: attach method docs to the correct structIndexEntry
+	for _, f := range files {
+		ast.Inspect(f, func(n ast.Node) bool {
+			funcDecl, ok := n.(*ast.FuncDecl)
+			if !ok || funcDecl.Recv == nil || len(funcDecl.Recv.List) == 0 {
+				return true
+			}
+
+			// Extract receiver type name
+			recvType := funcDecl.Recv.List[0].Type
+			if starExpr, ok := recvType.(*ast.StarExpr); ok {
+				recvType = starExpr.X
+			}
+
+			if ident, ok := recvType.(*ast.Ident); ok {
+				pkgName := f.Name.Name
+				key := unique.Make(pkgName + "." + ident.Name)
+
+				if entry, exists := finalIndex[key]; exists {
+					methodName := funcDecl.Name.Name
+					doc := ""
+					if funcDecl.Doc != nil {
+						doc = funcDecl.Doc.Text()
+					}
+					pos := fset.Position(funcDecl.Pos())
+
+					// Ensure we only update if there's a doc string to avoid overwriting existing fields accidentally
+					if doc != "" {
+						entry.fields[methodName] = fieldInfo{
+							file: pos.Filename,
+							line: pos.Line,
+							col:  pos.Column,
+							doc:  doc,
+						}
+					}
+				}
+			}
+			return true
+		})
+	}
+
 	return finalIndex
 }
 
@@ -1018,12 +1060,25 @@ func extractFieldsWithDocs(
 			continue
 		}
 		fi := FieldInfo{Name: m.Name(), TypeStr: "method"}
+		if sig, ok := m.Type().(*types.Signature); ok {
+			fi.Params, fi.Returns, _ = extractSignatureInfo(sig)
+		}
 		if pos := m.Pos(); pos.IsValid() && fset != nil {
 			position := fset.Position(pos)
 			fi.DefFile = position.Filename
 			fi.DefLine = position.Line
 			fi.DefCol = position.Column
 		}
+
+		if pos, ok2 := entry.fields[m.Name()]; ok2 {
+			if fi.DefFile == "" {
+				fi.DefFile = pos.file
+				fi.DefLine = pos.line
+				fi.DefCol = pos.col
+			}
+			fi.Doc = pos.doc
+		}
+
 		fields = append(fields, fi)
 	}
 

@@ -28,6 +28,8 @@ type FieldInfo struct {
 	KeyType  string      `json:"keyType,omitempty"`
 	ElemType string      `json:"elemType,omitempty"`
 	Methods  []string    `json:"methods,omitempty"`
+	Params   []ParamInfo `json:"params,omitempty"`
+	Returns  []ParamInfo `json:"returns,omitempty"`
 	// Definition location in Go source (for go-to-definition)
 	DefFile string `json:"defFile,omitempty"` // Go file where the field is defined
 	DefLine int    `json:"defLine,omitempty"` // Line number where the field is defined
