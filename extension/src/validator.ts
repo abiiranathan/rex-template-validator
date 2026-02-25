@@ -1704,6 +1704,22 @@ export class TemplateValidator {
             const cursorOffset = position.character - (node.col - 1);
             const subPathStr = this.extractPathAtCursor(node.rawText, cursorOffset);
             if (subPathStr) {
+                const funcMaps = this.graphBuilder.getGraph().funcMaps;
+                if (funcMaps && funcMaps.has(subPathStr)) {
+                    const fn = funcMaps.get(subPathStr)!;
+                    if (fn.defFile && fn.defLine) {
+                        const abs = this.resolveGoFile(fn.defFile);
+                        if (abs) {
+                            return new vscode.Location(
+                                vscode.Uri.file(abs),
+                                new vscode.Position(
+                                    Math.max(0, fn.defLine - 1),
+                                    (fn.defCol ?? 1) - 1
+                                )
+                            );
+                        }
+                    }
+                }
                 targetPath = this.parser.parseDotPath(subPathStr);
             }
         }
@@ -1713,6 +1729,22 @@ export class TemplateValidator {
                 targetPath = node.path;
             } else {
                 return null;
+            }
+        }
+
+        if (targetPath.length > 1) {
+            const subResult = resolvePath(targetPath, hitVars, stack, hitLocals);
+            if (subResult.found && subResult.defFile && subResult.defLine) {
+                const abs = this.resolveGoFile(subResult.defFile);
+                if (abs) {
+                    return new vscode.Location(
+                        vscode.Uri.file(abs),
+                        new vscode.Position(
+                            Math.max(0, subResult.defLine - 1),
+                            (subResult.defCol ?? 1) - 1
+                        )
+                    );
+                }
             }
         }
 

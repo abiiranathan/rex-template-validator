@@ -307,6 +307,10 @@ export interface ResolveResult {
   keyType?: string;
   params?: ParamInfo[];
   returns?: ParamInfo[];
+  defFile?: string;
+  defLine?: number;
+  defCol?: number;
+  doc?: string;
 }
 
 /**
@@ -352,6 +356,10 @@ export function resolvePath(
           isMap: local.isMap,
           elemType: local.elemType,
           keyType: local.keyType,
+          defFile: local.defFile,
+          defLine: local.defLine,
+          defCol: local.defCol,
+          doc: local.doc,
         };
       }
       return resolveFields(path.slice(1), local.fields ?? [], local.isMap, local.elemType);
@@ -403,6 +411,10 @@ export function resolvePath(
         isMap: topVar.isMap,
         elemType: topVar.elemType,
         keyType: topVar.keyType,
+        defFile: topVar.defFile,
+        defLine: topVar.defLine,
+        defCol: topVar.defCol,
+        doc: topVar.doc,
       };
     }
     return resolveFields(remaining.slice(1), topVar.fields ?? [], topVar.isMap, topVar.elemType);
@@ -438,6 +450,10 @@ export function resolvePath(
             isMap: topVar.isMap,
             elemType: topVar.elemType,
             keyType: topVar.keyType,
+            defFile: topVar.defFile,
+            defLine: topVar.defLine,
+            defCol: topVar.defCol,
+            doc: topVar.doc,
           };
         }
         return resolveFields(path.slice(1), topVar.fields ?? [], topVar.isMap, topVar.elemType);
@@ -462,6 +478,10 @@ export function resolvePath(
       isMap: topVar.isMap,
       elemType: topVar.elemType,
       keyType: topVar.keyType,
+      defFile: topVar.defFile,
+      defLine: topVar.defLine,
+      defCol: topVar.defCol,
+      doc: topVar.doc,
     };
   }
 
@@ -577,5 +597,9 @@ function resolveFieldsDeep(
     keyType: field.keyType,
     params: field.params,
     returns: field.returns,
+    defFile: field.defFile,
+    defLine: field.defLine,
+    defCol: field.defCol,
+    doc: field.doc,
   };
 }
