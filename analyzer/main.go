@@ -57,6 +57,7 @@ func main() {
 	contextFile := flag.String("context-file", "", "Path to JSON file with additional context variables")
 	compress := flag.Bool("compress", false, "Output gzip-compressed JSON")
 	showNamedTemplates := flag.Bool("named-templates", false, "Return all named template as JSON")
+	viewContext := flag.String("view-context", "", "Show context for a specific template")
 	flag.Parse()
 
 	// Resolve absolute paths
@@ -69,6 +70,12 @@ func main() {
 
 	// Run static analysis on the source directory
 	result := validator.AnalyzeDir(absDir, *contextFile, validator.DefaultConfig)
+
+	// Handle view-context command
+	if *viewContext != "" {
+		handleViewContext(result, *viewContext, *compress)
+		return
+	}
 
 	// Filter out import-related noise
 	result.Errors = filterImportErrors(result.Errors)
@@ -186,4 +193,38 @@ func isImportError(e string) bool {
 		}
 	}
 	return false
+}
+
+// handleViewContext filters render calls for a specific template and outputs the context variables.
+func handleViewContext(result validator.AnalysisResult, templateName string, compress bool) {
+	type ContextInfo struct {
+		File string                  `json:"file"`
+		Line int                     `json:"line"`
+		Vars []validator.TemplateVar `json:"vars"`
+	}
+
+	foundContexts := []ContextInfo{}
+
+	for _, rc := range result.RenderCalls {
+		// Check for exact match or suffix match (to handle relative paths vs absolute/partial paths)
+		if rc.Template == templateName || strings.HasSuffix(rc.Template, "/"+templateName) || strings.HasSuffix(rc.Template, "\\"+templateName) {
+			// Avoid NULLS
+			if rc.Vars == nil {
+				rc.Vars = []validator.TemplateVar{}
+			}
+			foundContexts = append(foundContexts, ContextInfo{
+				File: rc.File,
+				Line: rc.Line,
+				Vars: rc.Vars,
+			})
+		}
+	}
+
+	if len(foundContexts) == 0 {
+		// Output empty list to indicate no context found
+		encodeJSON([]ContextInfo{}, compress)
+		return
+	}
+
+	encodeJSON(foundContexts, compress)
 }
