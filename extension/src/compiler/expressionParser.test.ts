@@ -452,7 +452,7 @@ function testComplexExpressions(vars: Map<string, TemplateVar>): [number, number
 function testEdgeCases(vars: Map<string, TemplateVar>): [number, number] {
   const tests: TestCase[] = [
     { name: 'String literal', expr: '"hello world"', expectedType: 'string' },
-    { name: 'Number literal', expr: '42', expectedType: 'float64' },
+    { name: 'Number literal', expr: '42', expectedType: 'int' },
     { name: 'Parenthesized expression', expr: '(gt .Count 5)', expectedType: 'bool' },
   ];
 

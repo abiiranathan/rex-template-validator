@@ -228,10 +228,8 @@ getCompletions(
 
 Run the test suite:
 
-```typescript
-import { runExpressionParserTests } from './expressionParserIntegration';
-
-runExpressionParserTests();
+```bash
+bun ./expressionParser.test.ts
 ```
 
 Expected output:
@@ -280,7 +278,7 @@ Expected output:
 ```
 
 ### Complex Expressions
-```go
+```html
 {{$count := len .Items}}
 {{if gt $count 0}}
   {{printf "Found %d items" $count}}

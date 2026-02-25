@@ -51,6 +51,10 @@ type User struct {
 	Name string
 }
 
+func (u *User) GetName() string {
+	return u.Name
+}
+
 // Prescription represents a prescription
 type Prescription struct {
 	// Drug name

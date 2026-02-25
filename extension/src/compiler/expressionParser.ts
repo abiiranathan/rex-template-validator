@@ -341,7 +341,8 @@ class ExpressionParser {
             const functionKeywords = [
                 'index', 'slice', 'len', 'print', 'printf', 'println', 'call',
                 'html', 'js', 'urlquery', 'and', 'or', 'not', 'eq', 'ne',
-                'lt', 'le', 'gt', 'ge', 'add', 'sub', 'mul', 'div', 'mod'
+                'lt', 'le', 'gt', 'ge', 'add', 'sub', 'mul', 'div', 'mod',
+                'dict'
             ];
 
             if (functionKeywords.includes(name) || (this.funcMaps && this.funcMaps.has(name))) {
@@ -443,7 +444,8 @@ class ExpressionParser {
                 const functionKeywords = [
                     'index', 'slice', 'len', 'print', 'printf', 'println', 'call',
                     'html', 'js', 'urlquery', 'and', 'or', 'not', 'eq', 'ne',
-                    'lt', 'le', 'gt', 'ge', 'add', 'sub', 'mul', 'div', 'mod'
+                    'lt', 'le', 'gt', 'ge', 'add', 'sub', 'mul', 'div', 'mod',
+                    'dict'
                 ];
 
                 if (functionKeywords.includes(name) || (this.funcMaps && this.funcMaps.has(name))) {
@@ -692,7 +694,8 @@ export class TypeInferencer {
     private inferCallType(func: string, args: ExprNode[]): TypeResult | null {
         // 1. Prioritize user-defined functions from FuncMap. 
         // This allows them to override built-ins like 'add' and directly provides the precise return type.
-        if (this.funcMaps?.has(func)) {
+        // NOTE: We always infer dict call from builtins for proper context resolution.
+        if (func != "dict" && this.funcMaps?.has(func)) {
             const fn = this.funcMaps.get(func)!;
             if (fn.returns && fn.returns.length > 0) {
                 let retType = fn.returns[0].type;
@@ -752,6 +755,49 @@ export class TypeInferencer {
             case 'urlquery':
                 // Escaping functions return string
                 return { typeStr: 'string' };
+
+            case 'dict': {
+                if (args.length % 2 !== 0) {
+                    // Invalid dict call: odd number of arguments
+                    return { typeStr: 'map[string]any', isMap: true, fields: [] }; // Return a map type, but empty fields
+                }
+
+                const fields: FieldInfo[] = [];
+                for (let i = 0; i < args.length; i += 2) {
+                    const keyArg = args[i];
+                    const valueArg = args[i + 1];
+
+                    if (keyArg.kind !== 'string') {
+                        // Dict keys must be string literals, cannot infer dynamically
+                        // Continue to process other pairs, but this one is problematic
+                        continue;
+                    }
+
+                    const keyName = keyArg.value;
+                    const valueType = this.inferNodeType(valueArg);
+
+                    if (valueType) {
+                        fields.push({
+                            name: keyName,
+                            type: valueType.typeStr,
+                            fields: valueType.fields,
+                            isSlice: valueType.isSlice ?? false,
+                            isMap: valueType.isMap ?? false,
+                            elemType: valueType.elemType,
+                            keyType: valueType.keyType,
+                        });
+                    } else {
+                        // Couldn't infer type of value, add as unknown
+                        fields.push({
+                            name: keyName,
+                            type: 'unknown',
+                            isSlice: false,
+                            isMap: false,
+                        });
+                    }
+                }
+                return { typeStr: 'map[string]any', isMap: true, fields };
+            }
 
             case 'call': {
                 // call function arg...

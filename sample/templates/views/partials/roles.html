@@ -1,10 +1,13 @@
 {{ define "roles" }}
-{{ range $key, $v := . }}
-<!-- 1. Create a map with your dict function -->
-{{ $ctx := dict "key" $key "value" $v }}
-{{ end }}
+{{ template "profile" dict "name" "Abiira" "age" 30 }}
 {{ end}}
 
 {{ define "role_item" }}
 {{ .key }}: {{ .value }}
+{{ end }}
+
+{{ define "profile" }}
+Context: {{ . }}
+Name: {{ .name }}
+Age: {{ .age }}
 {{ end }}

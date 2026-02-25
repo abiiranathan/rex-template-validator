@@ -936,7 +936,7 @@ export class TemplateValidator {
         if (!node.partialName) return;
 
         const contextArg = node.partialContext ?? '.';
-        if (contextArg !== '.' && contextArg !== '$') {
+        if (contextArg !== '.' && contextArg !== '$' && !contextArg.startsWith('dict ')) {
             const contextPath = this.parser.parseDotPath(contextArg);
             if (contextPath.length > 0 && contextPath[0] !== '.') {
                 const result = resolvePath(contextPath, vars, scopeStack, blockLocals);
@@ -1055,6 +1055,20 @@ export class TemplateValidator {
         let childStack: ScopeFrame[];
         if (contextArg === '.' || contextArg === '$') {
             childStack = scopeStack;
+        } else if (contextArg.startsWith('dict ')) {
+            // Handle inline dict calls specifically
+            const dictType = inferExpressionType(contextArg, vars, scopeStack, blockLocals, this.graphBuilder.getGraph().funcMaps);
+            childStack = dictType && dictType.fields
+                ? [{
+                    key: '.',
+                    typeStr: dictType.typeStr,
+                    fields: dictType.fields,
+                    isMap: dictType.isMap,
+                    keyType: dictType.keyType,
+                    elemType: dictType.elemType,
+                    isSlice: dictType.isSlice,
+                }]
+                : scopeStack;
         } else {
             const result = resolvePath(
                 this.parser.parseDotPath(contextArg),
@@ -1174,6 +1188,20 @@ export class TemplateValidator {
             let childStack: ScopeFrame[];
             if (contextArg === '.' || contextArg === '$') {
                 childStack = scopeStack;
+            } else if (contextArg.startsWith('dict ')) {
+                // Handle inline dict calls specifically
+                const dictType = inferExpressionType(contextArg, vars, scopeStack, blockLocals, this.graphBuilder.getGraph().funcMaps);
+                childStack = dictType && dictType.fields
+                    ? [{
+                        key: '.',
+                        typeStr: dictType.typeStr,
+                        fields: dictType.fields,
+                        isMap: dictType.isMap,
+                        keyType: dictType.keyType,
+                        elemType: dictType.elemType,
+                        isSlice: dictType.isSlice,
+                    }]
+                    : scopeStack;
             } else {
                 const result = resolvePath(
                     this.parser.parseDotPath(contextArg),
@@ -1238,6 +1266,25 @@ export class TemplateValidator {
                 };
             }
             return { vars: new Map(vars) };
+        }
+
+        // Handle inline dict calls specifically
+        if (contextArg.startsWith('dict ')) {
+            const dictType = inferExpressionType(contextArg, vars, scopeStack, blockLocals, this.graphBuilder.getGraph().funcMaps);
+            if (dictType && dictType.fields) {
+                const partialVars = new Map<string, TemplateVar>();
+                for (const f of dictType.fields) {
+                    partialVars.set(f.name, fieldInfoToTemplateVar(f));
+                }
+                return {
+                    vars: partialVars,
+                    isMap: dictType.isMap,
+                    keyType: dictType.keyType,
+                    elemType: dictType.elemType,
+                    isSlice: dictType.isSlice,
+                    rootTypeStr: dictType.typeStr
+                };
+            }
         }
 
         const result = resolvePath(
@@ -2435,6 +2482,21 @@ export class TemplateValidator {
                     const frame = scopeStack.slice().reverse().find(f => f.key === '.');
                     if (frame) return { typeStr: frame.typeStr, fields: frame.fields, isMap: frame.isMap, keyType: frame.keyType, elemType: frame.elemType, isSlice: frame.isSlice };
                     return { typeStr: 'context', fields: [...vars.values()] as unknown as FieldInfo[] };
+                }
+
+                // If contextArg is a dict call, we need to infer its type
+                if (contextArg.startsWith('dict ')) {
+                    const dictType = inferExpressionType(contextArg, vars, scopeStack, blockLocals, this.graphBuilder.getGraph().funcMaps);
+                    if (dictType) {
+                        return {
+                            typeStr: dictType.typeStr,
+                            fields: dictType.fields,
+                            isMap: dictType.isMap,
+                            keyType: dictType.keyType,
+                            elemType: dictType.elemType,
+                            isSlice: dictType.isSlice
+                        };
+                    }
                 }
 
                 const result = resolvePath(this.parser.parseDotPath(contextArg), vars, scopeStack, blockLocals);
