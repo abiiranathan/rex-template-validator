@@ -1,9 +1,13 @@
 {
   "name": "rex-analyzer",
   "displayName": "Golang Template Validator and Language Server",
-  "description": "Validates Go template variables in .html/.tmpl files used with the rex web framework",
+  "description": "Validates Go template variables in .html/.tmpl files and provides intellisense, go to definition etc",
   "version": "0.2.0",
   "publisher": "Dr. Abiira Nathan",
+  "repository": {
+    "url": "https://github.com/abiiranathan/rex-template-validator.git"
+  },
+  "license": "MIT",
   "engines": {
     "vscode": "^1.85.0"
   },

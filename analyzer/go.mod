@@ -1,6 +1,6 @@
 module github.com/rex-template-analyzer
 
-go 1.24.0
+go 1.25.7
 
 require golang.org/x/tools v0.42.0
 

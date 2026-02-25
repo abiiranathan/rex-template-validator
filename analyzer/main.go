@@ -1,3 +1,14 @@
+/*
+Package main provides the command-line interface for the Rex template analyzer.
+
+It performs static analysis on Go source code to identify template rendering
+invocations, function map declarations, and validate templates against their
+corresponding render calls.
+
+The analyzer can output various forms of JSON results, including detected
+render calls, function maps, validation errors, and named template blocks.
+It supports gzip compression for the output.
+*/
 package main
 
 import (

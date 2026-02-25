@@ -1,4 +1,19 @@
 // Package validator
+/*
+Package validator performs static analysis on Go templates to identify potential issues.
+
+It analyzes template render calls, discovers template function maps, and validates
+template usages against their defined contexts. This package also includes
+functionality to extract and validate named template blocks (`define` and `block` actions).
+
+The validator provides:
+  - Detection of undefined template variables
+  - Validation of field access paths
+  - Detection of missing template files and named blocks
+  - Duplicate named block detection
+  - Scope-aware validation (handles with, range, if blocks)
+  - Support for nested templates and partials
+*/
 package validator
 
 import (
@@ -6,38 +21,157 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 )
 
-// parseAllNamedTemplates extracts all define and block declarations from template files
+// ═══════════════════════════════════════════════════════════════════════════
+// NAMED TEMPLATE PARSING (CONCURRENT)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// parseAllNamedTemplates extracts all {{define}} and {{block}} declarations
+// from template files in the specified directory tree.
+//
+// This function performs concurrent file processing for improved performance
+// on large template directories. Each template file is parsed independently
+// to extract named block definitions.
+//
+// Named blocks can be declared with either:
+//   - {{define "blockName"}}...{{end}}
+//   - {{block "blockName" .}}...{{end}}
+//
+// The function detects duplicate declarations of the same block name and
+// returns them as errors.
+//
+// Parameters:
+//   - baseDir: Root directory of the project
+//   - templateRoot: Subdirectory containing template files (relative to baseDir)
+//
+// Returns:
+//   - registry: Map of block names to their definitions (may contain duplicates)
+//   - errors: Slice of duplicate block errors
+//
+// Concurrency: File processing is done concurrently using a worker pool.
+// Thread-safety: Uses sync.Map for concurrent writes, then converts to regular map.
 func parseAllNamedTemplates(baseDir, templateRoot string) (map[string][]NamedBlockEntry, []NamedBlockDuplicateError) {
-	registry := make(map[string][]NamedBlockEntry)
 	root := filepath.Join(baseDir, templateRoot)
 
+	// Phase 1: Collect all template file paths
+	var templateFiles []string
 	filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
 			return nil
 		}
-		if !isFileBasedPartial(path) {
-			return nil
+		if isFileBasedPartial(path) {
+			templateFiles = append(templateFiles, path)
 		}
+		return nil
+	})
 
+	// Phase 2: Process files concurrently
+	registry := processTemplateFilesConcurrently(templateFiles, root)
+
+	// Phase 3: Detect duplicates
+	errors := detectDuplicateBlocks(registry)
+
+	return registry, errors
+}
+
+// processTemplateFilesConcurrently processes template files using a worker pool
+// to extract named block definitions concurrently.
+//
+// Concurrency model:
+//   - One worker per CPU core (optimal for I/O + CPU mixed workload)
+//   - Workers read from shared file channel
+//   - Results collected via sync.Map (concurrent-safe)
+//   - Converted to regular map after all workers complete
+//
+// Thread-safety: Uses sync.Map for concurrent writes during processing.
+func processTemplateFilesConcurrently(templateFiles []string, root string) map[string][]NamedBlockEntry {
+	if len(templateFiles) == 0 {
+		return make(map[string][]NamedBlockEntry)
+	}
+
+	// Shared data structures
+	var sharedRegistry sync.Map // map[string][]NamedBlockEntry
+	numWorkers := max(runtime.NumCPU(), 1)
+	fileChan := make(chan string, len(templateFiles))
+
+	// Start workers
+	var wg sync.WaitGroup
+	for range numWorkers {
+		wg.Go(func() {
+			processTemplateFileWorker(fileChan, root, &sharedRegistry)
+		})
+	}
+
+	// Feed work to workers
+	for _, path := range templateFiles {
+		fileChan <- path
+	}
+	close(fileChan)
+
+	// Wait for completion
+	wg.Wait()
+
+	// Convert sync.Map to regular map
+	return convertRegistryToMap(&sharedRegistry)
+}
+
+// processTemplateFileWorker is a worker function that processes template files
+// from a channel and extracts named block definitions.
+//
+// Each worker:
+//  1. Reads template file content
+//  2. Computes relative path for error reporting
+//  3. Extracts named blocks from content
+//  4. Stores results in shared registry (thread-safe)
+//
+// Thread-safety: All writes to sharedRegistry use sync.Map's thread-safe operations.
+func processTemplateFileWorker(
+	fileChan <-chan string,
+	root string,
+	sharedRegistry *sync.Map,
+) {
+	for path := range fileChan {
+		// Calculate relative path for consistent error reporting
 		rel, err := filepath.Rel(root, path)
 		if err != nil {
 			rel = path
 		}
-		// Normalize rel path to use forward slashes for cross-platform TS consistency
+		// Normalize to forward slashes for cross-platform consistency
 		rel = filepath.ToSlash(rel)
 
+		// Read file content
 		content, err := os.ReadFile(path)
 		if err != nil {
-			return nil
+			continue // Skip files we can't read
 		}
 
-		extractNamedTemplatesFromContent(string(content), path, rel, registry)
-		return nil
+		// Extract named templates and store in shared registry
+		extractNamedTemplatesFromContent(string(content), path, rel, sharedRegistry)
+	}
+}
+
+// convertRegistryToMap converts a sync.Map registry to a regular map.
+// This is done after all concurrent writes are complete for better read performance.
+func convertRegistryToMap(sharedRegistry *sync.Map) map[string][]NamedBlockEntry {
+	registry := make(map[string][]NamedBlockEntry)
+
+	sharedRegistry.Range(func(key, value any) bool {
+		registry[key.(string)] = value.([]NamedBlockEntry)
+		return true
 	})
 
+	return registry
+}
+
+// detectDuplicateBlocks identifies block names that are defined multiple times.
+// This is an error condition as each block name should be unique.
+//
+// Returns a slice of NamedBlockDuplicateError, one for each duplicated block name.
+func detectDuplicateBlocks(registry map[string][]NamedBlockEntry) []NamedBlockDuplicateError {
 	var errors []NamedBlockDuplicateError
 	for name, entries := range registry {
 		if len(entries) > 1 {
@@ -50,21 +184,53 @@ func parseAllNamedTemplates(baseDir, templateRoot string) (map[string][]NamedBlo
 		}
 	}
 
-	return registry, errors
+	return errors
 }
 
-// extractNamedTemplatesFromContent finds defined templates within content
-func extractNamedTemplatesFromContent(content, absolutePath, templatePath string, registry map[string][]NamedBlockEntry) {
-	var activeName string
-	var startIndex int
-	var startLine int
-	var startCol int
-	depth := 0
+// ═══════════════════════════════════════════════════════════════════════════
+// NAMED TEMPLATE CONTENT EXTRACTION
+// ═══════════════════════════════════════════════════════════════════════════
 
+// extractNamedTemplatesFromContent parses template content to find {{define}}
+// and {{block}} declarations and extracts their content.
+//
+// Algorithm:
+//  1. Scans content line-by-line for template actions
+//  2. Tracks nesting depth to handle nested define/block declarations
+//  3. Extracts content between declaration and matching {{end}}
+//  4. Records source location (file, line, column) for error reporting
+//
+// Supported syntax:
+//   - {{define "name"}}...{{end}}
+//   - {{block "name" .}}...{{end}}
+//
+// Nesting behavior:
+//   - Tracks depth to handle nested control structures (if/with/range/block)
+//   - Only extracts top-level define/block declarations
+//   - Inner define blocks are included in outer block's content
+//
+// Parameters:
+//   - content: Template file content as string
+//   - absolutePath: Full filesystem path to template file
+//   - templatePath: Relative path for display in errors
+//   - registry: Target registry (sync.Map or regular map via interface)
+//
+// Thread-safety: When used with sync.Map, concurrent calls are safe.
+func extractNamedTemplatesFromContent(content, absolutePath, templatePath string, registry any) {
+	// State tracking for nested block extraction
+	var activeName string // Name of current block being extracted
+	var startIndex int    // Content start position (after opening action)
+	var startLine int     // Line number of block declaration
+	var startCol int      // Column number of block declaration
+	depth := 0            // Nesting depth (0 = not in block, >0 = in block)
+
+	// Line tracking for accurate error reporting
 	lineStart := 0
 	lineNum := 1
 
+	// Process content line by line
 	for lineStart < len(content) {
+		// Extract current line
 		lineEnd := strings.IndexByte(content[lineStart:], '\n')
 		var line string
 		if lineEnd == -1 {
@@ -74,14 +240,17 @@ func extractNamedTemplatesFromContent(content, absolutePath, templatePath string
 			line = content[lineStart:lineEnd]
 		}
 
+		// Scan line for template actions {{ ... }}
 		cur := 0
 		for {
+			// Find opening delimiter
 			openRel := strings.Index(line[cur:], "{{")
 			if openRel == -1 {
 				break
 			}
 			open := cur + openRel
 
+			// Find closing delimiter
 			closeRel := strings.Index(line[open:], "}}")
 			if closeRel == -1 {
 				break
@@ -89,38 +258,32 @@ func extractNamedTemplatesFromContent(content, absolutePath, templatePath string
 			close := open + closeRel
 			fullActionEndRel := close + 2
 
-			// Absolute positions
+			// Calculate absolute positions in content
 			fullActionStart := lineStart + open
 			fullActionEnd := lineStart + fullActionEndRel
 
-			// Content extraction
+			// Extract action content (trim whitespace)
 			contentStart := open + 2
-			for contentStart < close {
-				r := line[contentStart]
-				if r != ' ' && r != '\t' {
-					break
-				}
+			for contentStart < close && isWhitespace(line[contentStart]) {
 				contentStart++
 			}
 
 			contentEnd := close
-			for contentEnd > contentStart {
-				r := line[contentEnd-1]
-				if r != ' ' && r != '\t' {
-					break
-				}
+			for contentEnd > contentStart && isWhitespace(line[contentEnd-1]) {
 				contentEnd--
 			}
 
 			action := line[contentStart:contentEnd]
 
-			// Advance for next iteration
+			// Move to next action
 			cur = fullActionEndRel
 
+			// Skip comments
 			if strings.HasPrefix(action, "/*") || strings.HasPrefix(action, "//") {
 				continue
 			}
 
+			// Parse action into words
 			words := strings.Fields(action)
 			if len(words) == 0 {
 				continue
@@ -128,45 +291,60 @@ func extractNamedTemplatesFromContent(content, absolutePath, templatePath string
 
 			first := words[0]
 
+			// Handle different action types
 			switch first {
 			case "if", "with", "range", "block":
 				if activeName != "" {
+					// Inside a block: increment depth
 					depth++
 				} else if first == "block" && len(words) >= 2 {
+					// Start of new block declaration
 					activeName = strings.Trim(words[1], `"`)
 					startIndex = fullActionEnd
 					startLine = lineNum
 					startCol = open + 1
 					depth = 1
 				}
+
 			case "define":
 				if activeName != "" {
+					// Inside a block: increment depth
 					depth++
 				} else if len(words) >= 2 {
+					// Start of new define declaration
 					activeName = strings.Trim(words[1], `"`)
 					startIndex = fullActionEnd
 					startLine = lineNum
 					startCol = open + 1
 					depth = 1
 				}
+
 			case "end":
 				if activeName != "" {
+					// Decrement depth
 					depth--
 					if depth == 0 {
-						registry[activeName] = append(registry[activeName], NamedBlockEntry{
+						// Reached matching end - extract block content
+						entry := NamedBlockEntry{
 							Name:         activeName,
 							Content:      content[startIndex:fullActionStart],
 							AbsolutePath: absolutePath,
 							TemplatePath: templatePath,
 							Line:         startLine,
 							Col:          startCol,
-						})
+						}
+
+						// Store in registry (thread-safe for sync.Map)
+						storeNamedBlock(registry, activeName, entry)
+
+						// Reset state
 						activeName = ""
 					}
 				}
 			}
 		}
 
+		// Move to next line
 		if lineEnd == -1 {
 			lineStart = len(content)
 		} else {
@@ -176,38 +354,224 @@ func extractNamedTemplatesFromContent(content, absolutePath, templatePath string
 	}
 }
 
-// ValidateTemplates validates all templates against their render calls
+// storeNamedBlock stores a named block entry in the registry.
+// Handles both sync.Map (concurrent) and regular map (sequential) registries.
+//
+// Thread-safety: When registry is *sync.Map, operations are thread-safe.
+func storeNamedBlock(registry any, name string, entry NamedBlockEntry) {
+	switch r := registry.(type) {
+	case *sync.Map:
+		// Concurrent registry: use sync.Map operations
+		for {
+			val, loaded := r.LoadOrStore(name, []NamedBlockEntry{entry})
+			if !loaded {
+				// Successfully stored new entry
+				return
+			}
+
+			// Entry exists: append to existing slice
+			existing := val.([]NamedBlockEntry)
+			updated := append(existing, entry)
+
+			// Attempt to update (may fail if another goroutine updated concurrently)
+			if r.CompareAndSwap(name, existing, updated) {
+				return
+			}
+			// CAS failed: retry
+		}
+
+	case map[string][]NamedBlockEntry:
+		// Sequential registry: direct map access
+		r[name] = append(r[name], entry)
+	}
+}
+
+// isWhitespace checks if a byte is whitespace (space or tab).
+func isWhitespace(b byte) bool {
+	return b == ' ' || b == '\t'
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TEMPLATE VALIDATION (CONCURRENT)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ValidateTemplates validates all templates against their render calls.
+// This is the main entry point for template validation.
+//
+// Validation process:
+//  1. Parse all named blocks from template directory (concurrent)
+//  2. Detect duplicate block definitions
+//  3. Validate each render call against its template (concurrent)
+//  4. Aggregate all errors
+//
+// For each render call, the validator:
+//   - Locates the template file or named block
+//   - Checks all variable references in template actions
+//   - Validates field access paths
+//   - Validates nested template calls (recursively)
+//   - Tracks scope changes (with, range, if blocks)
+//
+// Parameters:
+//   - renderCalls: Slice of render calls discovered by static analysis
+//   - baseDir: Root directory of the project
+//   - templateRoot: Subdirectory containing template files
+//
+// Returns:
+//   - allErrors: All validation errors found across all templates
+//   - namedBlocks: Registry of all named block definitions
+//   - namedBlockErrors: Errors related to duplicate block definitions
+//
+// Concurrency: Render calls are validated concurrently for better performance.
+// Thread-safety: Results are aggregated safely using channels.
 func ValidateTemplates(renderCalls []RenderCall, baseDir string, templateRoot string) ([]ValidationResult, map[string][]NamedBlockEntry, []NamedBlockDuplicateError) {
+	// Phase 1: Parse all named blocks (concurrent)
 	namedBlocks, namedBlockErrors := parseAllNamedTemplates(baseDir, templateRoot)
 
-	var allErrors = []ValidationResult{}
-	for _, rc := range renderCalls {
-		templatePath := filepath.Join(baseDir, templateRoot, rc.Template)
-		errors := validateTemplateFile(templatePath, rc.Vars, rc.Template, baseDir, templateRoot, namedBlocks)
-		for i := range errors {
-			errors[i].GoFile = rc.File
-			errors[i].GoLine = rc.Line
-		}
-		allErrors = append(allErrors, errors...)
-	}
+	// Phase 2: Validate all render calls (concurrent)
+	allErrors := validateRenderCallsConcurrently(renderCalls, baseDir, templateRoot, namedBlocks)
+
 	return allErrors, namedBlocks, namedBlockErrors
 }
 
-// validateTemplateFile validates a single template file
-func validateTemplateFile(templatePath string, vars []TemplateVar, templateName string, baseDir, templateRoot string, registry map[string][]NamedBlockEntry) []ValidationResult {
-	content, err := os.ReadFile(templatePath)
-	if err != nil {
-		// If the template is a named block, validate its content
-		if entries, ok := registry[templateName]; ok && len(entries) > 0 {
-			varMap := make(map[string]TemplateVar)
-			for _, v := range vars {
-				varMap[v.Name] = v
-			}
-			// Use entries[0].TemplatePath so the error maps to the correct file
-			// Use entries[0].Line so the error maps to the correct line in the file
-			return validateTemplateContent(entries[0].Content, varMap, entries[0].TemplatePath, baseDir, templateRoot, entries[0].Line, registry)
+// validateRenderCallsConcurrently validates multiple render calls concurrently
+// using a worker pool pattern.
+//
+// Concurrency model:
+//   - One worker per CPU core
+//   - Each worker validates a subset of render calls
+//   - Results are collected via channels and aggregated
+//   - No shared mutable state between workers
+//
+// Thread-safety: Each worker operates on independent data. Results are
+// aggregated sequentially from the result channel.
+func validateRenderCallsConcurrently(
+	renderCalls []RenderCall,
+	baseDir string,
+	templateRoot string,
+	namedBlocks map[string][]NamedBlockEntry,
+) []ValidationResult {
+	if len(renderCalls) == 0 {
+		return nil
+	}
+
+	// Setup worker pool
+	numWorkers := max(runtime.NumCPU(), 1)
+	chunkSize := (len(renderCalls) + numWorkers - 1) / numWorkers
+	resultChan := make(chan []ValidationResult, numWorkers)
+	var wg sync.WaitGroup
+
+	// Spawn workers
+	for w := range numWorkers {
+		start := w * chunkSize
+		if start >= len(renderCalls) {
+			break
+		}
+		end := min(start+chunkSize, len(renderCalls))
+		chunk := renderCalls[start:end]
+
+		wg.Go(func() {
+			validateRenderCallsWorker(chunk, baseDir, templateRoot, namedBlocks, resultChan)
+		})
+	}
+
+	// Close result channel when all workers complete
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// Aggregate results
+	var allErrors []ValidationResult
+	for errors := range resultChan {
+		allErrors = append(allErrors, errors...)
+	}
+
+	return allErrors
+}
+
+// validateRenderCallsWorker validates a chunk of render calls.
+// This is the worker function used in the concurrent validation pool.
+//
+// Each worker independently validates its assigned render calls without
+// accessing shared mutable state, ensuring thread-safety.
+func validateRenderCallsWorker(
+	chunk []RenderCall,
+	baseDir string,
+	templateRoot string,
+	namedBlocks map[string][]NamedBlockEntry,
+	resultChan chan<- []ValidationResult,
+) {
+	var errors []ValidationResult
+
+	for _, rc := range chunk {
+		templatePath := filepath.Join(baseDir, templateRoot, rc.Template)
+
+		// Validate this render call
+		rcErrors := validateTemplateFile(templatePath, rc.Vars, rc.Template, baseDir, templateRoot, namedBlocks)
+
+		// Annotate errors with source location (Go file/line where render call occurs)
+		for i := range rcErrors {
+			rcErrors[i].GoFile = rc.File
+			rcErrors[i].GoLine = rc.Line
 		}
 
+		errors = append(errors, rcErrors...)
+	}
+
+	resultChan <- errors
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SINGLE TEMPLATE VALIDATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+// validateTemplateFile validates a single template file against its expected
+// variable context.
+//
+// Validation logic:
+//  1. Attempt to read template file
+//  2. If file not found, check if it's a named block
+//  3. If found, validate content against provided variables
+//
+// Parameters:
+//   - templatePath: Full path to template file
+//   - vars: Variables expected to be available in template
+//   - templateName: Display name for error messages
+//   - baseDir: Root directory of project
+//   - templateRoot: Template subdirectory
+//   - registry: Named block registry
+//
+// Returns: Slice of validation errors found in this template
+//
+// Thread-safety: Read-only operations on shared data structures (registry, vars).
+func validateTemplateFile(
+	templatePath string,
+	vars []TemplateVar,
+	templateName string,
+	baseDir, templateRoot string,
+	registry map[string][]NamedBlockEntry,
+) []ValidationResult {
+	// Attempt to read template file
+	content, err := os.ReadFile(templatePath)
+	if err != nil {
+		// File not found - check if it's a named block
+		if entries, ok := registry[templateName]; ok && len(entries) > 0 {
+			// Template is a named block - validate its content
+			varMap := buildVarMap(vars)
+
+			entry := entries[0]
+			return validateTemplateContent(
+				entry.Content,
+				varMap,
+				entry.TemplatePath,
+				baseDir,
+				templateRoot,
+				entry.Line,
+				registry,
+			)
+		}
+
+		// Neither file nor named block found
 		return []ValidationResult{{
 			Template: templateName,
 			Line:     1,
@@ -216,72 +580,105 @@ func validateTemplateFile(templatePath string, vars []TemplateVar, templateName 
 			Message:  fmt.Sprintf("Template or named block not found: %s", templateName),
 			Severity: "error",
 		}}
-
 	}
 
-	varMap := make(map[string]TemplateVar)
+	// File found - validate content
+	varMap := buildVarMap(vars)
+	return validateTemplateContent(
+		string(content),
+		varMap,
+		templateName,
+		baseDir,
+		templateRoot,
+		1,
+		registry,
+	)
+}
+
+// buildVarMap converts a slice of TemplateVar to a map for O(1) lookup.
+func buildVarMap(vars []TemplateVar) map[string]TemplateVar {
+	varMap := make(map[string]TemplateVar, len(vars))
 	for _, v := range vars {
 		varMap[v.Name] = v
 	}
-	return validateTemplateContent(string(content), varMap, templateName, baseDir, templateRoot, 1, registry)
+	return varMap
 }
 
-// isFileBasedPartial returns true if the template name looks like a file path
-func isFileBasedPartial(name string) bool {
-	if strings.ContainsAny(name, "/\\") {
-		return true
-	}
-	ext := strings.ToLower(filepath.Ext(name))
-	switch ext {
-	case ".html", ".tmpl", ".gohtml", ".tpl", ".htm":
-		return true
-	}
-	return false
-}
+// ═══════════════════════════════════════════════════════════════════════════
+// TEMPLATE CONTENT VALIDATION WITH SCOPE TRACKING
+// ═══════════════════════════════════════════════════════════════════════════
 
-// validateTemplateContent validates template content with proper scope tracking
-func validateTemplateContent(content string, varMap map[string]TemplateVar, templateName string, baseDir, templateRoot string, lineOffset int, registry map[string][]NamedBlockEntry) []ValidationResult {
+// validateTemplateContent performs comprehensive validation of template content
+// with full scope tracking and nested template support.
+//
+// This is the core validation function that:
+//   - Parses all template actions ({{ ... }})
+//   - Tracks scope changes (with, range, if blocks)
+//   - Validates all variable references
+//   - Validates field access paths
+//   - Handles nested template calls recursively
+//   - Skips validation inside {{define}} blocks (separate scope)
+//
+// Scope tracking:
+//   - Root scope: All top-level variables from varMap
+//   - with scope: Changes dot context to specific variable
+//   - range scope: Creates iteration scope with collection elements
+//   - if scope: Maintains current scope (just for depth tracking)
+//
+// Parameters:
+//   - content: Template content string to validate
+//   - varMap: Available variables (map for O(1) lookup)
+//   - templateName: Template name for error reporting
+//   - baseDir: Project root directory
+//   - templateRoot: Template subdirectory
+//   - lineOffset: Starting line number (for nested blocks)
+//   - registry: Named block registry
+//
+// Returns: Slice of validation errors found in this content
+//
+// Thread-safety: Read-only operations on shared data (varMap, registry).
+// This function can be called concurrently for different templates.
+func validateTemplateContent(
+	content string,
+	varMap map[string]TemplateVar,
+	templateName string,
+	baseDir, templateRoot string,
+	lineOffset int,
+	registry map[string][]NamedBlockEntry,
+) []ValidationResult {
 	var errors []ValidationResult
 
+	// Initialize scope stack with root scope
 	var scopeStack []ScopeType
-
-	rootScope := ScopeType{
-		IsRoot: true,
-		Fields: make([]FieldInfo, 0),
-	}
-	for name, v := range varMap {
-		rootScope.Fields = append(rootScope.Fields, FieldInfo{
-			Name:    name,
-			TypeStr: v.TypeStr,
-			IsSlice: v.IsSlice,
-			Fields:  v.Fields,
-		})
-	}
+	rootScope := buildRootScope(varMap)
 	scopeStack = append(scopeStack, rootScope)
 
-	// defineSkipDepth tracks depth inside {{ define "..." }} blocks.
+	// Track depth inside {{define}} blocks (validation is skipped)
 	defineSkipDepth := 0
 
+	// Process content line by line
 	lineStart := 0
 	lineNum := 0
 
 	for lineStart < len(content) {
+		// Extract current line
 		lineEnd := strings.IndexByte(content[lineStart:], '\n')
 		var line string
 		if lineEnd == -1 {
 			line = content[lineStart:]
-			// Move lineStart to end to break loop after this
 		} else {
 			lineEnd += lineStart
 			line = content[lineStart:lineEnd]
 		}
 
+		// Calculate actual line number (with offset for nested blocks)
 		actualLineNum := lineNum + lineOffset
 		lineNum++
 
+		// Scan line for template actions
 		cur := 0
-
 		for {
+			// Find action delimiters
 			openRel := strings.Index(line[cur:], "{{")
 			if openRel == -1 {
 				break
@@ -295,48 +692,44 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 			close := open + closeRel
 			fullActionEnd := close + 2
 
-			// Mimic regex behavior: find content start/end skipping whitespace
+			// Extract and trim action content
 			contentStart := open + 2
-			for contentStart < close {
-				r := line[contentStart]
-				if r != ' ' && r != '\t' {
-					break
-				}
+			for contentStart < close && isWhitespace(line[contentStart]) {
 				contentStart++
 			}
 
 			contentEnd := close
-			for contentEnd > contentStart {
-				r := line[contentEnd-1]
-				if r != ' ' && r != '\t' {
-					break
-				}
+			for contentEnd > contentStart && isWhitespace(line[contentEnd-1]) {
 				contentEnd--
 			}
 
-			// action is the trimmed content
 			action := line[contentStart:contentEnd]
 			col := contentStart + 1
 
-			// Advance for next iteration
+			// Move to next action
 			cur = fullActionEnd
 
+			// Skip comments
 			if strings.HasPrefix(action, "/*") || strings.HasPrefix(action, "//") {
 				continue
 			}
 
+			// Parse action into words
 			words := strings.Fields(action)
 			first := ""
 			if len(words) > 0 {
 				first = words[0]
 			}
 
-			// ── define skip logic ──────────────────────────────────────────────
+			// ── Handle {{define}} blocks ────────────────────────────────────
+			// Define blocks create separate scopes and should not be validated
+			// in the context of the parent template.
 			if first == "define" {
 				defineSkipDepth++
 				continue
 			}
 
+			// Track nesting depth inside define blocks
 			if defineSkipDepth > 0 {
 				switch first {
 				case "if", "with", "range", "block":
@@ -347,25 +740,34 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 				continue
 			}
 
-			// ── block handling ─────────────────────────────────────────────────────
+			// ── Handle {{block}} blocks ─────────────────────────────────────
+			// Block is similar to define but with inline content
 			if first == "block" {
 				defineSkipDepth++
 				continue
 			}
 
-			// Validate all variables in the action against the CURRENT scope.
-			// Skip this for `template` actions — the dedicated handler below
-			// validates the context argument itself, so scanning here would
-			// produce duplicate errors for invalid context args like .NonExistent.
+			// ── Validate variables in action ────────────────────────────────
+			// Extract and validate all variable references in this action.
+			// Skip for {{template}} actions as they're handled specially below.
 			if first != "template" {
 				extractVariablesFromAction(action, func(v string) {
-					if err := validateVariableInScope(v, scopeStack, varMap, actualLineNum, col, templateName); err != nil {
+					if err := validateVariableInScope(
+						v,
+						scopeStack,
+						varMap,
+						actualLineNum,
+						col,
+						templateName,
+					); err != nil {
 						errors = append(errors, *err)
 					}
 				})
 			}
 
-			// Handle range
+			// ── Handle scope-modifying actions ──────────────────────────────
+
+			// Handle {{range}} - creates iteration scope
 			if first == "range" {
 				rangeExpr := strings.TrimSpace(action[6:])
 				newScope := createScopeFromRange(rangeExpr, scopeStack, varMap)
@@ -373,7 +775,7 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 				continue
 			}
 
-			// Handle with
+			// Handle {{with}} - changes dot context
 			if first == "with" {
 				withExpr := strings.TrimSpace(action[5:])
 				newScope := createScopeFromWith(withExpr, scopeStack, varMap)
@@ -381,9 +783,10 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 				continue
 			}
 
-			// Handle if (pushes copy of current scope since `if` needs an `end`)
+			// Handle {{if}} - maintains current scope
 			if first == "if" {
 				if len(scopeStack) > 0 {
+					// Copy current scope for this if block
 					scopeStack = append(scopeStack, scopeStack[len(scopeStack)-1])
 				} else {
 					scopeStack = append(scopeStack, ScopeType{})
@@ -391,7 +794,7 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 				continue
 			}
 
-			// Handle end
+			// Handle {{end}} - pop scope
 			if first == "end" {
 				if len(scopeStack) > 1 {
 					scopeStack = scopeStack[:len(scopeStack)-1]
@@ -399,18 +802,19 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 				continue
 			}
 
-			// Handle template calls
+			// ── Handle {{template}} calls ───────────────────────────────────
+			// Template calls invoke other templates/named blocks with a context.
 			if first == "template" {
 				parts := parseTemplateAction(action)
 
 				if len(parts) >= 1 {
 					tmplName := parts[0]
-
 					var contextArg string
 					if len(parts) >= 2 {
 						contextArg = parts[1]
 					}
 
+					// Validate context argument exists
 					if contextArg != "" && contextArg != "." {
 						if !validateContextArg(contextArg, scopeStack, varMap) {
 							errors = append(errors, ValidationResult{
@@ -425,20 +829,34 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 						}
 					}
 
+					// Validate nested template - check if it's a named block
 					if entries, ok := registry[tmplName]; ok && len(entries) > 0 {
 						nt := entries[0]
 
-						// Skip deep validation if context is an untracked local var ($var) to prevent false positives
+						// Skip deep validation for untracked local vars ($var)
+						// to prevent false positives
 						if contextArg != "" && contextArg != "." && !strings.HasPrefix(contextArg, ".") {
 							continue
 						}
 
+						// Build scope for nested template
 						partialScope := resolvePartialScope(contextArg, scopeStack, varMap)
 						partialVarMap := buildPartialVarMap(contextArg, partialScope, scopeStack, varMap)
-						partialErrors := validateTemplateContent(nt.Content, partialVarMap, nt.TemplatePath, baseDir, templateRoot, nt.Line, registry)
+
+						// Recursively validate nested template
+						partialErrors := validateTemplateContent(
+							nt.Content,
+							partialVarMap,
+							nt.TemplatePath,
+							baseDir,
+							templateRoot,
+							nt.Line,
+							registry,
+						)
 						errors = append(errors, partialErrors...)
 
 					} else if isFileBasedPartial(tmplName) {
+						// Check if it's a file-based partial
 						fullPath := filepath.Join(baseDir, templateRoot, tmplName)
 						if _, err := os.Stat(fullPath); os.IsNotExist(err) {
 							errors = append(errors, ValidationResult{
@@ -452,14 +870,24 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 							continue
 						}
 
-						// Skip deep validation if context is an untracked local var ($var) to prevent false positives
+						// Skip deep validation for untracked local vars
 						if contextArg != "" && contextArg != "." && !strings.HasPrefix(contextArg, ".") {
 							continue
 						}
 
+						// Build scope for file-based partial
 						partialScope := resolvePartialScope(contextArg, scopeStack, varMap)
 						partialVarMap := buildPartialVarMap(contextArg, partialScope, scopeStack, varMap)
-						partialErrors := validateTemplateFile(fullPath, scopeVarsToTemplateVars(partialVarMap), tmplName, baseDir, templateRoot, registry)
+
+						// Recursively validate file-based partial
+						partialErrors := validateTemplateFile(
+							fullPath,
+							scopeVarsToTemplateVars(partialVarMap),
+							tmplName,
+							baseDir,
+							templateRoot,
+							registry,
+						)
 						errors = append(errors, partialErrors...)
 					}
 				}
@@ -467,6 +895,7 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 			}
 		}
 
+		// Move to next line
 		if lineEnd == -1 {
 			lineStart = len(content)
 		} else {
@@ -477,36 +906,101 @@ func validateTemplateContent(content string, varMap map[string]TemplateVar, temp
 	return errors
 }
 
-// resolvePartialScope resolves what scope/type the context argument refers to
-func resolvePartialScope(contextArg string, scopeStack []ScopeType, varMap map[string]TemplateVar) ScopeType {
+// buildRootScope creates the root scope from the available variables.
+// The root scope contains all top-level variables accessible via $.VarName.
+func buildRootScope(varMap map[string]TemplateVar) ScopeType {
+	rootScope := ScopeType{
+		IsRoot: true,
+		Fields: make([]FieldInfo, 0, len(varMap)),
+	}
+
+	for name, v := range varMap {
+		rootScope.Fields = append(rootScope.Fields, FieldInfo{
+			Name:     name,
+			TypeStr:  v.TypeStr,
+			IsSlice:  v.IsSlice,
+			IsMap:    v.IsMap,
+			KeyType:  v.KeyType,
+			ElemType: v.ElemType,
+			Fields:   v.Fields,
+		})
+	}
+
+	return rootScope
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SCOPE MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════════════
+
+// resolvePartialScope determines what scope/type the context argument refers to
+// for a nested template call.
+//
+// Context argument types:
+//   - "." : Current scope (dot context)
+//   - ".VarName" : Specific variable from current scope
+//   - "$var" : Local pipeline variable (returns empty scope)
+//
+// Returns: ScopeType representing the context that will be passed to the nested template
+func resolvePartialScope(
+	contextArg string,
+	scopeStack []ScopeType,
+	varMap map[string]TemplateVar,
+) ScopeType {
 	if contextArg == "." {
+		// Pass current scope
 		if len(scopeStack) > 0 {
 			return scopeStack[len(scopeStack)-1]
 		}
 		return ScopeType{IsRoot: true}
 	}
+
 	if strings.HasPrefix(contextArg, ".") {
+		// Specific variable access
 		return createScopeFromExpression(contextArg, scopeStack, varMap)
 	}
+
+	// Untracked local variable or other expression
 	return ScopeType{Fields: []FieldInfo{}}
 }
 
-// buildPartialVarMap builds a varMap for a partial based on the context argument.
-func buildPartialVarMap(contextArg string, partialScope ScopeType, scopeStack []ScopeType, varMap map[string]TemplateVar) map[string]TemplateVar {
+// buildPartialVarMap constructs the variable map available to a nested template
+// based on the context argument.
+//
+// The resulting map represents what will be available as the dot (.) context
+// in the nested template.
+//
+// Context semantics:
+//   - "." : All variables from current scope
+//   - ".VarName" : Fields of VarName become top-level variables
+//
+// Returns: Map of variables available in the nested template
+func buildPartialVarMap(
+	contextArg string,
+	partialScope ScopeType,
+	scopeStack []ScopeType,
+	varMap map[string]TemplateVar,
+) map[string]TemplateVar {
 	result := make(map[string]TemplateVar)
 
 	if contextArg == "." {
+		// Pass entire current scope
 		if len(scopeStack) > 0 {
 			currentScope := scopeStack[len(scopeStack)-1]
 			if currentScope.IsRoot {
+				// Root scope: copy all variables
 				maps.Copy(result, varMap)
 			} else {
+				// Non-root scope: convert fields to variables
 				for _, f := range currentScope.Fields {
 					result[f.Name] = TemplateVar{
-						Name:    f.Name,
-						TypeStr: f.TypeStr,
-						Fields:  f.Fields,
-						IsSlice: f.IsSlice,
+						Name:     f.Name,
+						TypeStr:  f.TypeStr,
+						Fields:   f.Fields,
+						IsSlice:  f.IsSlice,
+						IsMap:    f.IsMap,
+						KeyType:  f.KeyType,
+						ElemType: f.ElemType,
 					}
 				}
 			}
@@ -514,53 +1008,163 @@ func buildPartialVarMap(contextArg string, partialScope ScopeType, scopeStack []
 		return result
 	}
 
-	// ".SomeVar[.Nested...]" — the partial's dot IS that value, so its fields become top-level
+	// Specific variable: its fields become top-level in nested template
 	for _, f := range partialScope.Fields {
 		result[f.Name] = TemplateVar{
-			Name:    f.Name,
-			TypeStr: f.TypeStr,
-			Fields:  f.Fields,
-			IsSlice: f.IsSlice,
+			Name:     f.Name,
+			TypeStr:  f.TypeStr,
+			Fields:   f.Fields,
+			IsSlice:  f.IsSlice,
+			IsMap:    f.IsMap,
+			KeyType:  f.KeyType,
+			ElemType: f.ElemType,
 		}
 	}
 
 	return result
 }
 
-// scopeVarsToTemplateVars converts a varMap back to a []TemplateVar slice
+// scopeVarsToTemplateVars converts a variable map back to a TemplateVar slice.
+// This is used when recursively validating file-based partials.
 func scopeVarsToTemplateVars(varMap map[string]TemplateVar) []TemplateVar {
-	var vars []TemplateVar
+	vars := make([]TemplateVar, 0, len(varMap))
 	for _, v := range varMap {
 		vars = append(vars, v)
 	}
 	return vars
 }
 
-// createScopeFromRange creates a new scope for a range block
-func createScopeFromRange(expr string, scopeStack []ScopeType, varMap map[string]TemplateVar) ScopeType {
+// createScopeFromRange creates a new scope for a {{range}} block.
+//
+// Range syntax:
+//   - {{range .Collection}} : Iterate over collection, dot becomes element
+//   - {{range $val := .Collection}} : Iterate with named value
+//   - {{range $key, $val := .Collection}} : Iterate with named key and value
+//
+// The new scope represents the type of elements being iterated over.
+//
+// Returns: ScopeType for the range block body
+func createScopeFromRange(
+	expr string,
+	scopeStack []ScopeType,
+	varMap map[string]TemplateVar,
+) ScopeType {
 	expr = strings.TrimSpace(expr)
 
+	var collectionScope ScopeType
+
+	// Handle assignment syntax: $var := expr
 	if strings.Contains(expr, ":=") {
 		parts := strings.SplitN(expr, ":=", 2)
 		if len(parts) == 2 {
 			varExpr := strings.TrimSpace(parts[1])
-			return createScopeFromExpression(varExpr, scopeStack, varMap)
+			collectionScope = createScopeFromExpression(varExpr, scopeStack, varMap)
+		} else {
+			// Fallback for malformed assignment
+			return ScopeType{Fields: []FieldInfo{}}
+		}
+	} else {
+		// Simple range: {{range .Collection}}
+		collectionScope = createScopeFromExpression(expr, scopeStack, varMap)
+	}
+
+	// If we are iterating over a map or slice, the scope inside the range
+	// corresponds to the element type, not the collection type.
+	// We need to unwrap the IsMap/IsSlice properties based on the element type.
+	if collectionScope.IsMap || collectionScope.IsSlice {
+		baseType := collectionScope.ElemType
+		// Unwrap pointer types
+		for strings.HasPrefix(baseType, "*") {
+			baseType = baseType[1:]
+		}
+
+		newIsMap := false
+		newIsSlice := false
+		newElemType := ""
+		// KeyType logic omitted for now as it's not critical for IsMap determination
+
+		if strings.HasPrefix(baseType, "map[") {
+			// Logic to parse map[Key]Value
+			depth := 0
+			splitIdx := -1
+
+			// Start after "map[" (index 3)
+			for i := 3; i < len(baseType); i++ {
+				if baseType[i] == '[' {
+					depth++
+				} else if baseType[i] == ']' {
+					depth--
+					if depth == 0 {
+						splitIdx = i
+						break
+					}
+				}
+			}
+
+			if splitIdx != -1 {
+				valType := baseType[splitIdx+1:]
+				newIsMap = true
+				newElemType = strings.TrimSpace(valType)
+			}
+		} else if strings.HasPrefix(baseType, "[]") {
+			newIsSlice = true
+			newElemType = baseType[2:]
+		}
+
+		// Return updated scope representing the element
+		return ScopeType{
+			IsRoot:   false,
+			VarName:  expr, // or original varExpr
+			TypeStr:  collectionScope.ElemType,
+			Fields:   collectionScope.Fields,
+			IsSlice:  newIsSlice,
+			IsMap:    newIsMap,
+			KeyType:  "",          // Not currently parsed
+			ElemType: newElemType, // Derived from ElemType string
 		}
 	}
 
+	return collectionScope
+}
+
+// createScopeFromWith creates a new scope for a {{with}} block.
+//
+// With syntax: {{with .Variable}}
+// Changes the dot context to the specified variable.
+//
+// Returns: ScopeType for the with block body
+func createScopeFromWith(
+	expr string,
+	scopeStack []ScopeType,
+	varMap map[string]TemplateVar,
+) ScopeType {
 	return createScopeFromExpression(expr, scopeStack, varMap)
 }
 
-// createScopeFromWith creates a new scope for a with block
-func createScopeFromWith(expr string, scopeStack []ScopeType, varMap map[string]TemplateVar) ScopeType {
-	return createScopeFromExpression(expr, scopeStack, varMap)
-}
-
-// createScopeFromExpression creates a scope from a variable expression with
-// full path traversal — supports arbitrary depth (e.g. ".User.Profile.Address").
-func createScopeFromExpression(expr string, scopeStack []ScopeType, varMap map[string]TemplateVar) ScopeType {
+// createScopeFromExpression creates a scope by resolving a variable expression.
+// Supports arbitrary nesting depth (e.g., .User.Profile.Address.City).
+//
+// Expression types:
+//   - "." : Current scope
+//   - ".VarName" : Top-level variable
+//   - ".Var.Field" : Nested field access
+//   - ".Var.Field.SubField" : Deep nested access
+//
+// Algorithm:
+//  1. Split expression into path segments
+//  2. Resolve first segment in current scope or varMap
+//  3. Traverse remaining segments through field hierarchy
+//  4. Return scope representing the final type
+//
+// Returns: ScopeType representing the resolved expression's type
+func createScopeFromExpression(
+	expr string,
+	scopeStack []ScopeType,
+	varMap map[string]TemplateVar,
+) ScopeType {
 	expr = strings.TrimSpace(expr)
 
+	// Handle dot (current scope)
 	if expr == "." {
 		if len(scopeStack) > 0 {
 			return scopeStack[len(scopeStack)-1]
@@ -568,19 +1172,22 @@ func createScopeFromExpression(expr string, scopeStack []ScopeType, varMap map[s
 		return ScopeType{IsRoot: true}
 	}
 
+	// Must start with dot for variable access
 	if !strings.HasPrefix(expr, ".") {
 		return ScopeType{Fields: []FieldInfo{}}
 	}
 
+	// Split into path segments
 	parts := strings.Split(expr, ".")
 	if len(parts) < 2 {
 		return ScopeType{Fields: []FieldInfo{}}
 	}
 
-	// parts[0] is "" (leading dot), parts[1] is the first name segment
+	// Resolve first segment (parts[0] is empty due to leading dot)
 	var currentField *FieldInfo
 	firstPart := parts[1]
 
+	// Look in current scope first
 	if len(scopeStack) > 0 {
 		currentScope := scopeStack[len(scopeStack)-1]
 		for _, f := range currentScope.Fields {
@@ -592,6 +1199,7 @@ func createScopeFromExpression(expr string, scopeStack []ScopeType, varMap map[s
 		}
 	}
 
+	// Fall back to varMap if not in current scope
 	if currentField == nil {
 		if v, ok := varMap[firstPart]; ok {
 			currentField = &FieldInfo{
@@ -606,11 +1214,12 @@ func createScopeFromExpression(expr string, scopeStack []ScopeType, varMap map[s
 		}
 	}
 
+	// Variable not found
 	if currentField == nil {
 		return ScopeType{Fields: []FieldInfo{}}
 	}
 
-	// Traverse remaining path segments (parts[2:])
+	// Traverse remaining path segments
 	for _, part := range parts[2:] {
 		found := false
 		for _, f := range currentField.Fields {
@@ -622,10 +1231,12 @@ func createScopeFromExpression(expr string, scopeStack []ScopeType, varMap map[s
 			}
 		}
 		if !found {
+			// Path segment not found
 			return ScopeType{Fields: []FieldInfo{}}
 		}
 	}
 
+	// Return scope representing the resolved type
 	return ScopeType{
 		IsRoot:   false,
 		VarName:  expr,
@@ -638,17 +1249,54 @@ func createScopeFromExpression(expr string, scopeStack []ScopeType, varMap map[s
 	}
 }
 
-// validateVariableInScope validates a variable access in the current scope.
-// Supports unlimited path depth.
-func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[string]TemplateVar, line, col int, templateName string) *ValidationResult {
+// ═══════════════════════════════════════════════════════════════════════════
+// VARIABLE VALIDATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+// validateVariableInScope validates a variable access expression in the
+// current scope context.
+//
+// This function handles:
+//   - Root variable access: $.VarName
+//   - Current scope access: .VarName
+//   - Nested field access: .Var.Field.SubField
+//   - Map access: .MapVar.key
+//   - Unlimited nesting depth
+//
+// Validation logic:
+//  1. Parse expression into path segments
+//  2. Determine if root ($) or scoped (.) access
+//  3. Validate first segment exists in appropriate scope
+//  4. Validate remaining segments exist in field hierarchy
+//
+// Parameters:
+//   - varExpr: Variable expression to validate (e.g., ".User.Name")
+//   - scopeStack: Current scope stack
+//   - varMap: Root variable map
+//   - line, col: Source location for error reporting
+//   - templateName: Template name for error reporting
+//
+// Returns: ValidationResult pointer if error found, nil if valid
+//
+// Thread-safety: Read-only operations, safe for concurrent calls.
+func validateVariableInScope(
+	varExpr string,
+	scopeStack []ScopeType,
+	varMap map[string]TemplateVar,
+	line, col int,
+	templateName string,
+) *ValidationResult {
 	varExpr = strings.TrimSpace(varExpr)
 
+	// Skip special variables
 	if varExpr == "." || varExpr == "$" {
 		return nil
 	}
 
+	// Normalize expression (remove trailing dots)
 	varExpr = strings.TrimRight(varExpr, ".")
 
+	// Split into path segments
 	parts := strings.Split(varExpr, ".")
 	if len(parts) < 2 {
 		return nil
@@ -656,18 +1304,33 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 
 	isRootAccess := parts[0] == "$"
 
-	// Non-root access inside a scoped block: check current scope first.
+	// ── Scoped access in nested block ──────────────────────────────────────
+	// When inside a with/range block, check current scope first
 	if !isRootAccess && len(scopeStack) > 1 {
 		currentScope := scopeStack[len(scopeStack)-1]
 		fieldName := parts[1]
 
+		// Handle map access
 		if currentScope.IsMap {
+			// Map key access is always valid
+			// Validate nested access if present
 			if len(parts) > 2 {
-				return validateNestedFields(parts[2:], nil, currentScope.ElemType, false, "", varExpr, line, col, templateName)
+				return validateNestedFields(
+					parts[2:],
+					nil,
+					currentScope.ElemType,
+					false,
+					"",
+					varExpr,
+					line,
+					col,
+					templateName,
+				)
 			}
-			return nil // Valid map access!
+			return nil
 		}
 
+		// Look for field in current scope
 		var foundField *FieldInfo
 		for _, f := range currentScope.Fields {
 			if f.Name == fieldName {
@@ -677,17 +1340,34 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 			}
 		}
 
+		// Found in current scope
 		if foundField != nil {
+			// Validate nested access if present
 			if len(parts) > 2 {
-				return validateNestedFields(parts[2:], foundField.Fields, foundField.TypeStr, foundField.IsMap, foundField.ElemType, varExpr, line, col, templateName)
+				return validateNestedFields(
+					parts[2:],
+					foundField.Fields,
+					foundField.TypeStr,
+					foundField.IsMap,
+					foundField.ElemType,
+					varExpr,
+					line,
+					col,
+					templateName,
+				)
 			}
 			return nil
 		}
 	}
 
+	// ── Root variable access ───────────────────────────────────────────────
+	// Access to top-level variables (either $ or . at root)
+
 	if len(parts) == 2 {
+		// Simple access: .VarName or $.VarName
 		rootVar := parts[1]
 
+		// Check root scope
 		rootScope := scopeStack[0]
 		for _, f := range rootScope.Fields {
 			if f.Name == rootVar {
@@ -695,10 +1375,12 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 			}
 		}
 
+		// Check varMap
 		if _, ok := varMap[rootVar]; ok {
 			return nil
 		}
 
+		// Variable not found
 		return &ValidationResult{
 			Template: templateName,
 			Line:     line,
@@ -709,22 +1391,38 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 		}
 	}
 
+	// ── Nested access: .Var.Field.SubField ─────────────────────────────────
 	rootVar := parts[1]
 
+	// Look up root variable
 	var rootVarInfo *TemplateVar
 	if v, ok := varMap[rootVar]; ok {
 		rootVarInfo = &v
 	} else {
+		// Try root scope fields
 		rootScope := scopeStack[0]
 		for _, f := range rootScope.Fields {
 			if f.Name == rootVar {
+				// Handle map with single key access
 				if f.IsMap && len(parts) == 3 {
 					return nil
 				}
-				return validateNestedFields(parts[2:], f.Fields, f.TypeStr, f.IsMap, f.ElemType, varExpr, line, col, templateName)
+				// Validate nested fields
+				return validateNestedFields(
+					parts[2:],
+					f.Fields,
+					f.TypeStr,
+					f.IsMap,
+					f.ElemType,
+					varExpr,
+					line,
+					col,
+					templateName,
+				)
 			}
 		}
 
+		// Root variable not found
 		return &ValidationResult{
 			Template: templateName,
 			Line:     line,
@@ -735,29 +1433,73 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 		}
 	}
 
+	// Handle map with single key access
 	if rootVarInfo.IsMap && len(parts) == 3 {
 		return nil
 	}
 
-	return validateNestedFields(parts[2:], rootVarInfo.Fields, rootVarInfo.TypeStr, rootVarInfo.IsMap, rootVarInfo.ElemType, varExpr, line, col, templateName)
+	// Validate nested fields
+	return validateNestedFields(
+		parts[2:],
+		rootVarInfo.Fields,
+		rootVarInfo.TypeStr,
+		rootVarInfo.IsMap,
+		rootVarInfo.ElemType,
+		varExpr,
+		line,
+		col,
+		templateName,
+	)
 }
 
-// validateNestedFields validates a field path against available fields.
-// Supports unlimited depth by recursing through the FieldInfo tree.
-func validateNestedFields(fieldParts []string, fields []FieldInfo, parentTypeName string, isMap bool, elemType string, fullExpr string, line, col int, templateName string) *ValidationResult {
+// validateNestedFields validates a field access path through a type hierarchy.
+// Supports unlimited nesting depth and handles maps, slices, and structs.
+//
+// This function recursively traverses the field path, validating each segment
+// exists on the parent type.
+//
+// Special handling:
+//   - Map types: Any key is valid, validates the value type for further nesting
+//   - Slice types: Element type is used for validation
+//   - Struct types: Field must exist in Fields slice
+//
+// Parameters:
+//   - fieldParts: Remaining field path segments to validate
+//   - fields: Available fields at current level
+//   - parentTypeName: Type name for error messages
+//   - isMap: Whether current type is a map
+//   - elemType: Element/value type for maps/slices
+//   - fullExpr: Complete original expression for error messages
+//   - line, col: Source location for error reporting
+//   - templateName: Template name for error reporting
+//
+// Returns: ValidationResult pointer if error found, nil if valid
+//
+// Thread-safety: Read-only operations, safe for concurrent calls.
+func validateNestedFields(
+	fieldParts []string,
+	fields []FieldInfo,
+	parentTypeName string,
+	isMap bool,
+	elemType string,
+	fullExpr string,
+	line, col int,
+	templateName string,
+) *ValidationResult {
 	currentFields := fields
 	parentType := parentTypeName
 	currentIsMap := isMap
 	currentElemType := elemType
 
+	// Traverse each field in the path
 	for _, fieldName := range fieldParts {
 		if currentIsMap {
-			// This part is a map key access.
-			// The result is the value type.
-			// We need to parse currentElemType to know if the value is itself a map, slice, or struct.
+			// ── Map key access ─────────────────────────────────────────────
+			// Any key is valid for map access
+			// Parse element type to determine if further nesting is valid
 
-			// Unwrap pointers from type string first
 			baseType := currentElemType
+			// Unwrap pointer types
 			for strings.HasPrefix(baseType, "*") {
 				baseType = baseType[1:]
 			}
@@ -766,10 +1508,12 @@ func validateNestedFields(fieldParts []string, fields []FieldInfo, parentTypeNam
 			newElemType := ""
 
 			if strings.HasPrefix(baseType, "map[") {
-				// Parse map[Key]Value with balanced brackets
+				// Nested map: parse map[Key]Value
+				// Use bracket counting to handle complex key types like map[string]
 				depth := 0
 				splitIdx := -1
-				// baseType starts with "map[", so the first bracket is at index 3
+
+				// Start after "map[" (index 3)
 				for i := 3; i < len(baseType); i++ {
 					if baseType[i] == '[' {
 						depth++
@@ -783,13 +1527,12 @@ func validateNestedFields(fieldParts []string, fields []FieldInfo, parentTypeNam
 				}
 
 				if splitIdx != -1 {
-					// keyType := baseType[4:splitIdx]
 					valType := baseType[splitIdx+1:]
 					newIsMap = true
 					newElemType = strings.TrimSpace(valType)
 				}
 			} else if strings.HasPrefix(baseType, "[]") {
-				// Slice
+				// Slice: element type is after []
 				newElemType = baseType[2:]
 			}
 
@@ -797,14 +1540,15 @@ func validateNestedFields(fieldParts []string, fields []FieldInfo, parentTypeNam
 			if newElemType != "" {
 				currentElemType = newElemType
 			} else {
-				// It's a struct or basic type.
-				// Parent type becomes the element type.
+				// Basic type or struct: use element type as parent type
 				parentType = currentElemType
 			}
 
-			// Fields remain the same because they represent the struct fields at the bottom
 			continue
 		}
+
+		// ── Struct field access ────────────────────────────────────────────
+		// Field must exist in Fields slice
 
 		found := false
 		var nextFields []FieldInfo
@@ -823,6 +1567,7 @@ func validateNestedFields(fieldParts []string, fields []FieldInfo, parentTypeNam
 		}
 
 		if !found {
+			// Field doesn't exist on this type
 			if parentType == "" {
 				parentType = "unknown"
 			}
@@ -836,6 +1581,7 @@ func validateNestedFields(fieldParts []string, fields []FieldInfo, parentTypeNam
 			}
 		}
 
+		// Move to next level in hierarchy
 		currentFields = nextFields
 		currentIsMap = nextIsMap
 		currentElemType = nextElemType
@@ -844,7 +1590,24 @@ func validateNestedFields(fieldParts []string, fields []FieldInfo, parentTypeNam
 	return nil
 }
 
-// parseTemplateAction parses a template action to extract arguments
+// ═══════════════════════════════════════════════════════════════════════════
+// ACTION PARSING
+// ═══════════════════════════════════════════════════════════════════════════
+
+// parseTemplateAction parses a {{template}} action to extract its arguments.
+//
+// Template action syntax:
+//   - {{template "name"}}
+//   - {{template "name" .}}
+//   - {{template "name" .Context}}
+//
+// Returns slice of parsed arguments:
+//   - [0]: template name (without quotes)
+//   - [1]: context argument (if present)
+//
+// Handles both quoted strings ("name", `name`) and unquoted identifiers.
+//
+// Thread-safety: No shared state, safe for concurrent calls.
 func parseTemplateAction(action string) []string {
 	rest := strings.TrimPrefix(action, "template ")
 	rest = strings.TrimSpace(rest)
@@ -857,26 +1620,34 @@ func parseTemplateAction(action string) []string {
 	for _, r := range rest {
 		switch {
 		case !inString && (r == '"' || r == '`'):
+			// Start of string literal
 			inString = true
 			stringChar = r
 			if current.Len() > 0 {
 				parts = append(parts, strings.TrimSpace(current.String()))
 				current.Reset()
 			}
+
 		case inString && r == stringChar:
+			// End of string literal
 			inString = false
 			parts = append(parts, current.String())
 			current.Reset()
+
 		case !inString && r == ' ':
+			// Whitespace separator (outside string)
 			if current.Len() > 0 {
 				parts = append(parts, strings.TrimSpace(current.String()))
 				current.Reset()
 			}
+
 		default:
+			// Regular character
 			current.WriteRune(r)
 		}
 	}
 
+	// Add any remaining content
 	if current.Len() > 0 {
 		parts = append(parts, strings.TrimSpace(current.String()))
 	}
@@ -884,7 +1655,22 @@ func parseTemplateAction(action string) []string {
 	return parts
 }
 
-// extractVariablesFromAction extracts all valid variables from an action string.
+// extractVariablesFromAction extracts all variable references from a template
+// action string.
+//
+// Variable references are identified by:
+//   - Starting with . (current scope) or $. (root scope)
+//   - Not being . or $ alone (special variables)
+//   - Not starting with .. (invalid syntax)
+//
+// The function parses the action, skipping:
+//   - String literals (quoted content)
+//   - Operators and delimiters
+//   - Keywords
+//
+// Calls onVar callback for each valid variable found.
+//
+// Thread-safety: No shared state, safe for concurrent calls.
 func extractVariablesFromAction(action string, onVar func(string)) {
 	start := -1
 	inString := false
@@ -892,6 +1678,7 @@ func extractVariablesFromAction(action string, onVar func(string)) {
 
 	for i, r := range action {
 		if inString {
+			// Inside string literal: skip until closing quote
 			if r == stringChar {
 				inString = false
 			}
@@ -900,6 +1687,7 @@ func extractVariablesFromAction(action string, onVar func(string)) {
 
 		switch r {
 		case '"', '`':
+			// Start of string literal
 			if start != -1 {
 				emitVar(action[start:i], onVar)
 				start = -1
@@ -908,55 +1696,120 @@ func extractVariablesFromAction(action string, onVar func(string)) {
 			stringChar = r
 
 		case ' ', '(', ')', '|', '=', ',', '+', '-', '*', '/', '!', '<', '>', '%', '&':
+			// Delimiter: emit pending variable
 			if start != -1 {
 				emitVar(action[start:i], onVar)
 				start = -1
 			}
 
 		default:
+			// Regular character: mark start of potential variable
 			if start == -1 {
 				start = i
 			}
 		}
 	}
 
+	// Emit any remaining variable
 	if start != -1 {
 		emitVar(action[start:], onVar)
 	}
 }
 
+// emitVar checks if a token is a valid variable reference and calls the callback.
+//
+// Valid variable references:
+//   - Start with . or $.
+//   - Not exactly . or $ (these are special variables)
+//   - Not starting with .. (invalid)
 func emitVar(v string, onVar func(string)) {
 	v = strings.TrimSpace(v)
-	if (strings.HasPrefix(v, ".") || strings.HasPrefix(v, "$.")) && v != "." && v != "$" && !strings.HasPrefix(v, "..") {
+	if (strings.HasPrefix(v, ".") || strings.HasPrefix(v, "$.")) &&
+		v != "." && v != "$" && !strings.HasPrefix(v, "..") {
 		onVar(v)
 	}
 }
 
-// validateContextArg checks whether a template call context expression resolves
-// in the current scope.
-func validateContextArg(contextArg string, scopeStack []ScopeType, varMap map[string]TemplateVar) bool {
+// validateContextArg checks whether a template call context expression
+// resolves in the current scope.
+//
+// Used to validate that context arguments in {{template "name" .Context}}
+// actually exist before recursively validating the nested template.
+//
+// Returns true if valid, false if undefined.
+//
+// Thread-safety: Read-only operations, safe for concurrent calls.
+func validateContextArg(
+	contextArg string,
+	scopeStack []ScopeType,
+	varMap map[string]TemplateVar,
+) bool {
+	// Special cases always valid
 	if contextArg == "" || contextArg == "." || contextArg == "$" {
 		return true
 	}
+
+	// Validate using standard validation logic
 	result := validateVariableInScope(contextArg, scopeStack, varMap, 0, 0, "")
 	return result == nil
 }
 
-// ValidateTemplateFileStr exposes internal method for testing
-func ValidateTemplateFileStr(content string, vars []TemplateVar, templateName string, baseDir, templateRoot string, registry map[string][]NamedBlockEntry) []ValidationResult {
-	varMap := make(map[string]TemplateVar)
-	for _, v := range vars {
-		varMap[v.Name] = v
+// ═══════════════════════════════════════════════════════════════════════════
+// FILE TYPE DETECTION
+// ═══════════════════════════════════════════════════════════════════════════
+
+// isFileBasedPartial determines if a template name refers to a file path
+// rather than a named block.
+//
+// Detection criteria:
+//   - Contains path separators (/ or \)
+//   - Has a recognized template file extension
+//
+// Recognized extensions:
+//   - .html, .htm
+//   - .tmpl, .tpl
+//   - .gohtml
+//
+// Thread-safety: Pure function, safe for concurrent calls.
+func isFileBasedPartial(name string) bool {
+	// Check for path separators
+	if strings.ContainsAny(name, "/\\") {
+		return true
 	}
-	return validateTemplateContent(string(content), varMap, templateName, baseDir, templateRoot, 1, registry)
+
+	// Check for template file extensions
+	ext := strings.ToLower(filepath.Ext(name))
+	switch ext {
+	case ".html", ".tmpl", ".gohtml", ".tpl", ".htm":
+		return true
+	}
+
+	return false
 }
 
-// ParseAllNamedTemplates exposes for testing
+// ═══════════════════════════════════════════════════════════════════════════
+// PUBLIC API FOR TESTING
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ValidateTemplateFileStr exposes internal validation for testing.
+// Validates template content string with provided variables.
+func ValidateTemplateFileStr(
+	content string,
+	vars []TemplateVar,
+	templateName string,
+	baseDir, templateRoot string,
+	registry map[string][]NamedBlockEntry,
+) []ValidationResult {
+	varMap := buildVarMap(vars)
+	return validateTemplateContent(content, varMap, templateName, baseDir, templateRoot, 1, registry)
+}
+
+// ParseAllNamedTemplates exposes named template parsing for testing.
 func ParseAllNamedTemplates(baseDir, templateRoot string) (map[string][]NamedBlockEntry, []NamedBlockDuplicateError) {
 	return parseAllNamedTemplates(baseDir, templateRoot)
 }
 
-// ExtractNamedTemplatesFromContent exposes for testing
+// ExtractNamedTemplatesFromContent exposes content extraction for testing.
 func ExtractNamedTemplatesFromContent(content, absolutePath, templatePath string, registry map[string][]NamedBlockEntry) {
 	extractNamedTemplatesFromContent(content, absolutePath, templatePath, registry)
 }
