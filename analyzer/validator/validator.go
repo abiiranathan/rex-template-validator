@@ -217,140 +217,118 @@ func detectDuplicateBlocks(registry map[string][]NamedBlockEntry) []NamedBlockDu
 //
 // Thread-safety: When used with sync.Map, concurrent calls are safe.
 func extractNamedTemplatesFromContent(content, absolutePath, templatePath string, registry any) {
-	// State tracking for nested block extraction
-	var activeName string // Name of current block being extracted
-	var startIndex int    // Content start position (after opening action)
-	var startLine int     // Line number of block declaration
-	var startCol int      // Column number of block declaration
-	depth := 0            // Nesting depth (0 = not in block, >0 = in block)
+	var activeName string
+	var startIndex int
+	var startLine int
+	var startCol int
+	depth := 0
 
-	// Line tracking for accurate error reporting
-	lineStart := 0
-	lineNum := 1
+	cur := 0
+	lineNum := 1 // 1-based for root files
 
-	// Process content line by line
-	for lineStart < len(content) {
-		// Extract current line
-		lineEnd := strings.IndexByte(content[lineStart:], '\n')
-		var line string
-		if lineEnd == -1 {
-			line = content[lineStart:]
-		} else {
-			lineEnd += lineStart
-			line = content[lineStart:lineEnd]
+	for cur < len(content) {
+		openRel := strings.Index(content[cur:], "{{")
+		if openRel == -1 {
+			break
+		}
+		openIdx := cur + openRel
+
+		// Add newlines between cur and openIdx
+		lineNum += strings.Count(content[cur:openIdx], "\n")
+
+		closeRel := strings.Index(content[openIdx:], "}}")
+		if closeRel == -1 {
+			break // Unclosed tag
+		}
+		closeIdx := openIdx + closeRel
+
+		// Calculate column
+		lastNewline := strings.LastIndexByte(content[:openIdx], '\n')
+		col := openIdx - lastNewline
+
+		// Extract action content (trim whitespace and `-`)
+		contentStart := openIdx + 2
+		if contentStart < closeIdx && content[contentStart] == '-' {
+			contentStart++
+		}
+		for contentStart < closeIdx && isWhitespace(content[contentStart]) {
+			contentStart++
 		}
 
-		// Scan line for template actions {{ ... }}
-		cur := 0
-		for {
-			// Find opening delimiter
-			openRel := strings.Index(line[cur:], "{{")
-			if openRel == -1 {
-				break
-			}
-			open := cur + openRel
+		contentEnd := closeIdx
+		if contentEnd > contentStart && content[contentEnd-1] == '-' {
+			contentEnd--
+		}
+		for contentEnd > contentStart && isWhitespace(content[contentEnd-1]) {
+			contentEnd--
+		}
 
-			// Find closing delimiter
-			closeRel := strings.Index(line[open:], "}}")
-			if closeRel == -1 {
-				break
-			}
-			close := open + closeRel
-			fullActionEndRel := close + 2
+		var action string
+		if contentStart < contentEnd {
+			action = content[contentStart:contentEnd]
+		}
 
-			// Calculate absolute positions in content
-			fullActionStart := lineStart + open
-			fullActionEnd := lineStart + fullActionEndRel
+		// Update cur and lineNum for next iteration
+		lineNumInside := strings.Count(content[openIdx:closeIdx+2], "\n")
+		cur = closeIdx + 2
 
-			// Extract action content (trim whitespace)
-			contentStart := open + 2
-			for contentStart < close && isWhitespace(line[contentStart]) {
-				contentStart++
-			}
+		// Skip comments
+		if strings.HasPrefix(action, "/*") || strings.HasPrefix(action, "//") {
+			lineNum += lineNumInside
+			continue
+		}
 
-			contentEnd := close
-			for contentEnd > contentStart && isWhitespace(line[contentEnd-1]) {
-				contentEnd--
-			}
+		// Parse action into words (strings.Fields handles \n automatically)
+		words := strings.Fields(action)
+		if len(words) == 0 {
+			lineNum += lineNumInside
+			continue
+		}
 
-			action := line[contentStart:contentEnd]
+		first := words[0]
 
-			// Move to next action
-			cur = fullActionEndRel
-
-			// Skip comments
-			if strings.HasPrefix(action, "/*") || strings.HasPrefix(action, "//") {
-				continue
-			}
-
-			// Parse action into words
-			words := strings.Fields(action)
-			if len(words) == 0 {
-				continue
+		switch first {
+		case "if", "with", "range", "block":
+			if activeName != "" {
+				depth++
+			} else if first == "block" && len(words) >= 2 {
+				activeName = strings.Trim(words[1], `"`)
+				startIndex = cur
+				startLine = lineNum
+				startCol = col
+				depth = 1
 			}
 
-			first := words[0]
+		case "define":
+			if activeName != "" {
+				depth++
+			} else if len(words) >= 2 {
+				activeName = strings.Trim(words[1], `"`)
+				startIndex = cur
+				startLine = lineNum
+				startCol = col
+				depth = 1
+			}
 
-			// Handle different action types
-			switch first {
-			case "if", "with", "range", "block":
-				if activeName != "" {
-					// Inside a block: increment depth
-					depth++
-				} else if first == "block" && len(words) >= 2 {
-					// Start of new block declaration
-					activeName = strings.Trim(words[1], `"`)
-					startIndex = fullActionEnd
-					startLine = lineNum
-					startCol = open + 1
-					depth = 1
-				}
-
-			case "define":
-				if activeName != "" {
-					// Inside a block: increment depth
-					depth++
-				} else if len(words) >= 2 {
-					// Start of new define declaration
-					activeName = strings.Trim(words[1], `"`)
-					startIndex = fullActionEnd
-					startLine = lineNum
-					startCol = open + 1
-					depth = 1
-				}
-
-			case "end":
-				if activeName != "" {
-					// Decrement depth
-					depth--
-					if depth == 0 {
-						// Reached matching end - extract block content
-						entry := NamedBlockEntry{
-							Name:         activeName,
-							Content:      content[startIndex:fullActionStart],
-							AbsolutePath: absolutePath,
-							TemplatePath: templatePath,
-							Line:         startLine,
-							Col:          startCol,
-						}
-
-						// Store in registry (thread-safe for sync.Map)
-						storeNamedBlock(registry, activeName, entry)
-
-						// Reset state
-						activeName = ""
+		case "end":
+			if activeName != "" {
+				depth--
+				if depth == 0 {
+					entry := NamedBlockEntry{
+						Name:         activeName,
+						Content:      content[startIndex:openIdx],
+						AbsolutePath: absolutePath,
+						TemplatePath: templatePath,
+						Line:         startLine,
+						Col:          startCol,
 					}
+					storeNamedBlock(registry, activeName, entry)
+					activeName = ""
 				}
 			}
 		}
 
-		// Move to next line
-		if lineEnd == -1 {
-			lineStart = len(content)
-		} else {
-			lineStart = lineEnd + 1
-		}
-		lineNum++
+		lineNum += lineNumInside
 	}
 }
 
@@ -386,9 +364,9 @@ func storeNamedBlock(registry any, name string, entry NamedBlockEntry) {
 	}
 }
 
-// isWhitespace checks if a byte is whitespace (space or tab).
+// isWhitespace checks if a byte is whitespace (space, tab, newline, carriage return).
 func isWhitespace(b byte) bool {
-	return b == ' ' || b == '\t'
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -656,251 +634,278 @@ func validateTemplateContent(
 	// Track depth inside {{define}} blocks (validation is skipped)
 	defineSkipDepth := 0
 
-	// Process content line by line
-	lineStart := 0
-	lineNum := 0
+	cur := 0
+	lineNum := 0 // 0-based offset from start of this content block
 
-	for lineStart < len(content) {
-		// Extract current line
-		lineEnd := strings.IndexByte(content[lineStart:], '\n')
-		var line string
-		if lineEnd == -1 {
-			line = content[lineStart:]
-		} else {
-			lineEnd += lineStart
-			line = content[lineStart:lineEnd]
+	for cur < len(content) {
+		openRel := strings.Index(content[cur:], "{{")
+		if openRel == -1 {
+			break
+		}
+		openIdx := cur + openRel
+
+		// Add newlines between cur and openIdx
+		lineNum += strings.Count(content[cur:openIdx], "\n")
+		actualLineNum := lineNum + lineOffset
+
+		closeRel := strings.Index(content[openIdx:], "}}")
+		if closeRel == -1 {
+			break // Unclosed tag
+		}
+		closeIdx := openIdx + closeRel
+
+		// Extract and trim action content
+		contentStart := openIdx + 2
+		if contentStart < closeIdx && content[contentStart] == '-' {
+			contentStart++
+		}
+		for contentStart < closeIdx && isWhitespace(content[contentStart]) {
+			contentStart++
 		}
 
-		// Calculate actual line number (with offset for nested blocks)
-		actualLineNum := lineNum + lineOffset
-		lineNum++
+		contentEnd := closeIdx
+		if contentEnd > contentStart && content[contentEnd-1] == '-' {
+			contentEnd--
+		}
+		for contentEnd > contentStart && isWhitespace(content[contentEnd-1]) {
+			contentEnd--
+		}
 
-		// Scan line for template actions
-		cur := 0
-		for {
-			// Find action delimiters
-			openRel := strings.Index(line[cur:], "{{")
-			if openRel == -1 {
-				break
-			}
-			open := cur + openRel
+		// Calculate column based on contentStart to match expected test behavior
+		lastNewline := strings.LastIndexByte(content[:openIdx], '\n')
+		col := contentStart - lastNewline
 
-			closeRel := strings.Index(line[open:], "}}")
-			if closeRel == -1 {
-				break
-			}
-			close := open + closeRel
-			fullActionEnd := close + 2
+		var action string
+		if contentStart < contentEnd {
+			action = content[contentStart:contentEnd]
+		}
 
-			// Extract and trim action content
-			contentStart := open + 2
-			for contentStart < close && isWhitespace(line[contentStart]) {
-				contentStart++
-			}
+		// Update cur and lineNum for next iteration
+		lineNumInside := strings.Count(content[openIdx:closeIdx+2], "\n")
+		cur = closeIdx + 2
 
-			contentEnd := close
-			for contentEnd > contentStart && isWhitespace(line[contentEnd-1]) {
-				contentEnd--
-			}
+		// Skip comments
+		if strings.HasPrefix(action, "/*") || strings.HasPrefix(action, "//") {
+			lineNum += lineNumInside
+			continue
+		}
 
-			action := line[contentStart:contentEnd]
-			col := contentStart + 1
+		// Parse action into words
+		words := strings.Fields(action)
+		first := ""
+		if len(words) > 0 {
+			first = words[0]
+		}
 
-			// Move to next action
-			cur = fullActionEnd
+		// ── Handle {{define}} blocks ────────────────────────────────────
+		// Define blocks create separate scopes and should not be validated
+		// in the context of the parent template.
+		if first == "define" {
+			defineSkipDepth++
+			lineNum += lineNumInside
+			continue
+		}
 
-			// Skip comments
-			if strings.HasPrefix(action, "/*") || strings.HasPrefix(action, "//") {
-				continue
-			}
-
-			// Parse action into words
-			words := strings.Fields(action)
-			first := ""
-			if len(words) > 0 {
-				first = words[0]
-			}
-
-			// ── Handle {{define}} blocks ────────────────────────────────────
-			// Define blocks create separate scopes and should not be validated
-			// in the context of the parent template.
-			if first == "define" {
+		// Track nesting depth inside define blocks
+		if defineSkipDepth > 0 {
+			switch first {
+			case "if", "with", "range", "block":
 				defineSkipDepth++
-				continue
+			case "end":
+				defineSkipDepth--
 			}
+			lineNum += lineNumInside
+			continue
+		}
 
-			// Track nesting depth inside define blocks
-			if defineSkipDepth > 0 {
-				switch first {
-				case "if", "with", "range", "block":
-					defineSkipDepth++
-				case "end":
-					defineSkipDepth--
+		// ── Handle scope popping (else, end) BEFORE validation ──────────
+		isElse := first == "else"
+		var elseAction string
+		if isElse {
+			if len(scopeStack) > 1 {
+				scopeStack = scopeStack[:len(scopeStack)-1]
+			} else {
+				panic(fmt.Sprintf("Template validation error in %s:%d: unexpected {{else}} without matching {{if/with/range}}", templateName, actualLineNum))
+			}
+			if len(words) > 1 {
+				elseAction = words[1] // "if", "with", "range"
+			}
+		} else if first == "end" {
+			if len(scopeStack) > 1 {
+				scopeStack = scopeStack[:len(scopeStack)-1]
+			} else {
+				panic(fmt.Sprintf("Template validation error in %s:%d: unexpected {{end}} without matching {{if/with/range}}", templateName, actualLineNum))
+			}
+			lineNum += lineNumInside
+			continue
+		}
+
+		// ── Validate variables in action ────────────────────────────────
+		// Extract and validate all variable references in this action.
+		extractVariablesFromAction(action, func(v string) {
+			if err := validateVariableInScope(
+				v,
+				scopeStack,
+				varMap,
+				actualLineNum,
+				col,
+				templateName,
+			); err != nil {
+				errors = append(errors, *err)
+			}
+		})
+
+		// ── Handle {{block}} blocks ─────────────────────────────────────
+		// Block is similar to define but with inline content
+		if first == "block" {
+			defineSkipDepth++
+			lineNum += lineNumInside
+			continue
+		}
+
+		// ── Handle scope pushing (if, with, range, else) AFTER validation ─────
+		actionToPush := first
+		exprToParse := action
+
+		if isElse {
+			if elseAction != "" {
+				actionToPush = elseAction
+				idx := strings.Index(action, elseAction)
+				if idx != -1 {
+					exprToParse = action[idx:]
 				}
-				continue
-			}
-
-			// ── Handle {{block}} blocks ─────────────────────────────────────
-			// Block is similar to define but with inline content
-			if first == "block" {
-				defineSkipDepth++
-				continue
-			}
-
-			// ── Validate variables in action ────────────────────────────────
-			// Extract and validate all variable references in this action.
-			// Skip for {{template}} actions as they're handled specially below.
-			if first != "template" {
-				extractVariablesFromAction(action, func(v string) {
-					if err := validateVariableInScope(
-						v,
-						scopeStack,
-						varMap,
-						actualLineNum,
-						col,
-						templateName,
-					); err != nil {
-						errors = append(errors, *err)
-					}
-				})
-			}
-
-			// ── Handle scope-modifying actions ──────────────────────────────
-
-			// Handle {{range}} - creates iteration scope
-			if first == "range" {
-				rangeExpr := strings.TrimSpace(action[6:])
-				newScope := createScopeFromRange(rangeExpr, scopeStack, varMap)
-				scopeStack = append(scopeStack, newScope)
-				continue
-			}
-
-			// Handle {{with}} - changes dot context
-			if first == "with" {
-				withExpr := strings.TrimSpace(action[5:])
-				newScope := createScopeFromWith(withExpr, scopeStack, varMap)
-				scopeStack = append(scopeStack, newScope)
-				continue
-			}
-
-			// Handle {{if}} - maintains current scope
-			if first == "if" {
+			} else {
+				// Plain else
 				if len(scopeStack) > 0 {
-					// Copy current scope for this if block
 					scopeStack = append(scopeStack, scopeStack[len(scopeStack)-1])
 				} else {
 					scopeStack = append(scopeStack, ScopeType{})
 				}
-				continue
-			}
-
-			// Handle {{end}} - pop scope
-			if first == "end" {
-				if len(scopeStack) > 1 {
-					scopeStack = scopeStack[:len(scopeStack)-1]
-				}
-				continue
-			}
-
-			// ── Handle {{template}} calls ───────────────────────────────────
-			// Template calls invoke other templates/named blocks with a context.
-			if first == "template" {
-				parts := parseTemplateAction(action)
-
-				if len(parts) >= 1 {
-					tmplName := parts[0]
-					var contextArg string
-					if len(parts) >= 2 {
-						contextArg = parts[1]
-					}
-
-					// Validate context argument exists
-					if contextArg != "" && contextArg != "." {
-						if !validateContextArg(contextArg, scopeStack, varMap) {
-							errors = append(errors, ValidationResult{
-								Template: templateName,
-								Line:     actualLineNum,
-								Column:   col,
-								Variable: contextArg,
-								Message:  fmt.Sprintf(`Template variable "%s" is not defined in the render context`, contextArg),
-								Severity: "error",
-							})
-							continue
-						}
-					}
-
-					// Validate nested template - check if it's a named block
-					if entries, ok := registry[tmplName]; ok && len(entries) > 0 {
-						nt := entries[0]
-
-						// Skip deep validation for untracked local vars ($var)
-						// to prevent false positives
-						if contextArg != "" && contextArg != "." && !strings.HasPrefix(contextArg, ".") {
-							continue
-						}
-
-						// Build scope for nested template
-						partialScope := resolvePartialScope(contextArg, scopeStack, varMap)
-						partialVarMap := buildPartialVarMap(contextArg, partialScope, scopeStack, varMap)
-
-						// Recursively validate nested template
-						partialErrors := validateTemplateContent(
-							nt.Content,
-							partialVarMap,
-							nt.TemplatePath,
-							baseDir,
-							templateRoot,
-							nt.Line,
-							registry,
-						)
-						errors = append(errors, partialErrors...)
-
-					} else if isFileBasedPartial(tmplName) {
-						// Check if it's a file-based partial
-						fullPath := filepath.Join(baseDir, templateRoot, tmplName)
-						if _, err := os.Stat(fullPath); os.IsNotExist(err) {
-							errors = append(errors, ValidationResult{
-								Template: templateName,
-								Line:     actualLineNum,
-								Column:   col,
-								Variable: tmplName,
-								Message:  fmt.Sprintf(`Partial template "%s" could not be found at %s`, tmplName, fullPath),
-								Severity: "error",
-							})
-							continue
-						}
-
-						// Skip deep validation for untracked local vars
-						if contextArg != "" && contextArg != "." && !strings.HasPrefix(contextArg, ".") {
-							continue
-						}
-
-						// Build scope for file-based partial
-						partialScope := resolvePartialScope(contextArg, scopeStack, varMap)
-						partialVarMap := buildPartialVarMap(contextArg, partialScope, scopeStack, varMap)
-
-						// Recursively validate file-based partial
-						partialErrors := validateTemplateFile(
-							fullPath,
-							scopeVarsToTemplateVars(partialVarMap),
-							tmplName,
-							baseDir,
-							templateRoot,
-							registry,
-						)
-						errors = append(errors, partialErrors...)
-					}
-				}
+				lineNum += lineNumInside
 				continue
 			}
 		}
 
-		// Move to next line
-		if lineEnd == -1 {
-			lineStart = len(content)
-		} else {
-			lineStart = lineEnd + 1
+		if actionToPush == "range" {
+			rangeExpr := strings.TrimSpace(strings.TrimPrefix(exprToParse, "range"))
+			newScope := createScopeFromRange(rangeExpr, scopeStack, varMap)
+			scopeStack = append(scopeStack, newScope)
+			lineNum += lineNumInside
+			continue
 		}
+
+		if actionToPush == "with" {
+			withExpr := strings.TrimSpace(strings.TrimPrefix(exprToParse, "with"))
+			newScope := createScopeFromWith(withExpr, scopeStack, varMap)
+			scopeStack = append(scopeStack, newScope)
+			lineNum += lineNumInside
+			continue
+		}
+
+		if actionToPush == "if" {
+			if len(scopeStack) > 0 {
+				scopeStack = append(scopeStack, scopeStack[len(scopeStack)-1])
+			} else {
+				scopeStack = append(scopeStack, ScopeType{})
+			}
+			lineNum += lineNumInside
+			continue
+		}
+
+		if isElse {
+			lineNum += lineNumInside
+			continue
+		}
+
+		// ── Handle {{template}} calls ───────────────────────────────────
+		// Template calls invoke other templates/named blocks with a context.
+		if first == "template" {
+			parts := parseTemplateAction(action)
+
+			if len(parts) >= 1 {
+				tmplName := parts[0]
+				var contextArg string
+				if len(parts) >= 2 {
+					contextArg = parts[1]
+				}
+
+				// Validate context argument exists
+				if contextArg != "" && contextArg != "." {
+					if !validateContextArg(contextArg, scopeStack, varMap) {
+						// Validation failed, skip recursive check to prevent cascading errors
+						lineNum += lineNumInside
+						continue
+					}
+				}
+
+				// Validate nested template - check if it's a named block
+				if entries, ok := registry[tmplName]; ok && len(entries) > 0 {
+					nt := entries[0]
+
+					// Skip deep validation for untracked local vars ($var)
+					// to prevent false positives
+					if contextArg != "" && contextArg != "." && !strings.HasPrefix(contextArg, ".") {
+						lineNum += lineNumInside
+						continue
+					}
+
+					// Build scope for nested template
+					partialScope := resolvePartialScope(contextArg, scopeStack, varMap)
+					partialVarMap := buildPartialVarMap(contextArg, partialScope, scopeStack, varMap)
+
+					// Recursively validate nested template
+					partialErrors := validateTemplateContent(
+						nt.Content,
+						partialVarMap,
+						nt.TemplatePath,
+						baseDir,
+						templateRoot,
+						nt.Line,
+						registry,
+					)
+					errors = append(errors, partialErrors...)
+
+				} else if isFileBasedPartial(tmplName) {
+					// Check if it's a file-based partial
+					fullPath := filepath.Join(baseDir, templateRoot, tmplName)
+					if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+						errors = append(errors, ValidationResult{
+							Template: templateName,
+							Line:     actualLineNum,
+							Column:   col,
+							Variable: tmplName,
+							Message:  fmt.Sprintf(`Partial template "%s" could not be found at %s`, tmplName, fullPath),
+							Severity: "error",
+						})
+						lineNum += lineNumInside
+						continue
+					}
+
+					// Skip deep validation for untracked local vars
+					if contextArg != "" && contextArg != "." && !strings.HasPrefix(contextArg, ".") {
+						lineNum += lineNumInside
+						continue
+					}
+
+					// Build scope for file-based partial
+					partialScope := resolvePartialScope(contextArg, scopeStack, varMap)
+					partialVarMap := buildPartialVarMap(contextArg, partialScope, scopeStack, varMap)
+
+					// Recursively validate file-based partial
+					partialErrors := validateTemplateFile(
+						fullPath,
+						scopeVarsToTemplateVars(partialVarMap),
+						tmplName,
+						baseDir,
+						templateRoot,
+						registry,
+					)
+					errors = append(errors, partialErrors...)
+				}
+			}
+		}
+
+		lineNum += lineNumInside
 	}
 
 	return errors
@@ -1634,7 +1639,7 @@ func parseTemplateAction(action string) []string {
 			parts = append(parts, current.String())
 			current.Reset()
 
-		case !inString && r == ' ':
+		case !inString && (r == ' ' || r == '\n' || r == '\r' || r == '\t'):
 			// Whitespace separator (outside string)
 			if current.Len() > 0 {
 				parts = append(parts, strings.TrimSpace(current.String()))
@@ -1695,7 +1700,7 @@ func extractVariablesFromAction(action string, onVar func(string)) {
 			inString = true
 			stringChar = r
 
-		case ' ', '(', ')', '|', '=', ',', '+', '-', '*', '/', '!', '<', '>', '%', '&':
+		case ' ', '\n', '\r', '\t', '(', ')', '|', '=', ',', '+', '-', '*', '/', '!', '<', '>', '%', '&':
 			// Delimiter: emit pending variable
 			if start != -1 {
 				emitVar(action[start:i], onVar)

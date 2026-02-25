@@ -352,7 +352,14 @@ func generateRenderCalls(
 
 			// Process each template name (usually one, but can be multiple from variables)
 			for _, templatePath := range rr.TemplateNames {
+				templatePath := strings.TrimSpace(templatePath)
 				if templatePath == "" {
+					continue
+				}
+
+				// Ignore HTML content being execute directly in go code.
+				// It is not a file
+				if strings.HasPrefix(templatePath, "<") || strings.Contains(templatePath, "/>") {
 					continue
 				}
 
