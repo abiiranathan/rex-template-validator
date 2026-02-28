@@ -1,7 +1,10 @@
-package validator
+package validator_test
 
 import (
 	"testing"
+
+	"github.com/rex-template-analyzer/ast"
+	"github.com/rex-template-analyzer/validator"
 )
 
 func TestDefineBlockPoppingScope(t *testing.T) {
@@ -13,22 +16,22 @@ func TestDefineBlockPoppingScope(t *testing.T) {
 			{{ .Name }}
 		{{ end }}
 	`
-	vars := []TemplateVar{
+	vars := []ast.TemplateVar{
 		{
-			Name: "User",
+			Name:    "User",
 			TypeStr: "User",
-			Fields: []FieldInfo{
+			Fields: []ast.FieldInfo{
 				{Name: "Name", TypeStr: "string"},
 				{Name: "Age", TypeStr: "int"},
 			},
 		},
 	}
-	varMap := make(map[string]TemplateVar)
+	varMap := make(map[string]ast.TemplateVar)
 	for _, v := range vars {
 		varMap[v.Name] = v
 	}
 
-	errs := validateTemplateContent(content, varMap, "test.html", ".", ".", 1, nil)
+	errs := validator.ValidateTemplateContent(content, varMap, "test.html", ".", ".", 1, nil)
 	for _, e := range errs {
 		t.Logf("Error: %s (variable: %s)", e.Message, e.Variable)
 	}

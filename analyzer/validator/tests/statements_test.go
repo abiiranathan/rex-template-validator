@@ -1,7 +1,10 @@
-package validator
+package validator_test
 
 import (
 	"testing"
+
+	"github.com/rex-template-analyzer/ast"
+	"github.com/rex-template-analyzer/validator"
 )
 
 func TestStatementsAndFunctions(t *testing.T) {
@@ -16,18 +19,18 @@ func TestStatementsAndFunctions(t *testing.T) {
             {{ .Name }}
 		{{ end }}
 	`
-	vars := []TemplateVar{
+	vars := []ast.TemplateVar{
 		{
 			Name:    "User",
 			TypeStr: "User",
-			Fields: []FieldInfo{
+			Fields: []ast.FieldInfo{
 				{Name: "Status", TypeStr: "string"},
 				{Name: "Role", TypeStr: "string"},
 				{Name: "Name", TypeStr: "string"},
 				{Name: "Age", TypeStr: "int"},
 				{
 					Name: "Items", TypeStr: "[]Item",
-					Fields: []FieldInfo{
+					Fields: []ast.FieldInfo{
 						{Name: "Name", TypeStr: "string"},
 					},
 				},
@@ -36,17 +39,17 @@ func TestStatementsAndFunctions(t *testing.T) {
 		{
 			Name:    "Feature",
 			TypeStr: "Feature",
-			Fields: []FieldInfo{
+			Fields: []ast.FieldInfo{
 				{Name: "Enabled", TypeStr: "bool"},
 			},
 		},
 	}
-	varMap := make(map[string]TemplateVar)
+	varMap := make(map[string]ast.TemplateVar)
 	for _, v := range vars {
 		varMap[v.Name] = v
 	}
 
-	errs := validateTemplateContent(content, varMap, "test.html", ".", ".", 1, nil)
+	errs := validator.ValidateTemplateContent(content, varMap, "test.html", ".", ".", 1, nil)
 	if len(errs) > 0 {
 		for _, e := range errs {
 			t.Errorf("Unexpected error: %s (variable: %s)", e.Message, e.Variable)
@@ -63,26 +66,26 @@ func TestStatementsAndFunctions_Errors(t *testing.T) {
             {{ .Invalid3 }}
 		{{ end }}
 	`
-	vars := []TemplateVar{
+	vars := []ast.TemplateVar{
 		{
 			Name:    "User",
 			TypeStr: "User",
-			Fields: []FieldInfo{
+			Fields: []ast.FieldInfo{
 				{
 					Name: "Items", TypeStr: "[]Item",
-					Fields: []FieldInfo{
+					Fields: []ast.FieldInfo{
 						{Name: "Name", TypeStr: "string"},
 					},
 				},
 			},
 		},
 	}
-	varMap := make(map[string]TemplateVar)
+	varMap := make(map[string]ast.TemplateVar)
 	for _, v := range vars {
 		varMap[v.Name] = v
 	}
 
-	errs := validateTemplateContent(content, varMap, "test.html", ".", ".", 1, nil)
+	errs := validator.ValidateTemplateContent(content, varMap, "test.html", ".", ".", 1, nil)
 
 	expectedErrors := []string{
 		"Invalid1", "Invalid2", "Invalid3",
@@ -105,21 +108,21 @@ func TestDeeplyNestedFieldAccess(t *testing.T) {
 		{{ .User.Profile.Bio }}
 		{{ .User.Name }}
 	`
-	vars := map[string]TemplateVar{
+	vars := map[string]ast.TemplateVar{
 		"User": {
 			Name:    "User",
 			TypeStr: "User",
-			Fields: []FieldInfo{
+			Fields: []ast.FieldInfo{
 				{Name: "Name", TypeStr: "string"},
 				{
 					Name:    "Profile",
 					TypeStr: "Profile",
-					Fields: []FieldInfo{
+					Fields: []ast.FieldInfo{
 						{Name: "Bio", TypeStr: "string"},
 						{
 							Name:    "Address",
 							TypeStr: "Address",
-							Fields: []FieldInfo{
+							Fields: []ast.FieldInfo{
 								{Name: "Street", TypeStr: "string"},
 								{Name: "City", TypeStr: "string"},
 								{Name: "Zip", TypeStr: "string"},
@@ -131,7 +134,7 @@ func TestDeeplyNestedFieldAccess(t *testing.T) {
 		},
 	}
 
-	errs := validateTemplateContent(content, vars, "test.html", ".", ".", 1, nil)
+	errs := validator.ValidateTemplateContent(content, vars, "test.html", ".", ".", 1, nil)
 	if len(errs) > 0 {
 		for _, e := range errs {
 			t.Errorf("Unexpected error for valid deep path: %s (variable: %s)", e.Message, e.Variable)
@@ -146,20 +149,20 @@ func TestDeeplyNestedFieldAccess_Errors(t *testing.T) {
 		{{ .User.Profile.InvalidNested }}
 		{{ .User.InvalidTop.Whatever }}
 	`
-	vars := map[string]TemplateVar{
+	vars := map[string]ast.TemplateVar{
 		"User": {
 			Name:    "User",
 			TypeStr: "User",
-			Fields: []FieldInfo{
+			Fields: []ast.FieldInfo{
 				{
 					Name:    "Profile",
 					TypeStr: "Profile",
-					Fields: []FieldInfo{
+					Fields: []ast.FieldInfo{
 						{Name: "Bio", TypeStr: "string"},
 						{
 							Name:    "Address",
 							TypeStr: "Address",
-							Fields: []FieldInfo{
+							Fields: []ast.FieldInfo{
 								{Name: "Street", TypeStr: "string"},
 								{Name: "City", TypeStr: "string"},
 							},
@@ -170,7 +173,7 @@ func TestDeeplyNestedFieldAccess_Errors(t *testing.T) {
 		},
 	}
 
-	errs := validateTemplateContent(content, vars, "test.html", ".", ".", 1, nil)
+	errs := validator.ValidateTemplateContent(content, vars, "test.html", ".", ".", 1, nil)
 	if len(errs) != 3 {
 		t.Errorf("Expected 3 errors for invalid deep paths, got %d", len(errs))
 	}
@@ -182,23 +185,23 @@ func TestDeeplyNestedFieldAccess_Errors(t *testing.T) {
 // TestFourLevelDeepPath validates 4-level deep field access in templates.
 func TestFourLevelDeepPath(t *testing.T) {
 	content := `{{ .User.Profile.Address.City.Name }}`
-	vars := map[string]TemplateVar{
+	vars := map[string]ast.TemplateVar{
 		"User": {
 			Name:    "User",
 			TypeStr: "User",
-			Fields: []FieldInfo{
+			Fields: []ast.FieldInfo{
 				{
 					Name:    "Profile",
 					TypeStr: "Profile",
-					Fields: []FieldInfo{
+					Fields: []ast.FieldInfo{
 						{
 							Name:    "Address",
 							TypeStr: "Address",
-							Fields: []FieldInfo{
+							Fields: []ast.FieldInfo{
 								{
 									Name:    "City",
 									TypeStr: "City",
-									Fields: []FieldInfo{
+									Fields: []ast.FieldInfo{
 										{Name: "Name", TypeStr: "string"},
 										{Name: "ZipCode", TypeStr: "string"},
 									},
@@ -211,7 +214,7 @@ func TestFourLevelDeepPath(t *testing.T) {
 		},
 	}
 
-	errs := validateTemplateContent(content, vars, "test.html", ".", ".", 1, nil)
+	errs := validator.ValidateTemplateContent(content, vars, "test.html", ".", ".", 1, nil)
 	if len(errs) > 0 {
 		for _, e := range errs {
 			t.Errorf("Unexpected error for 4-level path: %s", e.Message)
@@ -227,22 +230,22 @@ func TestDeepPathInsideRangeScope(t *testing.T) {
 			{{ .Product.Manufacturer.Country }}
 		{{ end }}
 	`
-	vars := map[string]TemplateVar{
+	vars := map[string]ast.TemplateVar{
 		"Items": {
 			Name:     "Items",
 			TypeStr:  "[]OrderItem",
 			IsSlice:  true,
 			ElemType: "OrderItem",
-			Fields: []FieldInfo{
+			Fields: []ast.FieldInfo{
 				{
 					Name:    "Product",
 					TypeStr: "Product",
-					Fields: []FieldInfo{
+					Fields: []ast.FieldInfo{
 						{Name: "Name", TypeStr: "string"},
 						{
 							Name:    "Manufacturer",
 							TypeStr: "Manufacturer",
-							Fields: []FieldInfo{
+							Fields: []ast.FieldInfo{
 								{Name: "Name", TypeStr: "string"},
 								{Name: "Country", TypeStr: "string"},
 							},
@@ -253,7 +256,7 @@ func TestDeepPathInsideRangeScope(t *testing.T) {
 		},
 	}
 
-	errs := validateTemplateContent(content, vars, "test.html", ".", ".", 1, nil)
+	errs := validator.ValidateTemplateContent(content, vars, "test.html", ".", ".", 1, nil)
 	if len(errs) > 0 {
 		for _, e := range errs {
 			t.Errorf("Unexpected error inside range scope: %s (variable: %s)", e.Message, e.Variable)
@@ -270,21 +273,21 @@ func TestDeepPathInsideWithScope(t *testing.T) {
 		{{ end }}
 		{{ .User.Name }}
 	`
-	vars := map[string]TemplateVar{
+	vars := map[string]ast.TemplateVar{
 		"User": {
 			Name:    "User",
 			TypeStr: "User",
-			Fields: []FieldInfo{
+			Fields: []ast.FieldInfo{
 				{Name: "Name", TypeStr: "string"},
 				{
 					Name:    "Profile",
 					TypeStr: "Profile",
-					Fields: []FieldInfo{
+					Fields: []ast.FieldInfo{
 						{Name: "Bio", TypeStr: "string"},
 						{
 							Name:    "Address",
 							TypeStr: "Address",
-							Fields: []FieldInfo{
+							Fields: []ast.FieldInfo{
 								{Name: "City", TypeStr: "string"},
 								{Name: "Street", TypeStr: "string"},
 							},
@@ -295,7 +298,7 @@ func TestDeepPathInsideWithScope(t *testing.T) {
 		},
 	}
 
-	errs := validateTemplateContent(content, vars, "test.html", ".", ".", 1, nil)
+	errs := validator.ValidateTemplateContent(content, vars, "test.html", ".", ".", 1, nil)
 	if len(errs) > 0 {
 		for _, e := range errs {
 			t.Errorf("Unexpected error inside with scope: %s (variable: %s)", e.Message, e.Variable)
@@ -312,19 +315,19 @@ func TestRootAccessInNestedScope(t *testing.T) {
 			{{ .Name }}
 		{{ end }}
 	`
-	vars := map[string]TemplateVar{
+	vars := map[string]ast.TemplateVar{
 		"User": {
 			Name:    "User",
 			TypeStr: "User",
-			Fields: []FieldInfo{
+			Fields: []ast.FieldInfo{
 				{
 					Name:    "Profile",
 					TypeStr: "Profile",
-					Fields: []FieldInfo{
+					Fields: []ast.FieldInfo{
 						{
 							Name:    "Address",
 							TypeStr: "Address",
-							Fields: []FieldInfo{
+							Fields: []ast.FieldInfo{
 								{Name: "City", TypeStr: "string"},
 							},
 						},
@@ -337,13 +340,13 @@ func TestRootAccessInNestedScope(t *testing.T) {
 			TypeStr:  "[]Item",
 			IsSlice:  true,
 			ElemType: "Item",
-			Fields: []FieldInfo{
+			Fields: []ast.FieldInfo{
 				{Name: "Name", TypeStr: "string"},
 			},
 		},
 	}
 
-	errs := validateTemplateContent(content, vars, "test.html", ".", ".", 1, nil)
+	errs := validator.ValidateTemplateContent(content, vars, "test.html", ".", ".", 1, nil)
 	if len(errs) > 0 {
 		for _, e := range errs {
 			t.Errorf("Unexpected error for root access in nested scope: %s (variable: %s)", e.Message, e.Variable)

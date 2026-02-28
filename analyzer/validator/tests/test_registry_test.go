@@ -1,7 +1,9 @@
-package validator
+package validator_test
 
 import (
 	"testing"
+
+	"github.com/rex-template-analyzer/validator"
 )
 
 func TestExtractNamedTemplates(t *testing.T) {
@@ -15,8 +17,9 @@ func TestExtractNamedTemplates(t *testing.T) {
 		
 		{{ block "footer" .Data }}<footer>{{ .Copyright }}</footer>{{ end }}
 	`
-	reg := make(map[string][]NamedBlockEntry)
-	extractNamedTemplatesFromContent(content, "/fake/path/test.html", "test.html", reg)
+	reg := make(map[string][]validator.NamedBlockEntry)
+	validator.ExtractNamedTemplatesFromContent(content, "/fake/path/test.html", "test.html", reg)
+
 	for k, entries := range reg {
 		for _, v := range entries {
 			t.Logf("Found %s at line %d:\n%q", k, v.Line, v.Content)

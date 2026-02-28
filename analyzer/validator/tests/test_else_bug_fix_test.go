@@ -1,6 +1,11 @@
-package validator
+package validator_test
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/rex-template-analyzer/ast"
+	"github.com/rex-template-analyzer/validator"
+)
 
 func TestUserSnippetElseBug(t *testing.T) {
 	// This reproduces the exact issue from the user's snippet
@@ -18,22 +23,22 @@ func TestUserSnippetElseBug(t *testing.T) {
         {{ end }}
 	`
 
-	vars := map[string]TemplateVar{
+	vars := map[string]ast.TemplateVar{
 		"account": {
 			Name:    "account",
 			TypeStr: "Account",
-			Fields: []FieldInfo{
+			Fields: []ast.FieldInfo{
 				{Name: "IsSuperuser", TypeStr: "bool"},
 				{
 					Name:    "Permission",
 					TypeStr: "Permission",
-					Fields: []FieldInfo{
+					Fields: []ast.FieldInfo{
 						{
 							Name:     "Slice",
 							TypeStr:  "[]string",
 							IsSlice:  true,
 							ElemType: "string",
-							Fields:   []FieldInfo{}, // string has no fields
+							Fields:   []ast.FieldInfo{}, // string has no fields
 						},
 					},
 				},
@@ -41,7 +46,7 @@ func TestUserSnippetElseBug(t *testing.T) {
 		},
 	}
 
-	errs := validateTemplateContent(content, vars, "test.html", ".", ".", 1, nil)
+	errs := validator.ValidateTemplateContent(content, vars, "test.html", ".", ".", 1, nil)
 	if len(errs) > 0 {
 		t.Errorf("Expected 0 errors, got %d:", len(errs))
 		for _, e := range errs {
@@ -60,17 +65,17 @@ func TestSimpleElseClause(t *testing.T) {
 		{{ end }}
 	`
 
-	vars := map[string]TemplateVar{
+	vars := map[string]ast.TemplateVar{
 		"User": {
 			Name:    "User",
 			TypeStr: "User",
-			Fields: []FieldInfo{
+			Fields: []ast.FieldInfo{
 				{Name: "Name", TypeStr: "string"},
 				{Name: "Age", TypeStr: "int"},
 				{
 					Name:    "Address",
 					TypeStr: "Address",
-					Fields: []FieldInfo{
+					Fields: []ast.FieldInfo{
 						{Name: "City", TypeStr: "string"},
 					},
 				},
@@ -78,7 +83,7 @@ func TestSimpleElseClause(t *testing.T) {
 		},
 	}
 
-	errs := validateTemplateContent(content, vars, "test.html", ".", ".", 1, nil)
+	errs := validator.ValidateTemplateContent(content, vars, "test.html", ".", ".", 1, nil)
 	if len(errs) > 0 {
 		t.Errorf("Expected 0 errors, got %d:", len(errs))
 		for _, e := range errs {
@@ -97,19 +102,19 @@ func TestRangeElseClause(t *testing.T) {
 		{{ end }}
 	`
 
-	vars := map[string]TemplateVar{
+	vars := map[string]ast.TemplateVar{
 		"Items": {
 			Name:     "Items",
 			TypeStr:  "[]Item",
 			IsSlice:  true,
 			ElemType: "Item",
-			Fields: []FieldInfo{
+			Fields: []ast.FieldInfo{
 				{Name: "Name", TypeStr: "string"},
 			},
 		},
 	}
 
-	errs := validateTemplateContent(content, vars, "test.html", ".", ".", 1, nil)
+	errs := validator.ValidateTemplateContent(content, vars, "test.html", ".", ".", 1, nil)
 	if len(errs) > 0 {
 		t.Errorf("Expected 0 errors, got %d:", len(errs))
 		for _, e := range errs {

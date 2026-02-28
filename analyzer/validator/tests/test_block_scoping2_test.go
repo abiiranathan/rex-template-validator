@@ -1,6 +1,11 @@
-package validator
+package validator_test
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/rex-template-analyzer/ast"
+	"github.com/rex-template-analyzer/validator"
+)
 
 func TestBlockScoping2(t *testing.T) {
 	content := `
@@ -11,20 +16,20 @@ func TestBlockScoping2(t *testing.T) {
         <div>{{ capitalize or (.Name) | upper }}</div>
     {{ end }}
 	`
-	vars := []TemplateVar{
+	vars := []ast.TemplateVar{
 		{
-			Name: "billedDrugs",
+			Name:    "billedDrugs",
 			TypeStr: "[]Drug",
-			Fields: []FieldInfo{
+			Fields: []ast.FieldInfo{
 				{Name: "Name", TypeStr: "string"},
 			},
 		},
 	}
-	varMap := make(map[string]TemplateVar)
+	varMap := make(map[string]ast.TemplateVar)
 	varMap["billedDrugs"] = vars[0]
 	// intentionally DO NOT add .Name to root scope, because . is the root, not the Drug!
-	
-	errs := validateTemplateContent(content, varMap, "test.html", ".", ".", 1, nil)
+
+	errs := validator.ValidateTemplateContent(content, varMap, "test.html", ".", ".", 1, nil)
 	for _, e := range errs {
 		t.Logf("Error: %s (variable: %s)", e.Message, e.Variable)
 	}

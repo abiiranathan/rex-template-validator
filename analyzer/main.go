@@ -1,3 +1,4 @@
+// FILE: main.go
 /*
 Package main provides the command-line interface for the Rex template analyzer.
 
@@ -19,6 +20,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/rex-template-analyzer/ast"
 	"github.com/rex-template-analyzer/validator"
 )
 
@@ -29,10 +31,10 @@ import (
 // diagnostics.
 type ValidationOutput struct {
 	// RenderCalls contains all detected template render invocations.
-	RenderCalls []validator.RenderCall `json:"renderCalls"`
+	RenderCalls []ast.RenderCall `json:"renderCalls"`
 
 	// FuncMaps contains discovered template function maps.
-	FuncMaps []validator.FuncMapInfo `json:"funcMaps"`
+	FuncMaps []ast.FuncMapInfo `json:"funcMaps"`
 
 	// ValidationErrors contains template-to-render-call mismatches.
 	ValidationErrors []validator.ValidationResult `json:"validationErrors"`
@@ -69,7 +71,7 @@ func main() {
 	}
 
 	// Run static analysis on the source directory
-	result := validator.AnalyzeDir(absDir, *contextFile, validator.DefaultConfig)
+	result := ast.AnalyzeDir(absDir, *contextFile, ast.DefaultConfig)
 
 	// Handle view-context command
 	if *viewContext != "" {
@@ -196,11 +198,11 @@ func isImportError(e string) bool {
 }
 
 // handleViewContext filters render calls for a specific template and outputs the context variables.
-func handleViewContext(result validator.AnalysisResult, templateName string, compress bool) {
+func handleViewContext(result ast.AnalysisResult, templateName string, compress bool) {
 	type ContextInfo struct {
-		File string                  `json:"file"`
-		Line int                     `json:"line"`
-		Vars []validator.TemplateVar `json:"vars"`
+		File string            `json:"file"`
+		Line int               `json:"line"`
+		Vars []ast.TemplateVar `json:"vars"`
 	}
 
 	foundContexts := []ContextInfo{}
@@ -210,7 +212,7 @@ func handleViewContext(result validator.AnalysisResult, templateName string, com
 		if rc.Template == templateName || strings.HasSuffix(rc.Template, "/"+templateName) || strings.HasSuffix(rc.Template, "\\"+templateName) {
 			// Avoid NULLS
 			if rc.Vars == nil {
-				rc.Vars = []validator.TemplateVar{}
+				rc.Vars = []ast.TemplateVar{}
 			}
 			foundContexts = append(foundContexts, ContextInfo{
 				File: rc.File,

@@ -1,5 +1,5 @@
 // filepath: analyzer/validator/repro_test.go
-package validator
+package ast
 
 import (
 	"encoding/json"

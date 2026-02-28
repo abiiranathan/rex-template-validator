@@ -1,8 +1,11 @@
-package validator
+package validator_test
 
 import (
 	"strings"
 	"testing"
+
+	"github.com/rex-template-analyzer/ast"
+	"github.com/rex-template-analyzer/validator"
 )
 
 // TestNestedRangeLoops validates field access in double-nested range loops
@@ -19,23 +22,23 @@ func TestNestedRangeLoops(t *testing.T) {
         {{ end }}
     `
 
-	vars := map[string]TemplateVar{
+	vars := map[string]ast.TemplateVar{
 		"Orders": {
 			Name:     "Orders",
 			TypeStr:  "[]Order",
 			IsSlice:  true,
 			ElemType: "Order",
-			Fields: []FieldInfo{
+			Fields: []ast.FieldInfo{
 				{Name: "OrderID", TypeStr: "string"},
 				{
 					Name:    "Items",
 					TypeStr: "[]OrderItem",
 					IsSlice: true,
-					Fields: []FieldInfo{
+					Fields: []ast.FieldInfo{
 						{
 							Name:    "Product",
 							TypeStr: "Product",
-							Fields: []FieldInfo{
+							Fields: []ast.FieldInfo{
 								{Name: "Name", TypeStr: "string"},
 								{Name: "Price", TypeStr: "float64"},
 							},
@@ -47,16 +50,16 @@ func TestNestedRangeLoops(t *testing.T) {
 		"User": {
 			Name:    "User",
 			TypeStr: "User",
-			Fields:  []FieldInfo{{Name: "Email", TypeStr: "string"}},
+			Fields:  []ast.FieldInfo{{Name: "Email", TypeStr: "string"}},
 		},
 		"Shop": {
 			Name:    "Shop",
 			TypeStr: "Shop",
-			Fields:  []FieldInfo{{Name: "Name", TypeStr: "string"}},
+			Fields:  []ast.FieldInfo{{Name: "Name", TypeStr: "string"}},
 		},
 	}
 
-	errs := validateTemplateContent(content, vars, "nested-range.html", ".", ".", 1, nil)
+	errs := validator.ValidateTemplateContent(content, vars, "nested-range.html", ".", ".", 1, nil)
 	if len(errs) > 0 {
 		for _, e := range errs {
 			t.Errorf("Unexpected error in nested ranges: %s (var: %s)", e.Message, e.Variable)
@@ -78,18 +81,18 @@ func TestNestedRangeWithInvalidAccess(t *testing.T) {
         {{ end }}
     `
 
-	vars := map[string]TemplateVar{
+	vars := map[string]ast.TemplateVar{
 		"Department": {
 			Name:     "Department",
 			TypeStr:  "[]Dept",
 			IsSlice:  true,
 			ElemType: "Dept",
-			Fields: []FieldInfo{
+			Fields: []ast.FieldInfo{
 				{
 					Name:    "Employees",
 					TypeStr: "[]Employee",
 					IsSlice: true,
-					Fields: []FieldInfo{
+					Fields: []ast.FieldInfo{
 						{Name: "Name", TypeStr: "string"},
 						{Name: "Salary", TypeStr: "int"},
 					},
@@ -99,11 +102,11 @@ func TestNestedRangeWithInvalidAccess(t *testing.T) {
 		"Company": {
 			Name:    "Company",
 			TypeStr: "Company",
-			Fields:  []FieldInfo{{Name: "Name", TypeStr: "string"}},
+			Fields:  []ast.FieldInfo{{Name: "Name", TypeStr: "string"}},
 		},
 	}
 
-	errs := validateTemplateContent(content, vars, "invalid-nested.html", ".", ".", 1, nil)
+	errs := validator.ValidateTemplateContent(content, vars, "invalid-nested.html", ".", ".", 1, nil)
 
 	expectedInvalid := []string{"DepartmentHead", "InvalidField"}
 
@@ -146,11 +149,11 @@ func TestRangeInsideWithAndRootAccess(t *testing.T) {
         {{ end }}
     `
 
-	vars := map[string]TemplateVar{
+	vars := map[string]ast.TemplateVar{
 		"CurrentUser": {
 			Name:    "CurrentUser",
 			TypeStr: "User",
-			Fields: []FieldInfo{
+			Fields: []ast.FieldInfo{
 				{Name: "FullName", TypeStr: "string"},
 				{Name: "Role", TypeStr: "string"},
 				{Name: "Email", TypeStr: "string"},
@@ -158,7 +161,7 @@ func TestRangeInsideWithAndRootAccess(t *testing.T) {
 					Name:    "Permissions",
 					TypeStr: "[]Permission",
 					IsSlice: true,
-					Fields: []FieldInfo{
+					Fields: []ast.FieldInfo{
 						{Name: "Name", TypeStr: "string"},
 						{Name: "Level", TypeStr: "int"},
 					},
@@ -168,11 +171,11 @@ func TestRangeInsideWithAndRootAccess(t *testing.T) {
 		"Settings": {
 			Name:    "Settings",
 			TypeStr: "Settings",
-			Fields:  []FieldInfo{{Name: "Theme", TypeStr: "string"}},
+			Fields:  []ast.FieldInfo{{Name: "Theme", TypeStr: "string"}},
 		},
 	}
 
-	errs := validateTemplateContent(content, vars, "with-range.html", ".", ".", 1, nil)
+	errs := validator.ValidateTemplateContent(content, vars, "with-range.html", ".", ".", 1, nil)
 
 	if len(errs) != 1 {
 		t.Errorf("Expected exactly 1 error (Invalid), got %d", len(errs))
@@ -198,25 +201,25 @@ func TestTripleNestedRangeWithMixedDotAndDollar(t *testing.T) {
         {{ end }}
     `
 
-	vars := map[string]TemplateVar{
+	vars := map[string]ast.TemplateVar{
 		"Regions": {
 			Name:     "Regions",
 			TypeStr:  "[]Region",
 			IsSlice:  true,
 			ElemType: "Region",
-			Fields: []FieldInfo{
+			Fields: []ast.FieldInfo{
 				{Name: "Name", TypeStr: "string"},
 				{
 					Name:    "Countries",
 					TypeStr: "[]Country",
 					IsSlice: true,
-					Fields: []FieldInfo{
+					Fields: []ast.FieldInfo{
 						{Name: "Name", TypeStr: "string"},
 						{
 							Name:    "Cities",
 							TypeStr: "[]City",
 							IsSlice: true,
-							Fields: []FieldInfo{
+							Fields: []ast.FieldInfo{
 								{Name: "Name", TypeStr: "string"},
 								{Name: "Population", TypeStr: "int"},
 							},
@@ -228,11 +231,11 @@ func TestTripleNestedRangeWithMixedDotAndDollar(t *testing.T) {
 		"Company": {
 			Name:    "Company",
 			TypeStr: "Company",
-			Fields:  []FieldInfo{{Name: "Name", TypeStr: "string"}},
+			Fields:  []ast.FieldInfo{{Name: "Name", TypeStr: "string"}},
 		},
 	}
 
-	errs := validateTemplateContent(content, vars, "triple-nest.html", ".", ".", 1, nil)
+	errs := validator.ValidateTemplateContent(content, vars, "triple-nest.html", ".", ".", 1, nil)
 
 	if len(errs) < 1 {
 		t.Error("Expected at least one scope-related error")

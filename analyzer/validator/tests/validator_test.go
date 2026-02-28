@@ -1,23 +1,26 @@
-package validator
+package validator_test
 
 import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/rex-template-analyzer/ast"
+	"github.com/rex-template-analyzer/validator"
 )
 
 // sharedVars is the common variable set used across tests
-var sharedVars = map[string]TemplateVar{
+var sharedVars = map[string]ast.TemplateVar{
 	"User": {
 		Name:    "User",
 		TypeStr: "User",
-		Fields: []FieldInfo{
+		Fields: []ast.FieldInfo{
 			{Name: "Name", TypeStr: "string"},
 			{Name: "Age", TypeStr: "int"},
 			{
 				Name:    "Address",
 				TypeStr: "Address",
-				Fields: []FieldInfo{
+				Fields: []ast.FieldInfo{
 					{Name: "City", TypeStr: "string"},
 					{Name: "Zip", TypeStr: "string"},
 				},
@@ -29,7 +32,7 @@ var sharedVars = map[string]TemplateVar{
 		TypeStr:  "[]Item",
 		IsSlice:  true,
 		ElemType: "Item",
-		Fields: []FieldInfo{
+		Fields: []ast.FieldInfo{
 			{Name: "Title", TypeStr: "string"},
 			{Name: "Price", TypeStr: "float64"},
 		},
@@ -40,13 +43,13 @@ var sharedVars = map[string]TemplateVar{
 		IsMap:    true,
 		KeyType:  "string",
 		ElemType: "User",
-		Fields: []FieldInfo{
+		Fields: []ast.FieldInfo{
 			{Name: "Name", TypeStr: "string"},
 			{Name: "Age", TypeStr: "int"},
 			{
 				Name:    "Address",
 				TypeStr: "Address",
-				Fields: []FieldInfo{
+				Fields: []ast.FieldInfo{
 					{Name: "City", TypeStr: "string"},
 					{Name: "Zip", TypeStr: "string"},
 				},
@@ -58,18 +61,18 @@ var sharedVars = map[string]TemplateVar{
 		TypeStr:  "map[string]map[string]User",
 		IsMap:    true,
 		ElemType: "map[string]User",
-		Fields: []FieldInfo{
+		Fields: []ast.FieldInfo{
 			{Name: "Name", TypeStr: "string"},
 			{Name: "Age", TypeStr: "int"},
 		},
 	},
 }
 
-func TestValidateTemplateContent(t *testing.T) {
+func ValidateTemplateContent(t *testing.T) {
 	tests := []struct {
 		name     string
 		content  string
-		expected []ValidationResult
+		expected []validator.ValidationResult
 	}{
 		// --- Basic variable access ---
 		{
@@ -80,7 +83,7 @@ func TestValidateTemplateContent(t *testing.T) {
 		{
 			name:    "Invalid variable access",
 			content: "{{ .User.Invalid }}",
-			expected: []ValidationResult{
+			expected: []validator.ValidationResult{
 				{
 					Variable: ".User.Invalid",
 					Message:  `Field "Invalid" does not exist on type User`,
@@ -98,7 +101,7 @@ func TestValidateTemplateContent(t *testing.T) {
 		{
 			name:    "Invalid nested variable access",
 			content: "{{ .User.Address.Invalid }}",
-			expected: []ValidationResult{
+			expected: []validator.ValidationResult{
 				{
 					Variable: ".User.Address.Invalid",
 					Message:  `Field "Invalid" does not exist on type Address`,
@@ -118,7 +121,7 @@ func TestValidateTemplateContent(t *testing.T) {
 		{
 			name:    "Invalid range access",
 			content: "{{ range .Items }}{{ .Invalid }}{{ end }}",
-			expected: []ValidationResult{
+			expected: []validator.ValidationResult{
 				{
 					Variable: ".Invalid",
 					Message:  `Template variable ".Invalid" is not defined in the render context`,
@@ -143,7 +146,7 @@ func TestValidateTemplateContent(t *testing.T) {
 		{
 			name:    "Invalid with block access",
 			content: "{{ with .User }}{{ .Invalid }}{{ end }}",
-			expected: []ValidationResult{
+			expected: []validator.ValidationResult{
 				{
 					Variable: ".Invalid",
 					Message:  `Template variable ".Invalid" is not defined in the render context`,
@@ -169,7 +172,7 @@ func TestValidateTemplateContent(t *testing.T) {
 					{{ .Address.Invalid }}
 				{{ end }}
 			`,
-			expected: []ValidationResult{
+			expected: []validator.ValidationResult{
 				{
 					Variable: ".Address.Invalid",
 					Message:  `Field "Invalid" does not exist on type Address`,
@@ -189,7 +192,7 @@ func TestValidateTemplateContent(t *testing.T) {
 		{
 			name:    "Invalid field on map value",
 			content: "{{ .MyMap.someKey.Invalid }}",
-			expected: []ValidationResult{
+			expected: []validator.ValidationResult{
 				{
 					Variable: ".MyMap.someKey.Invalid",
 					Message:  `Field "Invalid" does not exist on type User`,
@@ -207,7 +210,7 @@ func TestValidateTemplateContent(t *testing.T) {
 		{
 			name:    "Invalid range over map value",
 			content: "{{ range .MyMap }}{{ .Invalid }}{{ end }}",
-			expected: []ValidationResult{
+			expected: []validator.ValidationResult{
 				{
 					Variable: ".Invalid",
 					Message:  `Template variable ".Invalid" is not defined in the render context`,
@@ -230,7 +233,7 @@ func TestValidateTemplateContent(t *testing.T) {
 		{
 			name:    "Invalid nested map access",
 			content: "{{ .NestedMap.Key1.Key2.Invalid }}",
-			expected: []ValidationResult{
+			expected: []validator.ValidationResult{
 				{
 					Variable: ".NestedMap.Key1.Key2.Invalid",
 					Message:  `Field "Invalid" does not exist on type User`,
@@ -261,7 +264,7 @@ func TestValidateTemplateContent(t *testing.T) {
 		{
 			name:    "Named block with invalid variable context still validates the variable",
 			content: `{{ template "header" .NonExistent }}`,
-			expected: []ValidationResult{
+			expected: []validator.ValidationResult{
 				{
 					Variable: ".NonExistent",
 					Message:  `Template variable ".NonExistent" is not defined in the render context`,
@@ -291,7 +294,7 @@ func TestValidateTemplateContent(t *testing.T) {
 		{
 			name:    "Invalid variable inside if",
 			content: "{{ if .User.Name }}{{ .User.Invalid }}{{ end }}",
-			expected: []ValidationResult{
+			expected: []validator.ValidationResult{
 				{
 					Variable: ".User.Invalid",
 					Message:  `Field "Invalid" does not exist on type User`,
@@ -303,7 +306,7 @@ func TestValidateTemplateContent(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := validateTemplateContent(tt.content, sharedVars, "test.html", ".", "", 1, nil)
+			got := validator.ValidateTemplateContent(tt.content, sharedVars, "test.html", ".", "", 1, nil)
 
 			if len(got) != len(tt.expected) {
 				t.Errorf("expected %d errors, got %d", len(tt.expected), len(got))
@@ -355,7 +358,7 @@ func TestIsFileBasedPartial(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := isFileBasedPartial(tc.input)
+			got := validator.IsFileBasedPartial(tc.input)
 			if got != tc.expected {
 				t.Errorf("isFileBasedPartial(%q) = %v, want %v", tc.input, got, tc.expected)
 			}
@@ -390,8 +393,8 @@ func TestPartialTemplateResolution(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		vars := []TemplateVar{sharedVars["User"]}
-		errs := validateTemplateFile(parentPath, vars, "index.html", tmpDir, templateRoot, nil)
+		vars := []ast.TemplateVar{sharedVars["User"]}
+		errs := validator.ValidateTemplateFile(parentPath, vars, "index.html", tmpDir, templateRoot, nil)
 
 		// We expect exactly 1 error from the partial (NonExistent field)
 		if len(errs) != 1 {
@@ -421,8 +424,8 @@ func TestPartialTemplateResolution(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		vars := []TemplateVar{sharedVars["User"]}
-		errs := validateTemplateFile(parentPath, vars, "parent.html", tmpDir, templateRoot, nil)
+		vars := []ast.TemplateVar{sharedVars["User"]}
+		errs := validator.ValidateTemplateFile(parentPath, vars, "parent.html", tmpDir, templateRoot, nil)
 
 		if len(errs) != 0 {
 			t.Errorf("Fix3: expected no errors for valid partial scope, got %d", len(errs))
@@ -444,8 +447,8 @@ func TestPartialTemplateResolution(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		vars := []TemplateVar{sharedVars["User"], sharedVars["Items"]}
-		errs := validateTemplateFile(parentPath, vars, "root_parent.html", tmpDir, templateRoot, nil)
+		vars := []ast.TemplateVar{sharedVars["User"], sharedVars["Items"]}
+		errs := validator.ValidateTemplateFile(parentPath, vars, "root_parent.html", tmpDir, templateRoot, nil)
 
 		if len(errs) != 0 {
 			t.Errorf("Fix3: expected no errors when partial receives full root scope, got %d", len(errs))
@@ -466,8 +469,8 @@ func TestPartialTemplateResolution(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		vars := []TemplateVar{sharedVars["User"]}
-		errs := validateTemplateFile(parentPath, vars, "bad_parent.html", tmpDir, templateRoot, nil)
+		vars := []ast.TemplateVar{sharedVars["User"]}
+		errs := validator.ValidateTemplateFile(parentPath, vars, "bad_parent.html", tmpDir, templateRoot, nil)
 
 		if len(errs) != 1 {
 			t.Errorf("Fix3: expected 1 error for invalid field in partial, got %d", len(errs))
@@ -487,8 +490,8 @@ func TestPartialTemplateResolution(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		vars := []TemplateVar{sharedVars["User"]}
-		errs := validateTemplateFile(parentPath, vars, "missing_parent.html", tmpDir, templateRoot, nil)
+		vars := []ast.TemplateVar{sharedVars["User"]}
+		errs := validator.ValidateTemplateFile(parentPath, vars, "missing_parent.html", tmpDir, templateRoot, nil)
 
 		if len(errs) != 1 {
 			t.Errorf("expected 1 error for missing partial, got %d", len(errs))

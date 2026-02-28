@@ -1,5 +1,4 @@
-// filepath: analyzer/validator/generics_test.go
-package validator
+package ast
 
 import (
 	"os"
