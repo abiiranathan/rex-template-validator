@@ -94,6 +94,11 @@
           "type": "boolean",
           "default": false,
           "description": "Enable GZIP compression from analyzer"
+        },
+        "rex-analyzer.validate": {
+          "type": "boolean",
+          "default": true,
+          "description": "Validate variables passed into the context and template names"
         }
       }
     }

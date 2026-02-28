@@ -21,10 +21,13 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
 )
+
+var validTemplateName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // NAMED TEMPLATE PARSING (CONCURRENT)
@@ -547,6 +550,11 @@ func validateTemplateFile(
 				entry.Line,
 				registry,
 			)
+		}
+
+		// may be inline HTML.
+		if !validTemplateName.MatchString(templateName) {
+			return []ValidationResult{}
 		}
 
 		// Neither file nor named block found

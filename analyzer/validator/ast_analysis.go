@@ -13,15 +13,9 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"unique"
 
 	"golang.org/x/tools/go/packages"
 )
-
-// structKeyHandle provides a unique, interned identifier for struct types.
-// Using unique.Handle reduces memory overhead when the same type appears
-// multiple times across the codebase.
-type structKeyHandle = unique.Handle[string]
 
 // structIndexEntry caches documentation and field metadata for a struct type.
 // This prevents redundant AST traversals for the same type.
@@ -38,15 +32,11 @@ type fieldInfo struct {
 	doc  string // Associated documentation comment
 }
 
-// makeStructKey generates a unique handle for a named type by combining
-// its package name and type name. This handle serves as a cache key.
-func makeStructKey(named *types.Named) structKeyHandle {
-	return unique.Make(rawStructKey(named))
-}
-
-// rawStructKey constructs a fully qualified type identifier string.
+// getASTKey generates a base identifier for a named type to look up docs.
 // Format: "packageName.TypeName" or just "TypeName" for built-in types.
-func rawStructKey(named *types.Named) string {
+// This intentionally ignores type arguments (generics) because the AST
+// definition is the same regardless of instantiation.
+func getASTKey(named *types.Named) string {
 	obj := named.Obj()
 	if obj.Pkg() != nil {
 		return obj.Pkg().Name() + "." + obj.Name()
@@ -69,20 +59,20 @@ type cachedFields struct {
 // This is critical for performance when analyzing large codebases with
 // many references to the same types.
 type fieldCache struct {
-	mu    sync.RWMutex                     // Protects concurrent map access
-	cache map[structKeyHandle]cachedFields // Cache storage
+	mu    sync.RWMutex            // Protects concurrent map access
+	cache map[string]cachedFields // Cache storage (keyed by full type string)
 }
 
 // newFieldCache initializes a fieldCache with reasonable default capacity.
 func newFieldCache() *fieldCache {
 	return &fieldCache{
-		cache: make(map[structKeyHandle]cachedFields, 256),
+		cache: make(map[string]cachedFields, 256),
 	}
 }
 
 // get retrieves cached field data with read lock for concurrent safety.
 // Returns the cached data and a boolean indicating cache hit/miss.
-func (fc *fieldCache) get(k structKeyHandle) (cachedFields, bool) {
+func (fc *fieldCache) get(k string) (cachedFields, bool) {
 	fc.mu.RLock()
 	v, ok := fc.cache[k]
 	fc.mu.RUnlock()
@@ -90,7 +80,7 @@ func (fc *fieldCache) get(k structKeyHandle) (cachedFields, bool) {
 }
 
 // set stores field data in cache with write lock for concurrent safety.
-func (fc *fieldCache) set(k structKeyHandle, v cachedFields) {
+func (fc *fieldCache) set(k string, v cachedFields) {
 	fc.mu.Lock()
 	fc.cache[k] = v
 	fc.mu.Unlock()
@@ -112,7 +102,7 @@ func newSeenMapPool() *seenMapPool {
 	return &seenMapPool{
 		pool: sync.Pool{
 			New: func() any {
-				return make(map[structKeyHandle]bool, 16)
+				return make(map[string]bool, 16)
 			},
 		},
 	}
@@ -120,14 +110,14 @@ func newSeenMapPool() *seenMapPool {
 
 // get retrieves a cleared seen map from the pool, ready for use.
 // Maps are cleared to ensure no stale state from previous uses.
-func (smp *seenMapPool) get() map[structKeyHandle]bool {
-	m := smp.pool.Get().(map[structKeyHandle]bool)
+func (smp *seenMapPool) get() map[string]bool {
+	m := smp.pool.Get().(map[string]bool)
 	clear(m) // Go 1.21+ clear built-in
 	return m
 }
 
 // put returns a seen map to the pool for later reuse.
-func (smp *seenMapPool) put(m map[structKeyHandle]bool) {
+func (smp *seenMapPool) put(m map[string]bool) {
 	smp.pool.Put(m)
 }
 
@@ -310,7 +300,7 @@ func generateRenderCalls(
 	info *types.Info,
 	fset *token.FileSet,
 	dir string,
-	structIndex map[structKeyHandle]structIndexEntry,
+	structIndex map[string]structIndexEntry,
 	fc *fieldCache,
 	seenPool *seenMapPool,
 ) []RenderCall {
@@ -352,14 +342,7 @@ func generateRenderCalls(
 
 			// Process each template name (usually one, but can be multiple from variables)
 			for _, templatePath := range rr.TemplateNames {
-				templatePath := strings.TrimSpace(templatePath)
 				if templatePath == "" {
-					continue
-				}
-
-				// Ignore HTML content being execute directly in go code.
-				// It is not a file
-				if strings.HasPrefix(templatePath, "<") || strings.Contains(templatePath, "/>") {
 					continue
 				}
 
@@ -500,7 +483,7 @@ func collectFuncScopesOptimized(
 	files []*ast.File,
 	info *types.Info,
 	fset *token.FileSet,
-	structIndex map[structKeyHandle]structIndexEntry,
+	structIndex map[string]structIndexEntry,
 	fc *fieldCache,
 	config AnalysisConfig,
 	filesMap map[string]*ast.File,
@@ -550,7 +533,7 @@ func processNodesConcurrently(
 	funcNodes []funcWorkUnit,
 	info *types.Info,
 	fset *token.FileSet,
-	structIndex map[structKeyHandle]structIndexEntry,
+	structIndex map[string]structIndexEntry,
 	fc *fieldCache,
 	config AnalysisConfig,
 	filesMap map[string]*ast.File,
@@ -598,7 +581,7 @@ func processChunk(
 	chunk []funcWorkUnit,
 	info *types.Info,
 	fset *token.FileSet,
-	structIndex map[structKeyHandle]structIndexEntry,
+	structIndex map[string]structIndexEntry,
 	fc *fieldCache,
 	config AnalysisConfig,
 	filesMap map[string]*ast.File,
@@ -640,7 +623,7 @@ func processFunc(
 	n ast.Node,
 	info *types.Info,
 	fset *token.FileSet,
-	structIndex map[structKeyHandle]structIndexEntry,
+	structIndex map[string]structIndexEntry,
 	fc *fieldCache,
 	config AnalysisConfig,
 	filesMap map[string]*ast.File,
@@ -838,7 +821,7 @@ func findTemplateOperations(
 	n ast.Node,
 	info *types.Info,
 	fset *token.FileSet,
-	structIndex map[structKeyHandle]structIndexEntry,
+	structIndex map[string]structIndexEntry,
 	fc *fieldCache,
 	config AnalysisConfig,
 	filesMap map[string]*ast.File,
@@ -876,7 +859,7 @@ func processCallExpr(
 	call *ast.CallExpr,
 	info *types.Info,
 	fset *token.FileSet,
-	structIndex map[structKeyHandle]structIndexEntry,
+	structIndex map[string]structIndexEntry,
 	fc *fieldCache,
 	config AnalysisConfig,
 	seenPool *seenMapPool,
@@ -1038,7 +1021,7 @@ func extractSetCallVarOptimized(
 	call *ast.CallExpr,
 	info *types.Info,
 	fset *token.FileSet,
-	structIndex map[structKeyHandle]structIndexEntry,
+	structIndex map[string]structIndexEntry,
 	fc *fieldCache,
 	config AnalysisConfig,
 	seenPool *seenMapPool,
@@ -1070,7 +1053,7 @@ func extractSetCallVarOptimized(
 
 	// Extract type information if available
 	if typeInfo, ok := info.Types[valArg]; ok && typeInfo.Type != nil {
-		tv.TypeStr = normalizeTypeStr(typeInfo.Type.String())
+		tv.TypeStr = normalizeTypeStr(typeInfo.Type)
 
 		seen := seenPool.get()
 		tv.Fields, tv.Doc = extractFieldsWithDocs(typeInfo.Type, structIndex, fc, seen, fset)
@@ -1117,9 +1100,9 @@ func isContextType(expr ast.Expr, info *types.Info, contextTypeName string) bool
 // checkSliceType determines if a type is a slice and extracts element type info.
 func checkSliceType(
 	t types.Type,
-	structIndex map[structKeyHandle]structIndexEntry,
+	structIndex map[string]structIndexEntry,
 	fc *fieldCache,
-	seen map[structKeyHandle]bool,
+	seen map[string]bool,
 	fset *token.FileSet,
 	tv *TemplateVar,
 ) (isSlice bool, elemType string) {
@@ -1132,15 +1115,15 @@ func checkSliceType(
 	clear(seen)
 
 	tv.Fields, tv.Doc = extractFieldsWithDocsPreservingDoc(elem, structIndex, fc, seen, fset, tv.Doc)
-	return true, normalizeTypeStr(elem.String())
+	return true, normalizeTypeStr(elem)
 }
 
 // checkMapType determines if a type is a map and extracts key/value type info.
 func checkMapType(
 	t types.Type,
-	structIndex map[structKeyHandle]structIndexEntry,
+	structIndex map[string]structIndexEntry,
 	fc *fieldCache,
-	seen map[structKeyHandle]bool,
+	seen map[string]bool,
 	fset *token.FileSet,
 	tv *TemplateVar,
 ) (isMap bool, keyType string) {
@@ -1152,9 +1135,9 @@ func checkMapType(
 	// Clear seen map for element type extraction
 	clear(seen)
 
-	tv.ElemType = normalizeTypeStr(elemT.String())
+	tv.ElemType = normalizeTypeStr(elemT)
 	tv.Fields, tv.Doc = extractFieldsWithDocsPreservingDoc(elemT, structIndex, fc, seen, fset, tv.Doc)
-	return true, normalizeTypeStr(keyT.String())
+	return true, normalizeTypeStr(keyT)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1170,7 +1153,7 @@ func checkMapType(
 // Pass 2: Attach method documentation (sequential, typically small)
 //
 // Concurrency: Workers write directly to sync.Map to avoid coordination overhead.
-func buildStructIndex(fset *token.FileSet, files map[string]*ast.File) map[structKeyHandle]structIndexEntry {
+func buildStructIndex(fset *token.FileSet, files map[string]*ast.File) map[string]structIndexEntry {
 	numWorkers := max(runtime.NumCPU(), 1)
 	fileChan := make(chan *ast.File, len(files))
 
@@ -1250,8 +1233,8 @@ func extractStructFieldsWorker(
 					}
 				}
 
-				// Store in shared index
-				key := unique.Make(pkgName + "." + typeSpec.Name.Name)
+				// Store in shared index (using base name for AST lookup)
+				key := pkgName + "." + typeSpec.Name.Name
 				sharedIndex.Store(key, entry)
 			}
 
@@ -1261,11 +1244,11 @@ func extractStructFieldsWorker(
 }
 
 // convertSyncMapToMap converts sync.Map to regular map for optimized reads.
-func convertSyncMapToMap(sharedIndex *sync.Map, estimatedSize int) map[structKeyHandle]structIndexEntry {
-	finalIndex := make(map[structKeyHandle]structIndexEntry, estimatedSize*4)
+func convertSyncMapToMap(sharedIndex *sync.Map, estimatedSize int) map[string]structIndexEntry {
+	finalIndex := make(map[string]structIndexEntry, estimatedSize*4)
 
 	sharedIndex.Range(func(k, v any) bool {
-		finalIndex[k.(structKeyHandle)] = v.(structIndexEntry)
+		finalIndex[k.(string)] = v.(structIndexEntry)
 		return true
 	})
 
@@ -1274,7 +1257,7 @@ func convertSyncMapToMap(sharedIndex *sync.Map, estimatedSize int) map[structKey
 
 // attachMethodDocs walks all files to find method declarations and attach
 // their documentation to the corresponding struct entries.
-func attachMethodDocs(files map[string]*ast.File, fset *token.FileSet, index map[structKeyHandle]structIndexEntry) {
+func attachMethodDocs(files map[string]*ast.File, fset *token.FileSet, index map[string]structIndexEntry) {
 	for _, f := range files {
 		pkgName := f.Name.Name
 
@@ -1290,13 +1273,23 @@ func attachMethodDocs(files map[string]*ast.File, fset *token.FileSet, index map
 				recvType = starExpr.X
 			}
 
-			ident, ok := recvType.(*ast.Ident)
-			if !ok {
+			// Handle generic receivers (e.g., *MyStruct[T])
+			var ident *ast.Ident
+			switch rt := recvType.(type) {
+			case *ast.Ident:
+				ident = rt
+			case *ast.IndexExpr:
+				ident, _ = rt.X.(*ast.Ident)
+			case *ast.IndexListExpr:
+				ident, _ = rt.X.(*ast.Ident)
+			}
+
+			if ident == nil {
 				return true
 			}
 
 			// Find corresponding struct entry
-			key := unique.Make(pkgName + "." + ident.Name)
+			key := pkgName + "." + ident.Name
 			entry, exists := index[key]
 			if !exists {
 				return true
@@ -1334,7 +1327,7 @@ func attachMethodDocs(files map[string]*ast.File, fset *token.FileSet, index map
 //
 // Caching strategy:
 // - Each unique struct type is processed exactly once
-// - Results are cached by structKeyHandle
+// - Results are cached by the full type string (including type arguments)
 // - Subsequent requests hit the cache
 //
 // Recursion handling:
@@ -1343,9 +1336,9 @@ func attachMethodDocs(files map[string]*ast.File, fset *token.FileSet, index map
 // - Copies for independent branches (slice elements)
 func extractFieldsWithDocs(
 	t types.Type,
-	structIndex map[structKeyHandle]structIndexEntry,
+	structIndex map[string]structIndexEntry,
 	fc *fieldCache,
-	seen map[structKeyHandle]bool,
+	seen map[string]bool,
 	fset *token.FileSet,
 ) ([]FieldInfo, string) {
 	// Unwrap pointers and maps
@@ -1359,24 +1352,28 @@ func extractFieldsWithDocs(
 		return nil, ""
 	}
 
-	handle := makeStructKey(named)
+	// Cache key MUST include type arguments for generics (e.g., pkg.Struct[int])
+	cacheKey := t.String()
 
 	// Cycle detection
-	if seen[handle] {
+	if seen[cacheKey] {
 		return nil, ""
 	}
-	seen[handle] = true
+	seen[cacheKey] = true
 
 	// Check cache
-	if cached, ok := fc.get(handle); ok {
+	if cached, ok := fc.get(cacheKey); ok {
 		return cached.fields, cached.doc
 	}
 
+	// AST key is just the base name (pkg.Struct) for looking up docs/source locations
+	astKey := getASTKey(named)
+
 	// Extract fields (cache miss)
-	fields, doc := extractFieldsUncached(named, handle, structIndex, fc, seen, fset)
+	fields, doc := extractFieldsUncached(named, astKey, structIndex, fc, seen, fset)
 
 	// Store in cache
-	fc.set(handle, cachedFields{fields: fields, doc: doc})
+	fc.set(cacheKey, cachedFields{fields: fields, doc: doc})
 
 	return fields, doc
 }
@@ -1399,10 +1396,10 @@ func unwrapType(t types.Type) types.Type {
 // Handles both struct types and interface types differently.
 func extractFieldsUncached(
 	named *types.Named,
-	handle structKeyHandle,
-	structIndex map[structKeyHandle]structIndexEntry,
+	astKey string,
+	structIndex map[string]structIndexEntry,
 	fc *fieldCache,
-	seen map[structKeyHandle]bool,
+	seen map[string]bool,
 	fset *token.FileSet,
 ) ([]FieldInfo, string) {
 	strct, ok := named.Underlying().(*types.Struct)
@@ -1412,7 +1409,7 @@ func extractFieldsUncached(
 	}
 
 	// Struct type: extract fields and methods
-	entry := structIndex[handle]
+	entry := structIndex[astKey]
 	fields := extractStructFields(strct, entry, structIndex, fc, seen, fset)
 
 	// Append methods
@@ -1428,14 +1425,15 @@ func extractFieldsUncached(
 func extractStructFields(
 	strct *types.Struct,
 	entry structIndexEntry,
-	structIndex map[structKeyHandle]structIndexEntry,
+	structIndex map[string]structIndexEntry,
 	fc *fieldCache,
-	seen map[structKeyHandle]bool,
+	seen map[string]bool,
 	fset *token.FileSet,
 ) []FieldInfo {
 	fields := make([]FieldInfo, 0, strct.NumFields())
 
-	for field := range strct.Fields() {
+	for i := 0; i < strct.NumFields(); i++ {
+		field := strct.Field(i)
 		if !field.Exported() {
 			continue
 		}
@@ -1451,14 +1449,14 @@ func extractStructFields(
 func buildFieldInfo(
 	field *types.Var,
 	entry structIndexEntry,
-	structIndex map[structKeyHandle]structIndexEntry,
+	structIndex map[string]structIndexEntry,
 	fc *fieldCache,
-	seen map[structKeyHandle]bool,
+	seen map[string]bool,
 	fset *token.FileSet,
 ) FieldInfo {
 	fi := FieldInfo{
 		Name:    field.Name(),
-		TypeStr: normalizeTypeStr(field.Type().String()),
+		TypeStr: normalizeTypeStr(field.Type()),
 	}
 
 	// Set definition location
@@ -1483,8 +1481,8 @@ func buildFieldInfo(
 		fi.Fields, _ = extractFieldsWithDocs(slice.Elem(), structIndex, fc, elemSeen, fset)
 	} else if keyType, elemType := getMapTypes(ft); keyType != nil && elemType != nil {
 		fi.IsMap = true
-		fi.KeyType = normalizeTypeStr(keyType.String())
-		fi.ElemType = normalizeTypeStr(elemType.String())
+		fi.KeyType = normalizeTypeStr(keyType)
+		fi.ElemType = normalizeTypeStr(elemType)
 		// Independent recursion branch for map values
 		elemSeen := copySeenMap(seen)
 		fi.Fields, _ = extractFieldsWithDocs(elemType, structIndex, fc, elemSeen, fset)
@@ -1559,8 +1557,8 @@ func addMethodDocs(fields []FieldInfo, entry structIndexEntry) {
 }
 
 // copySeenMap creates an independent copy for separate recursion branches.
-func copySeenMap(src map[structKeyHandle]bool) map[structKeyHandle]bool {
-	dst := make(map[structKeyHandle]bool, len(src))
+func copySeenMap(src map[string]bool) map[string]bool {
+	dst := make(map[string]bool, len(src))
 	maps.Copy(dst, src)
 	return dst
 }
@@ -1576,9 +1574,9 @@ func extractMapVars(
 	expr ast.Expr,
 	info *types.Info,
 	fset *token.FileSet,
-	structIndex map[structKeyHandle]structIndexEntry,
+	structIndex map[string]structIndexEntry,
 	fc *fieldCache,
-	seen map[structKeyHandle]bool,
+	seen map[string]bool,
 ) []TemplateVar {
 	comp, ok := expr.(*ast.CompositeLit)
 	if !ok {
@@ -1606,18 +1604,18 @@ func extractMapVars(
 			// Clear seen map for this variable
 			clear(seen)
 
-			tv.TypeStr = normalizeTypeStr(typeInfo.Type.String())
+			tv.TypeStr = normalizeTypeStr(typeInfo.Type)
 			tv.Fields, tv.Doc = extractFieldsWithDocs(typeInfo.Type, structIndex, fc, seen, fset)
 
 			// Handle collection types
 			if elemType := getElementType(typeInfo.Type); elemType != nil {
 				tv.IsSlice = true
-				tv.ElemType = normalizeTypeStr(elemType.String())
+				tv.ElemType = normalizeTypeStr(elemType)
 				tv.Fields, tv.Doc = extractFieldsWithDocsPreservingDoc(elemType, structIndex, fc, seen, fset, tv.Doc)
 			} else if keyType, elemType := getMapTypes(typeInfo.Type); keyType != nil && elemType != nil {
 				tv.IsMap = true
-				tv.KeyType = normalizeTypeStr(keyType.String())
-				tv.ElemType = normalizeTypeStr(elemType.String())
+				tv.KeyType = normalizeTypeStr(keyType)
+				tv.ElemType = normalizeTypeStr(elemType)
 				tv.Fields, tv.Doc = extractFieldsWithDocsPreservingDoc(elemType, structIndex, fc, seen, fset, tv.Doc)
 			}
 		} else {
@@ -1652,7 +1650,7 @@ func enrichRenderCallsWithContext(
 	calls []RenderCall,
 	contextFile string,
 	pkgs []*packages.Package,
-	structIndex map[structKeyHandle]structIndexEntry,
+	structIndex map[string]structIndexEntry,
 	fc *fieldCache,
 	fset *token.FileSet,
 	config AnalysisConfig,
@@ -1740,7 +1738,7 @@ func enrichExistingCalls(
 	contextConfig map[string]map[string]string,
 	globalVars []TemplateVar,
 	typeMap map[string]*types.TypeName,
-	structIndex map[structKeyHandle]structIndexEntry,
+	structIndex map[string]structIndexEntry,
 	fc *fieldCache,
 	fset *token.FileSet,
 	seenPool *seenMapPool,
@@ -1771,7 +1769,7 @@ func addSyntheticCalls(
 	contextConfig map[string]map[string]string,
 	globalVars []TemplateVar,
 	typeMap map[string]*types.TypeName,
-	structIndex map[structKeyHandle]structIndexEntry,
+	structIndex map[string]structIndexEntry,
 	fc *fieldCache,
 	fset *token.FileSet,
 	config AnalysisConfig,
@@ -1811,7 +1809,7 @@ func addSyntheticCalls(
 func buildTemplateVarsOptimized(
 	varDefs map[string]string,
 	typeMap map[string]*types.TypeName,
-	structIndex map[structKeyHandle]structIndexEntry,
+	structIndex map[string]structIndexEntry,
 	fc *fieldCache,
 	fset *token.FileSet,
 	seenPool *seenMapPool,
@@ -1951,29 +1949,15 @@ func findDefinitionLocation(expr ast.Expr, info *types.Info, fset *token.FileSet
 }
 
 // normalizeTypeStr makes type strings more readable by removing package paths.
-// Preserves [] and * prefixes.
-// Example: "*github.com/user/pkg.MyType" → "*MyType"
-func normalizeTypeStr(s string) string {
-	var prefix strings.Builder
-	base := s
-
-	// Strip prefixes while preserving them
-	for {
-		switch {
-		case strings.HasPrefix(base, "[]"):
-			prefix.WriteString("[]")
-			base = base[2:]
-		case strings.HasPrefix(base, "*"):
-			prefix.WriteString("*")
-			base = base[1:]
-		default:
-			// Remove package path
-			if idx := strings.LastIndex(base, "/"); idx >= 0 {
-				base = base[idx+1:]
-			}
-			return prefix.String() + base
-		}
+// It correctly handles generic instantiations.
+// Example: "github.com/user/pkg.Page[github.com/user/pkg.User]" → "Page[User]"
+func normalizeTypeStr(t types.Type) string {
+	if t == nil {
+		return ""
 	}
+	return types.TypeString(t, func(*types.Package) string {
+		return "" // Omits package paths completely
+	})
 }
 
 // getElementType extracts the element type from a slice or array type.
@@ -2213,9 +2197,9 @@ func extractSignatureInfo(sig *types.Signature) (params, returns []ParamInfo, ar
 	params = make([]ParamInfo, sig.Params().Len())
 	args = make([]string, sig.Params().Len())
 
-	for i := range sig.Params().Len() {
+	for i := 0; i < sig.Params().Len(); i++ {
 		p := sig.Params().At(i)
-		ts := normalizeTypeStr(p.Type().String())
+		ts := normalizeTypeStr(p.Type())
 		params[i] = ParamInfo{Name: p.Name(), TypeStr: ts}
 		args[i] = ts
 	}
@@ -2223,9 +2207,9 @@ func extractSignatureInfo(sig *types.Signature) (params, returns []ParamInfo, ar
 	// Extract return types
 	returns = make([]ParamInfo, sig.Results().Len())
 
-	for i := range sig.Results().Len() {
+	for i := 0; i < sig.Results().Len(); i++ {
 		r := sig.Results().At(i)
-		ts := normalizeTypeStr(r.Type().String())
+		ts := normalizeTypeStr(r.Type())
 		returns[i] = ParamInfo{Name: r.Name(), TypeStr: ts}
 	}
 
@@ -2278,9 +2262,9 @@ func isFuncMapCompositeLit(comp *ast.CompositeLit, info *types.Info) bool {
 // existing documentation if new extraction returns empty doc.
 func extractFieldsWithDocsPreservingDoc(
 	t types.Type,
-	structIndex map[structKeyHandle]structIndexEntry,
+	structIndex map[string]structIndexEntry,
 	fc *fieldCache,
-	seen map[structKeyHandle]bool,
+	seen map[string]bool,
 	fset *token.FileSet,
 	existingDoc string,
 ) ([]FieldInfo, string) {

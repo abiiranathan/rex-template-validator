@@ -201,7 +201,7 @@ type AnalysisConfig struct {
 // DefaultConfig provides the default configuration for the Rex template analyzer, tailored for common Rex framework conventions.
 var DefaultConfig = AnalysisConfig{
 	RenderFunctionName:          "Render",
-	ExecuteTemplateFunctionName: "ExecuteTemplate",
+	ExecuteTemplateFunctionName: "",
 	SetFunctionName:             "Set",
 	ContextTypeName:             "Context",
 	GlobalTemplateName:          "global",

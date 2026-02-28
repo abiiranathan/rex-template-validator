@@ -49,6 +49,7 @@ export class GoAnalyzer {
     const templateBaseDir: string = config.get('templateBaseDir') ?? '';
     const contextFile: string = config.get('contextFile') ?? '';
     const enableGZIPCompression = config.get("compress") ?? false;
+    const validate: boolean = config.get("validate") ?? true;
 
     this.outputChannel.appendLine(`SourceDir: ${sourceDir}`)
     this.outputChannel.appendLine(`templateRoot: ${templateRoot}`)
@@ -63,7 +64,11 @@ export class GoAnalyzer {
       return { renderCalls: [], errors: [`Source directory not found: ${absSourceDir}`] };
     }
 
-    const args = ['-dir', absSourceDir, '-validate'];
+    const args = ['-dir', absSourceDir];
+
+    if (validate) {
+      args.push('-validate')
+    }
 
     // Only pass template-base-dir if explicitly set, otherwise let Go analyzer default to sourceDir
     if (templateBaseDir) {
