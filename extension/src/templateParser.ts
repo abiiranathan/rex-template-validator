@@ -78,7 +78,16 @@ export class TemplateParser {
           cleanExpr = assignMatch[3].trim();
         }
 
-        const child = this.buildTree(tokens, pos + 1);
+        let child = this.buildTree(tokens, pos + 1);
+        let trueBranch = child.nodes;
+        let falseBranch: TemplateNode[] | undefined;
+
+        if (child.endToken && (child.endToken.inner === 'else' || child.endToken.inner.startsWith('else '))) {
+          const elseChild = this.buildTree(tokens, child.nextPos);
+          falseBranch = elseChild.nodes;
+          child = elseChild;
+        }
+
         nodes.push({
           kind: 'range',
           path: this.parseDotPath(cleanExpr),
@@ -87,10 +96,11 @@ export class TemplateParser {
           col: tok.col,
           endLine: child.endToken?.line,
           endCol: child.endToken?.col,
-          children: child.nodes,
+          children: trueBranch,
+          elseChildren: falseBranch,
           keyVar,
           valVar,
-        });
+        } as any);
         pos = child.nextPos;
         continue;
       }
@@ -104,7 +114,17 @@ export class TemplateParser {
           valVar = assignMatch[1];
           cleanExpr = assignMatch[2].trim();
         }
-        const child = this.buildTree(tokens, pos + 1);
+
+        let child = this.buildTree(tokens, pos + 1);
+        let trueBranch = child.nodes;
+        let falseBranch: TemplateNode[] | undefined;
+
+        if (child.endToken && (child.endToken.inner === 'else' || child.endToken.inner.startsWith('else '))) {
+          const elseChild = this.buildTree(tokens, child.nextPos);
+          falseBranch = elseChild.nodes;
+          child = elseChild;
+        }
+
         nodes.push({
           kind: 'with',
           path: this.parseDotPath(cleanExpr),
@@ -113,16 +133,26 @@ export class TemplateParser {
           col: tok.col,
           endLine: child.endToken?.line,
           endCol: child.endToken?.col,
-          children: child.nodes,
+          children: trueBranch,
+          elseChildren: falseBranch,
           valVar,
-        });
+        } as any);
         pos = child.nextPos;
         continue;
       }
 
       if (inner.startsWith('if ')) {
         const expr = inner.slice(3).trim();
-        const child = this.buildTree(tokens, pos + 1);
+        let child = this.buildTree(tokens, pos + 1);
+        let trueBranch = child.nodes;
+        let falseBranch: TemplateNode[] | undefined;
+
+        if (child.endToken && (child.endToken.inner === 'else' || child.endToken.inner.startsWith('else '))) {
+          const elseChild = this.buildTree(tokens, child.nextPos);
+          falseBranch = elseChild.nodes;
+          child = elseChild;
+        }
+
         nodes.push({
           kind: 'if',
           path: this.parseDotPath(expr),
@@ -131,8 +161,9 @@ export class TemplateParser {
           col: tok.col,
           endLine: child.endToken?.line,
           endCol: child.endToken?.col,
-          children: child.nodes,
-        });
+          children: trueBranch,
+          elseChildren: falseBranch,
+        } as any);
         pos = child.nextPos;
         continue;
       }
@@ -209,7 +240,7 @@ export class TemplateParser {
       pos++;
     }
 
-    return { nodes, nextPos: pos };
+    return { nodes, nextPos: pos, endToken: tokens[pos - 1] };
   }
 
   // ── Helpers ────────────────────────────────────────────────────────────────
