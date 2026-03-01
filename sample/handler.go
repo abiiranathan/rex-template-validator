@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"strings"
 
 	"github.com/abiiranathan/rex"
 )
@@ -124,6 +125,7 @@ func (h *Handler) RenderTreatmentChart(inpatient bool) rex.HandlerFunc {
 		funcMap := template.FuncMap{
 			"getAuthUser": getAuthUser,
 			"dict":        dict,
+			"upper":       strings.ToUpper,
 		}
 
 		template.New("").Funcs(funcMap)

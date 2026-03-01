@@ -218,12 +218,13 @@ export class TemplateParser {
     let inner = tok.inner;
     const results: TemplateNode[] = [];
 
-    const assignMatch = inner.match(/^\s*(?:\$(\w+)(?:\s*,\s*\$(\w+))?)\s*:=\s*(.*)/);
+    // Support both := and = for assignments
+    const assignMatch = inner.match(/^\s*(?:\$(\w+)(?:\s*,\s*\$(\w+))?)\s*(:=|=)\s*(.*)/);
     if (assignMatch) {
       const assignVars = [];
       if (assignMatch[1]) assignVars.push('$' + assignMatch[1]);
       if (assignMatch[2]) assignVars.push('$' + assignMatch[2]);
-      const assignExpr = assignMatch[3].trim();
+      const assignExpr = assignMatch[4].trim();
 
       results.push({
         kind: 'assignment',
@@ -250,14 +251,9 @@ export class TemplateParser {
 
   /**
    * Parse a dot-path expression into path segments.
-   *
-   * ".Visit.Doctor.Name" → ["Visit", "Doctor", "Name"]
-   * "."                  → ["."]   (bare dot = current scope)
-   * ".Items"             → ["Items"]
-   * "$.User.Name"        → ["$", "User", "Name"]
    */
   parseDotPath(expr: string): string[] {
-    expr = expr.replace(/^\$\w+\s*:=\s*/, '').trim();
+    expr = expr.replace(/^\$\w+\s*(:=|=)\s*/, '').trim();
 
     const callMatch = expr.match(/\(call\s+(\.[^\s)]+)/);
     if (callMatch) expr = callMatch[1];
@@ -267,10 +263,13 @@ export class TemplateParser {
       expr = expr.replace(indexMatch[0], indexMatch[1] + '.[]');
     }
 
-    const pathPart = expr.split(/[\s|(),]/)[0];
+    // Extract the first valid path token (starting with . or $) to handle expressions like "not .IsLast"
+    const tokens = expr.split(/[\s|(),]+/);
+    let pathPart = tokens.find(t => t.startsWith('.') || t.startsWith('$')) || tokens[0];
 
+    if (!pathPart) return ['.'];
     if (pathPart === '.' || pathPart === '') return ['.'];
-    if (!pathPart.startsWith('.') && !pathPart.startsWith('$')) return [];
+    if (!pathPart.startsWith('.') && !pathPart.startsWith('$')) return [pathPart];
 
     if (pathPart.startsWith('$.')) {
       const rest = pathPart.slice(2).split('.').filter(p => p.length > 0);
@@ -313,27 +312,85 @@ export interface ResolveResult {
   doc?: string;
 }
 
+// Helper to extract map/slice info robustly from type strings
+function extractTypeInfo(typeStr: string, explicitIsSlice?: boolean, explicitIsMap?: boolean, explicitElemType?: string) {
+  let isSlice = explicitIsSlice ?? false;
+  let isMap = explicitIsMap ?? false;
+  let elemType = explicitElemType;
+
+  if (!isSlice && !isMap && typeStr) {
+    let bare = typeStr.startsWith('*') ? typeStr.slice(1) : typeStr;
+    if (bare.startsWith('[]')) {
+      isSlice = true;
+      if (!elemType) elemType = bare.slice(2);
+    } else if (bare.startsWith('map[')) {
+      isMap = true;
+      if (!elemType) {
+        let depth = 0;
+        let splitIdx = -1;
+        for (let i = 4; i < bare.length; i++) {
+          if (bare[i] === '[') depth++;
+          else if (bare[i] === ']') {
+            if (depth === 0) {
+              splitIdx = i;
+              break;
+            }
+            depth--;
+          }
+        }
+        if (splitIdx !== -1) {
+          elemType = bare.slice(splitIdx + 1).trim();
+        }
+      }
+    }
+  }
+  return { isSlice, isMap, elemType };
+}
+
+// Helper to force hydration by returning undefined instead of empty arrays
+function cleanFields(fields?: FieldInfo[]): FieldInfo[] | undefined {
+  return fields && fields.length > 0 ? fields : undefined;
+}
+
 /**
  * Resolve a dot-path against the current variable context and scope stack.
- *
- * Scope stack is innermost-last. The topmost frame with key "." represents
- * the current implicit dot (inside range/with blocks).
- *
- * Path semantics:
- *   ["."]              → bare dot, current scope
- *   ["$"]              → root context
- *   ["$", "User", ...] → root-anchored access via $.User...
- *   ["User", "Profile", "Address", "City"] → traverse vars then fields
  */
 export function resolvePath(
   path: string[],
   vars: Map<string, TemplateVar>,
   scopeStack: ScopeFrame[],
-  blockLocals?: Map<string, TemplateVar>
+  blockLocals?: Map<string, TemplateVar>,
+  fieldResolver?: (typeStr: string) => FieldInfo[] | undefined
 ): ResolveResult {
   if (path.length === 0) {
     return { typeStr: 'context', found: true };
   }
+
+  // Handle boolean and basic literals
+  if (path.length === 1) {
+    if (path[0] === 'true' || path[0] === 'false') {
+      return { typeStr: 'bool', found: true };
+    }
+    if (path[0] === 'nil') {
+      return { typeStr: 'any', found: true };
+    }
+
+    if (!isNaN(Number(path[0]))) {
+      return { typeStr: 'float64', found: true };
+    }
+    if (path[0].startsWith('"') || path[0].startsWith('`')) {
+      return { typeStr: 'string', found: true };
+    }
+  }
+
+  const getFields = (typeStr: string, existingFields?: FieldInfo[]): FieldInfo[] => {
+    if (existingFields && existingFields.length > 0) return existingFields;
+    if (!typeStr || !fieldResolver) return [];
+    let bare = typeStr.startsWith('*') ? typeStr.slice(1) : typeStr;
+    if (bare.startsWith('[]')) bare = bare.slice(2);
+    if (bare.startsWith('map[')) bare = bare.slice(bare.indexOf(']') + 1);
+    return fieldResolver(bare) || [];
+  };
 
   // Check blockLocals first for $ variables
   if (path[0].startsWith('$') && path[0] !== '$') {
@@ -347,14 +404,15 @@ export function resolvePath(
       }
     }
     if (local) {
+      const info = extractTypeInfo(local.type, local.isSlice, local.isMap, local.elemType);
       if (path.length === 1) {
         return {
           typeStr: local.type,
           found: true,
-          fields: local.fields,
-          isSlice: local.isSlice,
-          isMap: local.isMap,
-          elemType: local.elemType,
+          fields: cleanFields(local.fields),
+          isSlice: info.isSlice,
+          isMap: info.isMap,
+          elemType: info.elemType,
           keyType: local.keyType,
           defFile: local.defFile,
           defLine: local.defLine,
@@ -362,7 +420,8 @@ export function resolvePath(
           doc: local.doc,
         };
       }
-      return resolveFields(path.slice(1), local.fields ?? [], local.isMap, local.elemType);
+      const f = getFields(local.type, local.fields);
+      return resolveFields(path.slice(1), f, info.isMap, info.elemType, info.isSlice, fieldResolver);
     }
   }
 
@@ -374,14 +433,15 @@ export function resolvePath(
         return {
           typeStr: frame.typeStr,
           found: true,
-          fields: frame.fields,
+          fields: cleanFields(frame.fields),
           isMap: frame.isMap,
           keyType: frame.keyType,
           elemType: frame.elemType,
           isSlice: frame.isSlice,
         };
       } else { // Handle paths like ".key.subkey"
-        const res = resolveFieldsDeep(path.slice(1), frame.fields ?? []);
+        const f = getFields(frame.typeStr, frame.fields);
+        const res = resolveFieldsDeep(path.slice(1), f, fieldResolver);
         if (res.found) return res;
       }
     }
@@ -402,14 +462,17 @@ export function resolvePath(
     const remaining = path.slice(1);
     const topVar = vars.get(remaining[0]);
     if (!topVar) return { typeStr: 'unknown', found: false };
+
+    const info = extractTypeInfo(topVar.type, topVar.isSlice, topVar.isMap, topVar.elemType);
+
     if (remaining.length === 1) {
       return {
         typeStr: topVar.type,
         found: true,
-        fields: topVar.fields,
-        isSlice: topVar.isSlice,
-        isMap: topVar.isMap,
-        elemType: topVar.elemType,
+        fields: cleanFields(topVar.fields),
+        isSlice: info.isSlice,
+        isMap: info.isMap,
+        elemType: info.elemType,
         keyType: topVar.keyType,
         defFile: topVar.defFile,
         defLine: topVar.defLine,
@@ -417,7 +480,8 @@ export function resolvePath(
         doc: topVar.doc,
       };
     }
-    return resolveFields(remaining.slice(1), topVar.fields ?? [], topVar.isMap, topVar.elemType);
+    const f = getFields(topVar.type, topVar.fields);
+    return resolveFields(remaining.slice(1), f, info.isMap, info.elemType, info.isSlice, fieldResolver);
   }
 
   // Path inside a with/range scope → check the active dot frame first.
@@ -428,27 +492,30 @@ export function resolvePath(
       if (path.length === 2) { // e.g. [".", "key"]
         return { typeStr: dotFrame.elemType || 'unknown', found: true };
       } else if (path.length > 2) {
-        return resolveFields(path.slice(2), [], false, undefined);
+        return resolveFields(path.slice(2), [], false, undefined, false, fieldResolver);
       }
-    } else if (dotFrame.fields && dotFrame.fields.length > 0) {
-      const res = resolveFieldsDeep(path, dotFrame.fields);
-      if (res.found) return res;
+    } else {
+      const f = getFields(dotFrame.typeStr, dotFrame.fields);
+      if (f.length > 0) {
+        const res = resolveFieldsDeep(path, f, fieldResolver);
+        if (res.found) return res;
+      }
     }
 
     // Fallback for isolated block validation:
-    // If the dotFrame has no fields, it means the block's context couldn't be statically resolved.
-    // We fall back to checking the file's root vars, which contain the injected context-file definitions.
-    if (!dotFrame.fields || dotFrame.fields.length === 0) {
+    const f = getFields(dotFrame.typeStr, dotFrame.fields);
+    if (f.length === 0) {
       const topVar = vars.get(path[0]);
       if (topVar) {
+        const info = extractTypeInfo(topVar.type, topVar.isSlice, topVar.isMap, topVar.elemType);
         if (path.length === 1) {
           return {
             typeStr: topVar.type,
             found: true,
-            fields: topVar.fields,
-            isSlice: topVar.isSlice,
-            isMap: topVar.isMap,
-            elemType: topVar.elemType,
+            fields: cleanFields(topVar.fields),
+            isSlice: info.isSlice,
+            isMap: info.isMap,
+            elemType: info.elemType,
             keyType: topVar.keyType,
             defFile: topVar.defFile,
             defLine: topVar.defLine,
@@ -456,7 +523,8 @@ export function resolvePath(
             doc: topVar.doc,
           };
         }
-        return resolveFields(path.slice(1), topVar.fields ?? [], topVar.isMap, topVar.elemType);
+        const f2 = getFields(topVar.type, topVar.fields);
+        return resolveFields(path.slice(1), f2, info.isMap, info.elemType, info.isSlice, fieldResolver);
       }
     }
 
@@ -469,14 +537,16 @@ export function resolvePath(
     return { typeStr: 'unknown', found: false };
   }
 
+  const info = extractTypeInfo(topVar.type, topVar.isSlice, topVar.isMap, topVar.elemType);
+
   if (path.length === 1) {
     return {
       typeStr: topVar.type,
       found: true,
-      fields: topVar.fields,
-      isSlice: topVar.isSlice,
-      isMap: topVar.isMap,
-      elemType: topVar.elemType,
+      fields: cleanFields(topVar.fields),
+      isSlice: info.isSlice,
+      isMap: info.isMap,
+      elemType: info.elemType,
       keyType: topVar.keyType,
       defFile: topVar.defFile,
       defLine: topVar.defLine,
@@ -485,7 +555,8 @@ export function resolvePath(
     };
   }
 
-  return resolveFields(path.slice(1), topVar.fields ?? [], topVar.isMap, topVar.elemType);
+  const f = getFields(topVar.type, topVar.fields);
+  return resolveFields(path.slice(1), f, info.isMap, info.elemType, info.isSlice, fieldResolver);
 }
 
 function findDotFrame(scopeStack: ScopeFrame[]): ScopeFrame | undefined {
@@ -500,7 +571,8 @@ function resolveFields(
   fields: FieldInfo[],
   isMap: boolean = false,
   elemType?: string,
-  isSlice: boolean = false
+  isSlice: boolean = false,
+  fieldResolver?: (typeStr: string) => FieldInfo[] | undefined
 ): ResolveResult {
   if (parts.length === 0) {
     return { typeStr: 'unknown', found: false };
@@ -539,16 +611,17 @@ function resolveFields(
     }
 
     if (rest.length === 0) {
+      // Return undefined for fields so inferExpressionType is forced to hydrate them.
       return {
         typeStr: elemType || 'unknown',
         found: true,
-        fields: fields,
+        fields: undefined,
         isSlice: nextIsSlice,
         isMap: nextIsMap,
         elemType: nextElemType,
       };
     }
-    return resolveFields(rest, fields, nextIsMap, nextElemType, nextIsSlice);
+    return resolveFields(rest, fields, nextIsMap, nextElemType, nextIsSlice, fieldResolver);
   }
 
   if (isMap) {
@@ -559,15 +632,16 @@ function resolveFields(
         fields: [],
       };
     }
-    return resolveFields(parts.slice(1), fields, false, undefined);
+    return resolveFields(parts.slice(1), fields, false, undefined, false, fieldResolver);
   }
 
-  return resolveFieldsDeep(parts, fields);
+  return resolveFieldsDeep(parts, fields, fieldResolver);
 }
 
 function resolveFieldsDeep(
   parts: string[],
-  fields: FieldInfo[]
+  fields: FieldInfo[],
+  fieldResolver?: (typeStr: string) => FieldInfo[] | undefined
 ): ResolveResult {
   if (parts.length === 0) {
     return { typeStr: 'unknown', found: false };
@@ -581,19 +655,29 @@ function resolveFieldsDeep(
   }
 
   if (tail.length > 0) {
-    if (field.isMap) {
-      return resolveFields(tail, field.fields ?? [], true, field.elemType);
+    let nextFields = field.fields ?? [];
+    if (nextFields.length === 0 && field.type && fieldResolver) {
+      let bare = field.type.startsWith('*') ? field.type.slice(1) : field.type;
+      if (bare.startsWith('[]')) bare = bare.slice(2);
+      if (bare.startsWith('map[')) bare = bare.slice(bare.indexOf(']') + 1);
+      nextFields = fieldResolver(bare) || [];
     }
-    return resolveFieldsDeep(tail, field.fields ?? []);
+
+    if (field.isMap) {
+      return resolveFields(tail, nextFields, true, field.elemType, false, fieldResolver);
+    }
+    return resolveFieldsDeep(tail, nextFields, fieldResolver);
   }
+
+  const info = extractTypeInfo(field.type, field.isSlice, field.isMap, field.elemType);
 
   return {
     typeStr: field.type,
     found: true,
-    fields: field.fields,
-    isSlice: field.isSlice,
-    isMap: field.isMap,
-    elemType: field.elemType,
+    fields: cleanFields(field.fields),
+    isSlice: info.isSlice,
+    isMap: info.isMap,
+    elemType: info.elemType,
     keyType: field.keyType,
     params: field.params,
     returns: field.returns,

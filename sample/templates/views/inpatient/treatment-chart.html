@@ -12,6 +12,7 @@
         {{ if not .IsLast }} / {{ end }}
         {{ end }}
     </nav>
+
     <h1>{{ upper .Title }}</h1>
     <p>Patient: {{ .visit.Patient.Name }}</p>
     <p>Doctor: {{ .doctor }}</p>
@@ -38,19 +39,20 @@
     {{ end }}
     <a href="{{ .PathPrefix }}/new">New Entry</a>
     {{ template "views/partials/footer.html" .visit }}
-    {{ block "billed-drug" }}
+    {{ block "billed-drug" . }}
     <div>{{ .Name }}</div>
     <div>{{ .Price }}</div>
     <div>{{ .Quantity }}</div>
     {{ end }}
 
-    <!-- Passed through a context-file -->
+    {{/* Passed through a context-file */}}
     {{ $.newuser.Name }}
     {{ $.currentUser }}
 
-    <!-- Pass a Map to a cross-file template -->
+    {{/* Pass a Map to a cross-file template */}}
     {{ template "roles" .roles }}
-    <!-- Same-file block -->
+
+    {{/* Same-file block */}}
     {{ block "user-msg" .currentUser }}
     <h1>Hello: {{ .Name }}</h1>
     {{ end }}
@@ -60,6 +62,71 @@
 
     {{ $authUser := getAuthUser 1 }}
     {{ $authUser.PrintName }}
+
+    {{/* ------------------------------------------------------------------ */}}
+    {{/* Complex nested block: role-aware prescription summary */}}
+    {{/* Tests: nested range>with>if>else, $-access, local vars, template */}}
+    {{/* call inside range, and else-range fallback path. */}}
+    {{/* ------------------------------------------------------------------ */}}
+    {{ block "prescription-summary" . }}
+    <section class="prescription-summary">
+        <h2>{{ $.Title }} — Prescription Summary</h2>
+
+        {{ range .prescriptions }}
+        {{/* Outer range: dot is now a Prescription */}}
+        {{ $rx := . }}
+
+        {{ with .Drug }}
+        {{/* with: dot is now the Drug struct */}}
+        {{ if .Name }}
+        <div class="rx-card">
+            <h3>{{ .Name }}</h3>
+            <p>Quantity: {{ $rx.Quantity }}</p>
+            <p>Dosage: {{ $rx.Dosage }}</p>
+
+            {{/* Nested range over billedDrugs to find a matching billed entry */}}
+            {{ $matched := false }}
+            {{ range $.billedDrugs }}
+            {{ if eq .Name $rx.DrugName }}
+            {{ $matched = true }}
+            <p class="billed">
+                Billed: {{ .Price }} x {{ .Quantity }}
+            </p>
+            {{ end }}
+            {{ end }}
+
+            {{ if $matched }}
+            <span class="badge billed">Billed</span>
+            {{ else }}
+            <span class="badge unbilled">Not Yet Billed</span>
+            {{ end }}
+
+            {{/* Role check: only admins see the raw drug price */}}
+            {{ with $.roles }}
+            {{ $admin := index . "admin" }}
+            {{ if $admin }}
+            <p class="admin-only">
+                Unit price visible to admins only: {{ $rx.Drug.Price }}
+            </p>
+            {{ else }}
+            <p class="restricted">Price restricted.</p>
+            {{ end }}
+            {{ end }}
+        </div>
+        {{ else }}
+        {{/* Drug has no name — degenerate entry */}}
+        <div class="rx-card unnamed">
+            <p>Unnamed drug — Qty: {{ $rx.Quantity }}</p>
+        </div>
+        {{ end }}
+        {{ end }}
+        {{ else }}
+        {{/* Outer range fallback: no prescriptions */}}
+        <p class="empty">No prescriptions recorded for {{ $.visit.Patient.Name }}.</p>
+        {{ end }}
+    </section>
+    {{ end }}
+
 </body>
 
 </html>

@@ -98,10 +98,6 @@ class Lexer {
                 this.pos++;
                 return { type: 'DOT', value: '.', pos: startPos };
             case '$':
-                // If $ is followed by an alpha char or _, it's a local variable identifier (e.g. $varName)
-                if (this.pos + 1 < this.input.length && (this.isAlpha(this.input[this.pos + 1]) || this.input[this.pos + 1] === '_')) {
-                    return this.scanIdent();
-                }
                 this.pos++;
                 return { type: 'DOLLAR', value: '$', pos: startPos };
             case '(':
@@ -189,12 +185,6 @@ class Lexer {
     private scanIdent(): Token {
         const startPos = this.pos;
         let value = '';
-
-        // Allow $ prefix for local variables
-        if (this.input[this.pos] === '$') {
-            value += '$';
-            this.pos++;
-        }
 
         while (
             this.pos < this.input.length &&
@@ -328,7 +318,7 @@ class ExpressionParser {
             return this.parseFieldAccess();
         }
 
-        // Root context: $
+        // Root context or local variable: $ or $varName
         if (tok.type === 'DOLLAR') {
             return this.parseFieldAccess();
         }
@@ -387,14 +377,14 @@ class ExpressionParser {
                 return { kind: 'field', path: ['.'] };
             }
         } else if (tok.type === 'DOLLAR') {
-            // $ or $.Field
-            path.push('$');
-            if (this.lexer.peek().type === 'DOT') {
-                this.lexer.next(); // consume '.'
-                if (this.lexer.peek().type === 'IDENT') {
-                    const nameTok = this.lexer.next();
-                    path.push(nameTok.value);
-                }
+            const next = this.lexer.peek();
+            if (next.type === 'IDENT') {
+                // Local variable: $varName
+                this.lexer.next(); // consume IDENT
+                path.push('$' + next.value);
+            } else {
+                // Root context: $ or $.Field
+                path.push('$');
             }
         }
 
@@ -621,7 +611,6 @@ export class TypeInferencer {
             return { typeStr: 'context' };
         }
 
-        // Root context: $
         // Root context: $
         if (path[0] === '$') {
             if (path.length === 1) {
