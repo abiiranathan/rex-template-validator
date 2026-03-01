@@ -727,6 +727,15 @@ export class ScopeUtils {
                 );
                 if (found) return found;
             }
+
+            // Else branch reverts to parent scope — walk it with vars/scopeStack, not childStack.
+            const elseChildren = (node as any).elseChildren as TemplateNode[] | undefined;
+            if (elseChildren && elseChildren.length > 0) {
+                const found = this.findNodeAtPosition(
+                    elseChildren, position, vars, scopeStack, rootNodes, blockLocals
+                );
+                if (found) return found;
+            }
         }
 
         return null;
@@ -830,6 +839,14 @@ export class ScopeUtils {
             }
 
             if (isInside) {
+                // If position is in the else branch, use parent scope — the else clause
+                // of range/with/if reverts dot back to whatever it was before the block.
+                const elseChildren = (node as any).elseChildren as TemplateNode[] | undefined;
+                if (elseChildren && elseChildren.length > 0 && position.line >= elseChildren[0].line - 1) {
+                    return this.findScopeAtPosition(
+                        elseChildren, position, vars, scopeStack, rootNodes, ctx, blockLocals
+                    );
+                }
                 if (node.children && node.children.length > 0) {
                     return this.findScopeAtPosition(
                         node.children, position, childVars, childStack,

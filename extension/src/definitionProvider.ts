@@ -9,6 +9,7 @@ import * as fs from 'fs';
 import * as vscode from 'vscode';
 import {
     FieldInfo,
+    ScopeFrame,
     TemplateContext,
     TemplateNode,
     TemplateVar,
@@ -373,7 +374,7 @@ export class DefinitionProvider {
     private findDefinitionInScope(
         targetPath: string[],
         vars: Map<string, TemplateVar>,
-        scopeStack: import('./types').ScopeFrame[],
+        scopeStack: ScopeFrame[],
         ctx: TemplateContext
     ): vscode.Location | null {
         let topVarName = targetPath[0];
@@ -418,7 +419,7 @@ export class DefinitionProvider {
         nodes: TemplateNode[],
         position: vscode.Position,
         ctx: TemplateContext,
-        scopeStack: import('./types').ScopeFrame[],
+        scopeStack: ScopeFrame[],
         blockLocals: Map<string, TemplateVar>
     ): vscode.Location | null {
         const varName = targetNode.path[0];
@@ -437,7 +438,7 @@ export class DefinitionProvider {
         varName: string,
         position: vscode.Position,
         ctx: TemplateContext,
-        scopeStack: import('./types').ScopeFrame[],
+        scopeStack: ScopeFrame[],
         blockLocals: Map<string, TemplateVar>
     ): vscode.Location | null {
         if (node.kind === 'assignment' && node.assignVars?.includes(varName)) {
@@ -459,7 +460,7 @@ export class DefinitionProvider {
 
     private findRangeAssignedVariable(
         node: TemplateNode,
-        scopeStack: import('./types').ScopeFrame[],
+        scopeStack: ScopeFrame[],
         ctx: TemplateContext
     ): vscode.Location | null {
         if (!node.path[0]?.startsWith('$')) return null;
@@ -482,7 +483,7 @@ export class DefinitionProvider {
 
     private findRangeVariableDefinition(
         targetPath: string[],
-        scopeStack: import('./types').ScopeFrame[],
+        scopeStack: ScopeFrame[],
         ctx: TemplateContext
     ): vscode.Location | null {
         if (!targetPath.length || targetPath[0] === '.' || targetPath[0] === '$') return null;
