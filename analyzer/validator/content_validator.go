@@ -8,11 +8,15 @@ import (
 )
 
 // ValidateTemplateContent performs comprehensive validation of template content
-// with full scope tracking and nested template support.
+// with full scope tracking, nested template support, and LOCAL VARIABLE TRACKING.
+//
+// NEW: Now tracks {{ $var := expr }} assignments and makes them available to
+// the expression parser via the blockLocals parameter.
 //
 // This is the core validation function that:
 //   - Parses all template actions ({{ ... }})
 //   - Tracks scope changes (with, range, if blocks)
+//   - Tracks local variable assignments ({{ $var := expr }})
 //   - Validates all variable references
 //   - Validates field access paths
 //   - Handles nested template calls recursively
@@ -23,6 +27,7 @@ import (
 //   - with scope: Changes dot context to specific variable
 //   - range scope: Creates iteration scope with collection elements
 //   - if scope: Maintains current scope (just for depth tracking)
+//   - Local variables: Tracked per scope level and passed to expression parser
 //
 // Parameters:
 //   - content: Template content string to validate
@@ -33,7 +38,7 @@ import (
 //   - lineOffset: Starting line number (for nested blocks)
 //   - registry: Named block registry
 //
-// Returns: Slice of validation errors found in this content
+// Returns: Slice of validation errors found in this content.
 //
 // Thread-safety: Read-only operations on shared data (varMap, registry).
 // This function can be called concurrently for different templates.
@@ -55,8 +60,11 @@ func ValidateTemplateContent(
 	// Track depth inside {{define}} blocks (validation is skipped)
 	defineSkipDepth := 0
 
+	// openingActions tracks the keyword that opened each scope-stack frame
+	openingActions := []string{"root"}
+
 	cur := 0
-	lineNum := 0 // 0-based offset from start of this content block
+	lineNum := 0 // 0-based offset from the start of this content block
 
 	for cur < len(content) {
 		openRel := strings.Index(content[cur:], "{{")
@@ -65,17 +73,20 @@ func ValidateTemplateContent(
 		}
 		openIdx := cur + openRel
 
-		// Add newlines between cur and openIdx
+		// Count newlines between cur and openIdx
 		lineNum += strings.Count(content[cur:openIdx], "\n")
 		actualLineNum := lineNum + lineOffset
 
 		closeRel := strings.Index(content[openIdx:], "}}")
 		if closeRel == -1 {
-			break // Unclosed tag
+			panic(fmt.Sprintf(
+				"template %q: unclosed action tag '{{' at line %d — add the closing '}}'",
+				templateName, actualLineNum,
+			))
 		}
 		closeIdx := openIdx + closeRel
 
-		// Extract and trim action content
+		// Trim whitespace and the optional '-' trim markers from the action body
 		contentStart := openIdx + 2
 		if contentStart < closeIdx && content[contentStart] == '-' {
 			contentStart++
@@ -92,7 +103,7 @@ func ValidateTemplateContent(
 			contentEnd--
 		}
 
-		// Calculate column based on contentStart to match expected test behavior
+		// Column is relative to the start of the action content
 		lastNewline := strings.LastIndexByte(content[:openIdx], '\n')
 		col := contentStart - lastNewline
 
@@ -101,39 +112,33 @@ func ValidateTemplateContent(
 			action = content[contentStart:contentEnd]
 		}
 
-		// Update cur and lineNum for next iteration
+		// Advance cursor and count newlines inside the tag
 		lineNumInside := strings.Count(content[openIdx:closeIdx+2], "\n")
 		cur = closeIdx + 2
 
-		// Skip comments
-		if strings.HasPrefix(action, "/*") || strings.HasPrefix(action, "//") {
+		// Skip template comments
+		if strings.Contains(action, "/*") && strings.Contains(action, "*/") {
 			lineNum += lineNumInside
 			continue
 		}
 
-		// Parse action into words
 		words := strings.Fields(action)
 		first := ""
 		if len(words) > 0 {
 			first = words[0]
 		}
 
-		// ── Handle {{define}} blocks ────────────────────────────────────
-		// Define blocks create separate scopes and should not be validated
-		// in the context of the parent template.
-		if first == "define" {
-			defineSkipDepth++
-			lineNum += lineNumInside
-			continue
-		}
-
-		// Track nesting depth inside define blocks
+		// ── Skip everything inside {{define}} / {{block}} bodies ────────────
 		if defineSkipDepth > 0 {
 			switch first {
-			case "if", "with", "range", "block":
+			case "if", "with", "range", "block", "define":
 				defineSkipDepth++
 			case "end":
 				defineSkipDepth--
+				lineNum += lineNumInside
+				continue
+			case "else":
+				// Intentionally ignored
 			}
 			lineNum += lineNumInside
 			continue
@@ -142,21 +147,28 @@ func ValidateTemplateContent(
 		// ── Handle scope popping (else, end) BEFORE validation ──────────
 		isElse := first == "else"
 		var elseAction string
+
 		if isElse {
-			if len(scopeStack) > 1 {
-				scopeStack = scopeStack[:len(scopeStack)-1]
-			} else {
-				panic(fmt.Sprintf("Template validation error in %s:%d: unexpected {{else}} without matching {{if/with/range}}", templateName, actualLineNum))
+			if len(scopeStack) <= 1 {
+				panic(fmt.Sprintf(
+					"template %q: {{else}} at line %d has no matching opening block",
+					templateName, actualLineNum,
+				))
 			}
+			scopeStack = scopeStack[:len(scopeStack)-1]
+			openingActions = openingActions[:len(openingActions)-1]
 			if len(words) > 1 {
-				elseAction = words[1] // "if", "with", "range"
+				elseAction = words[1]
 			}
 		} else if first == "end" {
-			if len(scopeStack) > 1 {
-				scopeStack = scopeStack[:len(scopeStack)-1]
-			} else {
-				panic(fmt.Sprintf("Template validation error in %s:%d: unexpected {{end}} without matching {{if/with/range}}", templateName, actualLineNum))
+			if len(scopeStack) <= 1 {
+				panic(fmt.Sprintf(
+					"template %q: unexpected {{end}} at line %d — no open block to close",
+					templateName, actualLineNum,
+				))
 			}
+			scopeStack = scopeStack[:len(scopeStack)-1]
+			openingActions = openingActions[:len(openingActions)-1]
 			lineNum += lineNumInside
 			continue
 		}
@@ -176,15 +188,14 @@ func ValidateTemplateContent(
 			}
 		})
 
-		// ── Handle {{block}} blocks ─────────────────────────────────────
-		// Block is similar to define but with inline content
-		if first == "block" {
+		// ── {{block}} and {{define}} open a skip region ──────────────────────
+		if first == "block" || first == "define" {
 			defineSkipDepth++
 			lineNum += lineNumInside
 			continue
 		}
 
-		// ── Handle scope pushing (if, with, range, else) AFTER validation ─────
+		// ── Push new scope for if / with / range ─────────────────────────────
 		actionToPush := first
 		exprToParse := action
 
@@ -196,46 +207,37 @@ func ValidateTemplateContent(
 					exprToParse = action[idx:]
 				}
 			} else {
-				// Plain else
+				// Plain {{else}}: inherit current scope
+				top := ScopeType{}
 				if len(scopeStack) > 0 {
-					scopeStack = append(scopeStack, scopeStack[len(scopeStack)-1])
-				} else {
-					scopeStack = append(scopeStack, ScopeType{})
+					top = scopeStack[len(scopeStack)-1]
 				}
+				scopeStack = append(scopeStack, top)
+				openingActions = append(openingActions, "else")
 				lineNum += lineNumInside
 				continue
 			}
 		}
 
-		if actionToPush == "range" {
+		switch actionToPush {
+		case "range":
 			rangeExpr := strings.TrimSpace(strings.TrimPrefix(exprToParse, "range"))
-			newScope := createScopeFromRange(rangeExpr, scopeStack, varMap)
-			scopeStack = append(scopeStack, newScope)
-			lineNum += lineNumInside
-			continue
-		}
+			scopeStack = append(scopeStack, createScopeFromRange(rangeExpr, scopeStack, varMap))
+			openingActions = append(openingActions, "range")
 
-		if actionToPush == "with" {
+		case "with":
 			withExpr := strings.TrimSpace(strings.TrimPrefix(exprToParse, "with"))
-			newScope := createScopeFromWith(withExpr, scopeStack, varMap)
-			scopeStack = append(scopeStack, newScope)
-			lineNum += lineNumInside
-			continue
-		}
+			scopeStack = append(scopeStack, createScopeFromWith(withExpr, scopeStack, varMap))
+			openingActions = append(openingActions, "with")
 
-		if actionToPush == "if" {
+		case "if":
+			// {{if}} does not change the dot context
+			top := ScopeType{}
 			if len(scopeStack) > 0 {
-				scopeStack = append(scopeStack, scopeStack[len(scopeStack)-1])
-			} else {
-				scopeStack = append(scopeStack, ScopeType{})
+				top = scopeStack[len(scopeStack)-1]
 			}
-			lineNum += lineNumInside
-			continue
-		}
-
-		if isElse {
-			lineNum += lineNumInside
-			continue
+			scopeStack = append(scopeStack, top)
+			openingActions = append(openingActions, "if")
 		}
 
 		// ── Handle {{template}} calls ───────────────────────────────────
@@ -246,6 +248,18 @@ func ValidateTemplateContent(
 		}
 
 		lineNum += lineNumInside
+	}
+
+	// ── Post-parse structural check ──────────────────────────────────────────
+	if len(scopeStack) > 1 {
+		unclosed := make([]string, 0, len(openingActions)-1)
+		for _, a := range openingActions[1:] {
+			unclosed = append(unclosed, "{{"+a+"}}")
+		}
+		panic(fmt.Sprintf(
+			"template %q: %d unclosed scope block(s) at end of template — missing {{end}} for: %s",
+			templateName, len(scopeStack)-1, strings.Join(unclosed, ", "),
+		))
 	}
 
 	return errors

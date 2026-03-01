@@ -8,6 +8,11 @@ import (
 	"strings"
 )
 
+// MaxFieldDepth is the maximum depth for field extraction to prevent excessive recursion
+// Most templates don't access fields deeper than 4 levels
+// But we use default 10 to handle large projects.
+const MaxFieldDepth = 10
+
 // extractFieldsWithDocs recursively extracts exported fields and methods from
 // a type, leveraging caching to avoid redundant work. The seen map prevents
 // infinite recursion on self-referential types.
@@ -21,6 +26,7 @@ import (
 // - seen map tracks types in current path
 // - Prevents infinite loops on cyclic types
 // - Copies for independent branches (slice elements)
+// - Depth limit prevents excessive recursion on deeply nested types
 func extractFieldsWithDocs(
 	t types.Type,
 	structIndex map[string]structIndexEntry,
@@ -28,6 +34,23 @@ func extractFieldsWithDocs(
 	seen map[string]bool,
 	fset *token.FileSet,
 ) ([]FieldInfo, string) {
+	return extractFieldsWithDocsDepth(t, structIndex, fc, seen, fset, 0)
+}
+
+// extractFieldsWithDocsDepth is the internal version with depth tracking
+func extractFieldsWithDocsDepth(
+	t types.Type,
+	structIndex map[string]structIndexEntry,
+	fc *fieldCache,
+	seen map[string]bool,
+	fset *token.FileSet,
+	depth int,
+) ([]FieldInfo, string) {
+	// Early termination: limit recursion depth
+	if depth >= MaxFieldDepth {
+		return nil, ""
+	}
+
 	// Unwrap pointers and maps
 	t = unwrapType(t)
 	if t == nil {
@@ -57,7 +80,7 @@ func extractFieldsWithDocs(
 	astKey := getASTKey(named)
 
 	// Extract fields (cache miss)
-	fields, doc := extractFieldsUncached(named, astKey, structIndex, fc, seen, fset)
+	fields, doc := extractFieldsUncachedDepth(named, astKey, structIndex, fc, seen, fset, depth)
 
 	// Store in cache
 	fc.set(cacheKey, cachedFields{fields: fields, doc: doc})
@@ -65,15 +88,16 @@ func extractFieldsWithDocs(
 	return fields, doc
 }
 
-// extractFieldsUncached performs the actual field extraction without cache lookup.
+// extractFieldsUncachedDepth performs the actual field extraction without cache lookup.
 // Handles both struct types and interface types differently.
-func extractFieldsUncached(
+func extractFieldsUncachedDepth(
 	named *types.Named,
 	astKey string,
 	structIndex map[string]structIndexEntry,
 	fc *fieldCache,
 	seen map[string]bool,
 	fset *token.FileSet,
+	depth int,
 ) ([]FieldInfo, string) {
 	strct, ok := named.Underlying().(*types.Struct)
 	if !ok {
@@ -83,7 +107,7 @@ func extractFieldsUncached(
 
 	// Struct type: extract fields and methods
 	entry := structIndex[astKey]
-	fields := extractStructFields(strct, entry, structIndex, fc, seen, fset)
+	fields := extractStructFieldsDepth(strct, entry, structIndex, fc, seen, fset, depth)
 
 	// Append methods
 	fields = append(fields, extractMethodFields(named, fset)...)
@@ -94,38 +118,39 @@ func extractFieldsUncached(
 	return fields, entry.doc
 }
 
-// extractStructFields processes all fields in a struct type.
-func extractStructFields(
+// extractStructFieldsDepth processes all fields in a struct type with depth tracking.
+func extractStructFieldsDepth(
 	strct *types.Struct,
 	entry structIndexEntry,
 	structIndex map[string]structIndexEntry,
 	fc *fieldCache,
 	seen map[string]bool,
 	fset *token.FileSet,
+	depth int,
 ) []FieldInfo {
 	fields := make([]FieldInfo, 0, strct.NumFields())
 
-	for i := 0; i < strct.NumFields(); i++ {
-		field := strct.Field(i)
+	for field := range strct.Fields() {
 		if !field.Exported() {
 			continue
 		}
 
-		fi := buildFieldInfo(field, entry, structIndex, fc, seen, fset)
+		fi := buildFieldInfoDepth(field, entry, structIndex, fc, seen, fset, depth)
 		fields = append(fields, fi)
 	}
 
 	return fields
 }
 
-// buildFieldInfo constructs a FieldInfo for a single struct field.
-func buildFieldInfo(
+// buildFieldInfoDepth constructs a FieldInfo for a single struct field with depth tracking.
+func buildFieldInfoDepth(
 	field *types.Var,
 	entry structIndexEntry,
 	structIndex map[string]structIndexEntry,
 	fc *fieldCache,
 	seen map[string]bool,
 	fset *token.FileSet,
+	depth int,
 ) FieldInfo {
 	fi := FieldInfo{
 		Name:    field.Name(),
@@ -151,17 +176,17 @@ func buildFieldInfo(
 		fi.IsSlice = true
 		// Independent recursion branch for slice elements
 		elemSeen := copySeenMap(seen)
-		fi.Fields, _ = extractFieldsWithDocs(slice.Elem(), structIndex, fc, elemSeen, fset)
+		fi.Fields, _ = extractFieldsWithDocsDepth(slice.Elem(), structIndex, fc, elemSeen, fset, depth+1)
 	} else if keyType, elemType := getMapTypes(ft); keyType != nil && elemType != nil {
 		fi.IsMap = true
 		fi.KeyType = normalizeTypeStr(keyType)
 		fi.ElemType = normalizeTypeStr(elemType)
 		// Independent recursion branch for map values
 		elemSeen := copySeenMap(seen)
-		fi.Fields, _ = extractFieldsWithDocs(elemType, structIndex, fc, elemSeen, fset)
+		fi.Fields, _ = extractFieldsWithDocsDepth(elemType, structIndex, fc, elemSeen, fset, depth+1)
 	} else {
 		// Regular field: continue with shared seen map
-		fi.Fields, _ = extractFieldsWithDocs(ft, structIndex, fc, seen, fset)
+		fi.Fields, _ = extractFieldsWithDocsDepth(ft, structIndex, fc, seen, fset, depth+1)
 	}
 
 	// Add field documentation from index

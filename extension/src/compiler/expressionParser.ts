@@ -697,7 +697,6 @@ export class TypeInferencer {
                     retType = retType.substring(1);
                 }
                 const resolvedFields = this.fieldResolver?.(retType);
-                
                 resolvedField = {
                     ...field,
                     type: retType,

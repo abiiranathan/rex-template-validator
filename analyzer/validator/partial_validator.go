@@ -40,12 +40,11 @@ func validateTemplateCall(
 			}
 		}
 
-		// Validate nested template - check if it's a named block
+		// Validate nested template
 		if entries, ok := registry[tmplName]; ok && len(entries) > 0 {
 			nt := entries[0]
 
-			// Skip deep validation for untracked local vars ($var)
-			// to prevent false positives
+			// Skip deep validation for untracked local vars
 			if contextArg != "" && contextArg != "." && !strings.HasPrefix(contextArg, ".") {
 				return errors
 			}
@@ -55,6 +54,8 @@ func validateTemplateCall(
 			partialVarMap := buildPartialVarMap(contextArg, partialScope, scopeStack, varMap)
 
 			// Recursively validate nested template
+			// NOTE: We DON'T pass blockLocals here because the nested template
+			// has its own scope - local variables don't cross template boundaries
 			partialErrors := ValidateTemplateContent(
 				nt.Content,
 				partialVarMap,
@@ -67,7 +68,6 @@ func validateTemplateCall(
 			errors = append(errors, partialErrors...)
 
 		} else if IsFileBasedPartial(tmplName) {
-			// Check if it's a file-based partial
 			fullPath := filepath.Join(baseDir, templateRoot, tmplName)
 			if _, err := os.Stat(fullPath); os.IsNotExist(err) {
 				errors = append(errors, ValidationResult{
@@ -81,12 +81,10 @@ func validateTemplateCall(
 				return errors
 			}
 
-			// Skip deep validation for untracked local vars
 			if contextArg != "" && contextArg != "." && !strings.HasPrefix(contextArg, ".") {
 				return errors
 			}
 
-			// Build scope for file-based partial
 			partialScope := resolvePartialScope(contextArg, scopeStack, varMap)
 			partialVarMap := buildPartialVarMap(contextArg, partialScope, scopeStack, varMap)
 

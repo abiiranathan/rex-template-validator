@@ -142,9 +142,10 @@ var DefaultConfig = AnalysisConfig{
 // FuncScope encapsulates all template-related operations within a single
 // function or code block scope.
 type FuncScope struct {
-	SetVars     []TemplateVar    // Template variables set via context.Set()
-	RenderNodes []ResolvedRender // Template render calls found
-	FuncMaps    []FuncMapInfo    // Function map definitions
+	SetVars        []TemplateVar                  // Template variables set via context.Set()
+	RenderNodes    []ResolvedRender               // Template render calls found
+	FuncMaps       []FuncMapInfo                  // Function map definitions
+	MapAssignments map[string]*goast.CompositeLit // Map variable name → composite literal
 }
 
 // ResolvedRender represents a template render call with resolved template

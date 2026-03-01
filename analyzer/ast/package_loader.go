@@ -16,10 +16,17 @@ import (
 // resolution during analysis.
 //
 // Also collects all AST files and non-import-related errors.
+//
+// Performance: Skips vendor and generated code directories to reduce processing time.
 func mergeTypeInfo(pkgs []*packages.Package, result *AnalysisResult) (*types.Info, []*goast.File) {
 	// Pre-calculate total sizes to avoid map growth
 	totalTypes, totalDefs, totalUses := 0, 0, 0
 	for _, pkg := range pkgs {
+		// Skip vendor and generated code for performance
+		if shouldSkipPackage(pkg.PkgPath) {
+			continue
+		}
+
 		if pkg.TypesInfo != nil {
 			totalTypes += len(pkg.TypesInfo.Types)
 			totalDefs += len(pkg.TypesInfo.Defs)
@@ -39,6 +46,11 @@ func mergeTypeInfo(pkgs []*packages.Package, result *AnalysisResult) (*types.Inf
 
 	// Merge all package data
 	for _, pkg := range pkgs {
+		// Skip vendor and generated code
+		if shouldSkipPackage(pkg.PkgPath) {
+			continue
+		}
+
 		// Collect non-import errors
 		for _, e := range pkg.Errors {
 			if !isImportRelatedError(e.Msg) {
@@ -58,6 +70,34 @@ func mergeTypeInfo(pkgs []*packages.Package, result *AnalysisResult) (*types.Inf
 	}
 
 	return info, allFiles
+}
+
+// shouldSkipPackage determines if a package should be skipped for performance reasons.
+// Skips vendor directories and common generated code patterns.
+func shouldSkipPackage(pkgPath string) bool {
+	lower := strings.ToLower(pkgPath)
+
+	// Skip vendor directories
+	if strings.Contains(lower, "/vendor/") || strings.Contains(lower, "\\vendor\\") {
+		return true
+	}
+
+	// Skip generated code directories
+	if strings.Contains(lower, "/generated/") || strings.Contains(lower, "\\generated\\") {
+		return true
+	}
+
+	// Skip common generated package suffixes
+	if strings.HasSuffix(lower, "_generated") || strings.HasSuffix(lower, ".pb") {
+		return true
+	}
+
+	// Skip test packages (already handled by Tests: false in config)
+	if strings.HasSuffix(lower, "_test") {
+		return true
+	}
+
+	return false
 }
 
 // buildFileMap creates a fast lookup map from filename to AST file.

@@ -50,7 +50,6 @@ func generateRenderCalls(
 			templatePathExpr := call.Args[templateArgIdx]
 
 			// Calculate precise column range for template name
-			// This enables accurate editor highlighting and navigation
 			tplNameStartCol, tplNameEndCol := getExprColumnRange(fset, templatePathExpr)
 
 			// Adjust for string literal quotes
@@ -68,9 +67,28 @@ func generateRenderCalls(
 				// Extract variables from data argument if present
 				dataArgIdx := templateArgIdx + 1
 				var localVars []TemplateVar
+
 				if dataArgIdx < len(call.Args) {
+					dataArg := call.Args[dataArgIdx]
 					seen := seenPool.get()
-					localVars = extractMapVars(call.Args[dataArgIdx], info, fset, structIndex, fc, seen)
+					localVars = extractMapVars(dataArg, info, fset, structIndex, fc, seen)
+
+					// Fallback: data arg is an identifier — resolve it to a
+					// composite literal tracked during the assignment pass.
+					// This handles the common pattern:
+					//
+					//   ctx := rex.Map{"key": val}
+					//   SetTriageContext(ctx, triage, visit)
+					//   c.Render("tmpl.html", ctx)
+					if len(localVars) == 0 {
+						if ident, ok := dataArg.(*goast.Ident); ok {
+							if comp, found := scope.MapAssignments[ident.Name]; found {
+								clear(seen)
+								localVars = extractMapVars(comp, info, fset, structIndex, fc, seen)
+							}
+						}
+					}
+
 					seenPool.put(seen)
 				}
 

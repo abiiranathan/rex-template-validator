@@ -6,10 +6,25 @@ package ast
 
 import (
 	"fmt"
+	goast "go/ast"
 	"go/token"
+	"go/types"
+	"sync"
 
 	"golang.org/x/tools/go/packages"
 )
+
+// Package-level cache for type information to speed up repeated analysis
+var (
+	packageCacheMu sync.RWMutex
+	packageCache   = make(map[string]*cacheEntry)
+)
+
+// cacheEntry stores cached package analysis results
+type cacheEntry struct {
+	filesMap    map[string]*goast.File
+	structIndex map[string]structIndexEntry
+}
 
 // AnalyzeDir performs comprehensive static analysis on Go source code to extract:
 // 1. Template render calls with their associated data variables
@@ -34,41 +49,77 @@ func AnalyzeDir(dir string, contextFile string, config AnalysisConfig) AnalysisR
 	result := AnalysisResult{}
 	fset := token.NewFileSet()
 
-	// Configure package loader to include all necessary type information
-	cfg := &packages.Config{
-		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
-			packages.NeedTypes | packages.NeedTypesInfo | packages.NeedTypesSizes |
-			packages.NeedImports,
-		Dir:   dir,
-		Fset:  fset,
-		Tests: false, // Skip test files for cleaner analysis
+	// Check cache first for performance
+	cacheKey := dir
+	packageCacheMu.RLock()
+	cached, hasCached := packageCache[cacheKey]
+	packageCacheMu.RUnlock()
+
+	var filesMap map[string]*goast.File
+	var structIndex map[string]structIndexEntry
+	var info *types.Info
+	var allFiles []*goast.File
+
+	if hasCached {
+		// Use cached data (filesMap and structIndex are immutable after creation)
+		filesMap = cached.filesMap
+		structIndex = cached.structIndex
+
+		// Still need to load packages for type info (but we skip some processing)
+		cfg := &packages.Config{
+			Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
+				packages.NeedTypes | packages.NeedTypesInfo | packages.NeedTypesSizes |
+				packages.NeedImports,
+			Dir:   dir,
+			Fset:  fset,
+			Tests: false,
+		}
+
+		pkgs, err := packages.Load(cfg, "./...")
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("load error: %v", err))
+			return result
+		}
+
+		info, allFiles = mergeTypeInfo(pkgs, &result)
+	} else {
+		// Full analysis path
+		cfg := &packages.Config{
+			Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
+				packages.NeedTypes | packages.NeedTypesInfo | packages.NeedTypesSizes |
+				packages.NeedImports,
+			Dir:   dir,
+			Fset:  fset,
+			Tests: false,
+		}
+
+		pkgs, err := packages.Load(cfg, "./...")
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("load error: %v", err))
+			return result
+		}
+
+		info, allFiles = mergeTypeInfo(pkgs, &result)
+		filesMap = buildFileMap(allFiles, fset)
+		structIndex = buildStructIndex(fset, filesMap)
+
+		// Cache the immutable data structures
+		packageCacheMu.Lock()
+		packageCache[cacheKey] = &cacheEntry{
+			filesMap:    filesMap,
+			structIndex: structIndex,
+		}
+		packageCacheMu.Unlock()
 	}
-
-	// Load all packages in the directory tree
-	pkgs, err := packages.Load(cfg, "./...")
-	if err != nil {
-		result.Errors = append(result.Errors, fmt.Sprintf("load error: %v", err))
-		return result
-	}
-
-	// Merge type information from all packages into a unified index
-	info, allFiles := mergeTypeInfo(pkgs, &result)
-
-	// Build quick lookup map: filename → AST
-	filesMap := buildFileMap(allFiles, fset)
 
 	// Initialize shared infrastructure
 	fc := newFieldCache()
 	seenPool := newSeenMapPool()
 
-	// Phase 1: Build struct index (concurrent)
-	structIndex := buildStructIndex(fset, filesMap)
-
 	// Phase 2: Collect function scopes (concurrent)
 	scopes := collectFuncScopesOptimized(allFiles, info, fset, structIndex, fc, config, filesMap, seenPool)
 
 	// Phase 3: Identify global implicit variables
-	// These are variables set outside any render call (global context)
 	globalImplicitVars := extractGlobalImplicitVars(scopes)
 
 	// Phase 4: Generate render calls from collected scopes
@@ -79,12 +130,36 @@ func AnalyzeDir(dir string, contextFile string, config AnalysisConfig) AnalysisR
 
 	// Phase 6: Enrich with external context if provided
 	if contextFile != "" {
+		// Need to reload packages for context enrichment
+		cfg := &packages.Config{
+			Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
+				packages.NeedTypes | packages.NeedTypesInfo | packages.NeedTypesSizes |
+				packages.NeedImports,
+			Dir:   dir,
+			Fset:  fset,
+			Tests: false,
+		}
+
+		pkgs, err := packages.Load(cfg, "./...")
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("context load error: %v", err))
+			return result
+		}
+
 		result.RenderCalls = enrichRenderCallsWithContext(
 			result.RenderCalls, contextFile, pkgs, structIndex, fc, fset, config, seenPool,
 		)
 	}
 
 	return result
+}
+
+// ClearCache clears the package cache. Useful for testing or when analyzing
+// the same directory multiple times with different configurations.
+func ClearCache() {
+	packageCacheMu.Lock()
+	packageCache = make(map[string]*cacheEntry)
+	packageCacheMu.Unlock()
 }
 
 // extractGlobalImplicitVars identifies template variables that are set
