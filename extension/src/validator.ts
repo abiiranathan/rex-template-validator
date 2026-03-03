@@ -62,6 +62,14 @@ export class TemplateValidator {
         document: vscode.TextDocument,
         providedCtx?: TemplateContext
     ): Promise<vscode.Diagnostic[]> {
+        // Return no errors if validation turned off in configuration
+        const config = vscode.workspace.getConfiguration('rex-analyzer');
+        const validationEnabled: boolean = config.get("validate") ?? true;
+
+        if (!validationEnabled) {
+            return []
+        }
+
         const ctx =
             providedCtx ||
             this.graphBuilder.findContextForFile(document.uri.fsPath);
