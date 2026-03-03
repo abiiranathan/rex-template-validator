@@ -408,7 +408,7 @@ async function applyAnalyzerDiagnostics(
         }
       }
     } else if (isNotFound && err.goFile && err.goLine !== undefined) {
-      diagnosticFilePath = path.join(workspaceRoot, sourceDir, err.goFile);
+      diagnosticFilePath = path.join(path.resolve(workspaceRoot, sourceDir), err.goFile);
       diagnosticLine = Math.max(0, err.goLine - 1);
       diagnosticCol = Math.max(0, (err.templateNameStartCol ?? 1) - 1);
       diagnosticEndCol = Math.max(
@@ -427,7 +427,7 @@ async function applyAnalyzerDiagnostics(
       diagnosticEndCol = diagnosticCol + (err.variable?.length || 1);
 
       if (err.goFile) {
-        const goFileAbs = path.join(workspaceRoot, sourceDir, err.goFile);
+        const goFileAbs = path.join(path.resolve(workspaceRoot, sourceDir), err.goFile);
         relatedInfo = [
           new vscode.DiagnosticRelatedInformation(
             new vscode.Location(

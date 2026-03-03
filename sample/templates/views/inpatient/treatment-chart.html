@@ -130,12 +130,12 @@
 
     <!-- Test else if, else with, else range -->
     {{ if .Title}}
-    <p>Title: {{.Title }}</p>
+    <p>Title: {{ .Title }}</p>
     {{ else if .appVersion }}
     <p>App version:{{ .appVersion }}</p>
     {{ else with .billedDrugs }}
     {{ range . }}
-    <p>Drug: {{.Name}}</p>
+    <p>Drug: {{ .Name }}</p>
     {{ end }}
     {{ end }}
 

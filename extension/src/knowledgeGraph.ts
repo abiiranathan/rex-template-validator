@@ -36,6 +36,10 @@ export class KnowledgeGraphBuilder {
   /**
    * Resolves the base directory for templates by combining workspaceRoot,
    * sourceDir, templateBaseDir, and templateRoot correctly.
+   *
+   * Both sourceDir and templateBaseDir may be absolute paths, so we always use
+   * path.resolve (which treats an absolute second argument as the new root) rather
+   * than path.join (which would concatenate blindly, producing garbage paths).
    */
   private getTemplateBase(): string {
     const config = vscode.workspace.getConfiguration('rex-analyzer');
@@ -43,6 +47,9 @@ export class KnowledgeGraphBuilder {
     const templateBaseDir: string = config.get('templateBaseDir') ?? '';
     const templateRoot: string = config.get('templateRoot') ?? '';
 
+    // path.resolve handles absolute values of templateBaseDir / sourceDir correctly:
+    //   path.resolve('/workspace', '/abs/path') === '/abs/path'
+    //   path.resolve('/workspace', 'rel/path')  === '/workspace/rel/path'
     const baseDir = templateBaseDir
       ? path.resolve(this.workspaceRoot, templateBaseDir)
       : path.resolve(this.workspaceRoot, sourceDir);
@@ -147,6 +154,12 @@ export class KnowledgeGraphBuilder {
       }
     }
 
+    // Supplement the analyzer's namedBlocks with a full directory scan so that
+    // {{ define "name" }} / {{ block "name" ... }} declarations that have no
+    // corresponding Go render call are still discoverable by hover, completion,
+    // and validation.
+    this.scanTemplateDirectoryForNamedBlocks(templateBase, namedBlocks);
+
     const namedBlockErrors = analysisResult.namedBlockErrors ?? [];
 
     const funcMaps = new Map<string, FuncMapInfo>();
@@ -180,6 +193,114 @@ export class KnowledgeGraphBuilder {
 
   getGraph(): KnowledgeGraph {
     return this.graph;
+  }
+
+  /**
+   * Recursively scans the templates directory for {{ define "name" }} and
+   * {{ block "name" ... }} declarations and registers any that are not already
+   * present in the namedBlocks registry (i.e. those with no Go render calls).
+   *
+   * This ensures that blocks defined in template files but never explicitly
+   * rendered from Go code are still fully visible to hover, completion, and
+   * validation — the analyzer only reports blocks it can trace through render
+   * calls, so purely template-side composition would otherwise be invisible.
+   */
+  private scanTemplateDirectoryForNamedBlocks(
+    templateBase: string,
+    namedBlocks: NamedBlockRegistry
+  ): void {
+    if (!fs.existsSync(templateBase)) return;
+
+    // Regex that matches both:
+    //   {{ define "blockName" }}
+    //   {{ block  "blockName" . }}
+    // with optional dash-trimming and arbitrary whitespace.
+    const declarationRe = /\{\{-?\s*(?:define|block)\s+"([^"]+)"/g;
+
+    const walk = (dir: string): void => {
+      let entries: fs.Dirent[];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+
+      for (const entry of entries) {
+        const fullPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walk(fullPath);
+        } else if (entry.isFile() && /\.(html|gohtml|tmpl|tpl)$/.test(entry.name)) {
+          let content: string;
+          try {
+            const openDoc = vscode.workspace.textDocuments.find(
+              d => d.uri.fsPath === fullPath
+            );
+            content = openDoc ? openDoc.getText() : fs.readFileSync(fullPath, 'utf8');
+          } catch {
+            continue;
+          }
+
+          const templatePath = path.relative(templateBase, fullPath).replace(/\\/g, '/');
+          declarationRe.lastIndex = 0;
+
+          let match: RegExpExecArray | null;
+          while ((match = declarationRe.exec(content)) !== null) {
+            const name = match[1];
+            if (namedBlocks.has(name)) continue; // already known — analyzer wins
+
+            // Calculate line/col of this declaration.
+            const upTo = content.slice(0, match.index);
+            const line = (upTo.match(/\n/g) ?? []).length + 1;
+            const lastNl = upTo.lastIndexOf('\n');
+            const col = match.index - (lastNl === -1 ? 0 : lastNl + 1);
+
+            const absPath = fullPath;
+            const entry: NamedBlockEntry = {
+              name,
+              templatePath,
+              absolutePath: absPath,
+              line,
+              col,
+              get node() {
+                if (!(this as any)._node) {
+                  try {
+                    const doc = vscode.workspace.textDocuments.find(
+                      d => d.uri.fsPath === absPath
+                    );
+                    const src = doc ? doc.getText() : fs.readFileSync(absPath, 'utf8');
+                    const parser = new TemplateParser();
+                    const nodes = parser.parse(src);
+                    const findNode = (ns: TemplateNode[]): TemplateNode | undefined => {
+                      for (const n of ns) {
+                        if ((n.kind === 'define' || n.kind === 'block') && n.blockName === name) return n;
+                        if (n.children) {
+                          const f = findNode(n.children);
+                          if (f) return f;
+                        }
+                      }
+                      return undefined;
+                    };
+                    (this as any)._node = findNode(nodes) ?? {
+                      kind: 'define', path: [], rawText: '', line, col, blockName: name,
+                    };
+                  } catch {
+                    (this as any)._node = { kind: 'define', path: [], rawText: '', line, col, blockName: name };
+                  }
+                }
+                return (this as any)._node;
+              },
+            };
+
+            namedBlocks.set(name, [entry]);
+            this.outputChannel.appendLine(
+              `[KnowledgeGraph] Discovered unreferenced named block "${name}" in ${templatePath}`
+            );
+          }
+        }
+      }
+    };
+
+    walk(templateBase);
   }
 
   /**
@@ -471,10 +592,21 @@ export class KnowledgeGraphBuilder {
     };
   }
 
+  /**
+   * Resolve a Go source file path relative to the configured sourceDir.
+   *
+   * Uses path.resolve so that an absolute sourceDir setting is honoured correctly —
+   * path.join would prepend workspaceRoot even when sourceDir is already absolute,
+   * producing a bogus path like /workspace/home/user/project/src/handler.go.
+   */
   resolveGoFilePath(relativeFile: string): string | null {
     const config = vscode.workspace.getConfiguration('rex-analyzer');
     const sourceDir: string = config.get('sourceDir') ?? '.';
-    const abs = path.join(this.workspaceRoot, sourceDir, relativeFile);
+    // path.resolve handles both relative and absolute sourceDir values:
+    //   path.resolve('/workspace', '/abs/src') === '/abs/src'
+    //   path.resolve('/workspace', 'rel/src')  === '/workspace/rel/src'
+    const sourceDirAbs = path.resolve(this.workspaceRoot, sourceDir);
+    const abs = path.join(sourceDirAbs, relativeFile);
     return fs.existsSync(abs) ? abs : null;
   }
 
@@ -499,7 +631,7 @@ export class KnowledgeGraphBuilder {
     const candidates = [
       path.join(templateBase, templatePath),
       path.join(this.workspaceRoot, templatePath),
-      path.join(this.workspaceRoot, sourceDir, templatePath),
+      path.join(path.resolve(this.workspaceRoot, sourceDir), templatePath),
     ];
 
     for (const candidate of candidates) {

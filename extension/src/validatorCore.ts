@@ -350,7 +350,19 @@ export class ValidatorCore {
             if (subVarError) return;
         }
 
-        // 3. Fallback: check if it is a simple path that failed evaluation.
+        // 3. Fallback: for simple (non-complex) unresolved paths, report an error.
+        //
+        // Complex expressions (those containing spaces, pipes, or parentheses) are
+        // intentionally skipped here to avoid false positives.  Reasons:
+        //   a) Their sub-variables were already validated individually in step 2 above.
+        //   b) Pipe/function names that are not yet in the funcMap registry would
+        //      otherwise trigger spurious "not defined" diagnostics even when hover,
+        //      completion, and go-to-definition all work correctly.
+        //   c) The Go binary (rex-analyzer) provides authoritative function-level
+        //      validation; we don't need to duplicate that work here.
+        //
+        // Only simple dot-paths (e.g. "{{ .Foo.Bar }}") that genuinely don't resolve
+        // against the current context should be reported as errors at this stage.
         const pathResolved = resolvePath(
             node.path, vars, scopeStack, blockLocals,
             this.scope.buildFieldResolver(vars, scopeStack)
@@ -359,28 +371,23 @@ export class ValidatorCore {
             `  Fallback pathResolved: ${pathResolved} (path: ${node.path.join('.')})`
         );
 
-        const isComplex = cleanExpr && /[\s|()]/.test(cleanExpr);
+        // A "complex" expression contains whitespace, a pipe, or parentheses —
+        // i.e. it is a function call, pipeline, or compound expression rather than
+        // a bare field access.
+        const isComplex = cleanExpr ? /[\s|()]/.test(cleanExpr) : false;
 
-        if (!pathResolved || isComplex) {
-            this.outputChannel.appendLine(
-                `  Validation FAILED. isComplex: ${isComplex}`
-            );
+        if (!pathResolved && !isComplex) {
+            this.outputChannel.appendLine(`  Validation FAILED.`);
 
-            let message: string;
-            if (isComplex) {
-                message = `Undefined or invalid function call: "${cleanExpr}"`;
-            } else {
-                const displayPath =
-                    node.path[0] === '$'
-                        ? '$.' + node.path.slice(1).join('.')
-                        : node.path[0].startsWith('$')
-                            ? node.path.join('.')
-                            : '.' + node.path.join('.');
-                message = `Template variable "${displayPath}" is not defined in the render context`;
-            }
+            const displayPath =
+                node.path[0] === '$'
+                    ? '$.' + node.path.slice(1).join('.')
+                    : node.path[0].startsWith('$')
+                        ? node.path.join('.')
+                        : '.' + node.path.join('.');
 
             errors.push({
-                message,
+                message: `Template variable "${displayPath}" is not defined in the render context`,
                 line: node.line,
                 col: node.col,
                 severity: 'error',

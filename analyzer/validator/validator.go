@@ -77,7 +77,7 @@ func ValidateTemplates(
 	return allErrors, namedBlocks, namedBlockErrors
 }
 
-var templateRegex = regexp.MustCompile(`\{\{-?\s*(?:template|block)\s+["'\x60]([^"'\x60]+)["'\x60]`)
+var templateRegex = regexp.MustCompile(`\{\{-?\s*(?:template|block|define)\s+["'\x60]([^"'\x60]+)["'\x60]`)
 
 // findPartialTargets scans all template files to find targets of {{template "..."}} or {{block "..."}} calls.
 func findPartialTargets(baseDir, templateRoot string) map[string]bool {
