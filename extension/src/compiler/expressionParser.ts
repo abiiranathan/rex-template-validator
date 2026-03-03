@@ -644,10 +644,14 @@ export class TypeInferencer {
         // Check in current scope first
         const frame = this.findDotFrame();
         if (frame) {
-            if (frame.fields) {
+            if (frame.fields && frame.fields.length > 0) {
                 return this.resolveFieldPath(path, frame.fields);
             }
-            return null;
+
+            // Dot frame exists but has no field metadata (unknown/unresolvable context).
+            // Return a permissive unknown type so callers don't treat this as an
+            // inference failure and escalate to a validation error.
+            return { typeStr: 'unknown' };
         }
 
         // Root scope: resolve against top-level vars

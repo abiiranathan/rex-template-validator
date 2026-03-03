@@ -127,7 +127,6 @@
     </section>
     {{ end }}
 
-
     <!-- Test else if, else with, else range -->
     {{ if .Title}}
     <p>Title: {{ .Title }}</p>
@@ -138,6 +137,8 @@
     <p>Drug: {{ .Name }}</p>
     {{ end }}
     {{ end }}
+
+    {{ template "partial" . }}
 
 </body>
 

@@ -411,7 +411,6 @@ export class KnowledgeGraphBuilder {
     for (const [blockName, entries] of this.graph.namedBlocks) {
       for (const entry of entries) {
         if (path.normalize(entry.absolutePath).toLowerCase() === path.normalize(absolutePath).toLowerCase()) {
-          // Found a named block in this file - check if it has context-file vars
           const blockCtx = this.graph.templates.get(blockName);
           if (blockCtx && blockCtx.renderCalls.some(rc => rc.file === 'context-file')) {
             this.outputChannel.appendLine(
@@ -431,7 +430,7 @@ export class KnowledgeGraphBuilder {
       }
     }
 
-    // ── Priority 2: Scan parent templates for {{ template }} calls ──
+    // ── Priority 2: Scan parent templates for {{ template }} calls and MERGE them ──
     const parser = new TemplateParser();
     const normalizedTargetAbsPath = path.normalize(absolutePath).toLowerCase();
 
@@ -443,6 +442,12 @@ export class KnowledgeGraphBuilder {
         }
       }
     }
+
+    let foundAny = false;
+    const mergedVars = new Map<string, TemplateVar>();
+    const mergedRenderCalls: RenderCall[] = [];
+    let lastPartialSourceVar: TemplateVar | undefined;
+    let lastResolvedMeta: any = {};
 
     for (const [parentTplPath, parentCtx] of this.graph.templates) {
       if (!parentCtx.absolutePath || !fs.existsSync(parentCtx.absolutePath)) {
@@ -459,6 +464,7 @@ export class KnowledgeGraphBuilder {
 
         const partialCall = this.findPartialCall(nodes, partialRelPath, partialBasename, definedBlocksInFile);
         if (partialCall) {
+          foundAny = true;
           this.outputChannel.appendLine(
             `[KnowledgeGraph] Found partial call in ${parentTplPath}: template "${partialCall.partialName}" ${partialCall.partialContext}`
           );
@@ -468,21 +474,22 @@ export class KnowledgeGraphBuilder {
             parentCtx.vars
           );
 
-          this.outputChannel.appendLine(
-            `[KnowledgeGraph] Resolved partial vars: ${[...resolved.vars.keys()].join(', ')}`
-          );
+          // Merge variables from this parent into the aggregated pool
+          for (const [k, v] of resolved.vars) {
+            const existing = mergedVars.get(k);
+            if (!existing || isMoreComplete(v, existing)) {
+              mergedVars.set(k, v);
+            }
+          }
 
-          const partialSourceVar = this.findPartialSourceVar(
+          mergedRenderCalls.push(...parentCtx.renderCalls);
+
+          lastPartialSourceVar = this.findPartialSourceVar(
             partialCall.partialContext ?? '.',
             parentCtx.vars
           );
 
-          return {
-            templatePath: partialRelPath,
-            absolutePath: absolutePath,
-            vars: resolved.vars,
-            renderCalls: parentCtx.renderCalls,
-            partialSourceVar,
+          lastResolvedMeta = {
             isMap: resolved.isMap,
             keyType: resolved.keyType,
             elemType: resolved.elemType,
@@ -493,6 +500,21 @@ export class KnowledgeGraphBuilder {
       } catch {
         continue;
       }
+    }
+
+    if (foundAny) {
+      this.outputChannel.appendLine(
+        `[KnowledgeGraph] Resolved merged partial vars: ${[...mergedVars.keys()].join(', ')}`
+      );
+
+      return {
+        templatePath: partialRelPath,
+        absolutePath: absolutePath,
+        vars: mergedVars,
+        renderCalls: mergedRenderCalls,
+        partialSourceVar: lastPartialSourceVar,
+        ...lastResolvedMeta
+      };
     }
 
     this.outputChannel.appendLine(

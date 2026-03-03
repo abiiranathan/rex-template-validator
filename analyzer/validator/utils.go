@@ -24,18 +24,12 @@ var validTemplateName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 //
 // Thread-safety: Pure function, safe for concurrent calls.
 func IsFileBasedPartial(name string) bool {
-	// Check for path separators
-	if strings.ContainsAny(name, "/\\") {
-		return true
-	}
-
 	// Check for template file extensions
 	ext := strings.ToLower(filepath.Ext(name))
 	switch ext {
 	case ".html", ".tmpl", ".gohtml", ".tpl", ".htm":
 		return true
 	}
-
 	return false
 }
 

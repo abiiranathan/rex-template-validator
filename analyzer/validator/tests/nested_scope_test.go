@@ -106,7 +106,8 @@ func TestNestedRangeWithInvalidAccess(t *testing.T) {
 		},
 	}
 
-	errs := validator.ValidateTemplateContent(content, vars, "invalid-nested.html", ".", ".", 1, nil)
+	varMap := make(map[string][]validator.NamedBlockEntry)
+	errs := validator.ValidateTemplateContent(content, vars, "invalid-nested.html", ".", ".", 1, varMap)
 
 	expectedInvalid := []string{"DepartmentHead", "InvalidField"}
 

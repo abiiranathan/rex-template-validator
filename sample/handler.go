@@ -161,6 +161,7 @@ func (h *Handler) RenderDashboard(inpatient bool) rex.HandlerFunc {
 		// Magic happens here. Try renaming template name to something not found!
 		return c.Render(templateName, rex.Map{
 			"visitID": visitID,
+			"roles":   map[string]string{"admin": "Administrator", "user": "Normal User"},
 		})
 	}
 }

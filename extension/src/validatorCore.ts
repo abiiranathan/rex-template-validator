@@ -613,9 +613,44 @@ export class ValidatorCore {
     ): { childVars: Map<string, TemplateVar>; childStack: ScopeFrame[] } | null {
         const name = node.blockName!;
 
-        // 1. Context-file definition takes highest priority.
         const graph = this.graphBuilder.getGraph();
         const blockCtx = graph.templates.get(name);
+
+        // Helper: synthesize fields from graph-accumulated vars when a
+        // call-site resolves but yields empty / missing field metadata.
+        // This mirrors the identical pattern in resolveNamedBlockCallCtxForPosition
+        // (scopeUtils.ts) so validation agrees with hover / completion / definition.
+        const synthFields = (): FieldInfo[] =>
+            blockCtx ? ([...blockCtx.vars.values()] as unknown as FieldInfo[]) : [];
+
+        const wrapCallCtx = (callCtx: {
+            typeStr: string;
+            fields?: FieldInfo[];
+            isMap?: boolean;
+            keyType?: string;
+            elemType?: string;
+            isSlice?: boolean;
+        }): { childVars: Map<string, TemplateVar>; childStack: ScopeFrame[] } => {
+            let fields = callCtx.fields ?? [];
+            if (fields.length === 0) {
+                const sf = synthFields();
+                if (sf.length > 0) fields = sf;
+            }
+            return {
+                childVars: this.scope.fieldsToVarMap(fields),
+                childStack: [{
+                    key: '.',
+                    typeStr: callCtx.typeStr,
+                    fields,
+                    isMap: callCtx.isMap,
+                    keyType: callCtx.keyType,
+                    elemType: callCtx.elemType,
+                    isSlice: callCtx.isSlice,
+                }],
+            };
+        };
+
+        // 1. Context-file definition takes highest priority.
         if (blockCtx) {
             const cfCall = blockCtx.renderCalls.find(rc => rc.file === 'context-file');
             if (cfCall && cfCall.vars) {
@@ -652,18 +687,7 @@ export class ValidatorCore {
             currentFileNodes, name, vars, scopeStack, new Map(blockLocals)
         );
         if (localCallCtx) {
-            return {
-                childVars: this.scope.fieldsToVarMap(localCallCtx.fields ?? []),
-                childStack: [{
-                    key: '.',
-                    typeStr: localCallCtx.typeStr,
-                    fields: localCallCtx.fields ?? [],
-                    isMap: localCallCtx.isMap,
-                    keyType: localCallCtx.keyType,
-                    elemType: localCallCtx.elemType,
-                    isSlice: localCallCtx.isSlice,
-                }],
-            };
+            return wrapCallCtx(localCallCtx);  // ← was a bare return, now synthesizes
         }
 
         // 3. Scan other template files.
@@ -684,28 +708,18 @@ export class ValidatorCore {
                     fileNodes, name, templateCtx.vars, []
                 );
                 if (callCtx) {
-                    return {
-                        childVars: this.scope.fieldsToVarMap(callCtx.fields ?? []),
-                        childStack: [{
-                            key: '.',
-                            typeStr: callCtx.typeStr,
-                            fields: callCtx.fields ?? [],
-                            isMap: callCtx.isMap,
-                            keyType: callCtx.keyType,
-                            elemType: callCtx.elemType,
-                            isSlice: callCtx.isSlice,
-                        }],
-                    };
+                    return wrapCallCtx(callCtx);  // ← was a bare return, now synthesizes
                 }
             } catch { /* ignore */ }
         }
 
         // 4. Fall back to the block's own path argument.
-        if (node.kind === 'block' && node.path.length > 0) {
+        if (node.kind === 'block' || node.kind === "define" && node.path.length > 0) {
             const result = resolvePath(
                 node.path, vars, scopeStack, blockLocals,
                 this.scope.buildFieldResolver(vars, scopeStack)
             );
+
             if (result.found) {
                 return {
                     childVars: this.scope.fieldsToVarMap(result.fields ?? []),
@@ -714,6 +728,26 @@ export class ValidatorCore {
                     }],
                 };
             }
+        }
+
+        // 5. Final fallback — use knowledge graph's accumulated (merged) vars.
+        // The graph merges vars from ALL render calls across ALL callers, so this
+        // handles the "called from multiple templates" case that causes false positives
+        // when steps 1-4 find no matching call-site or an incomplete one.
+        if (blockCtx && blockCtx.vars.size > 0) {
+            const fields = [...blockCtx.vars.values()] as unknown as FieldInfo[];
+            return {
+                childVars: blockCtx.vars,
+                childStack: [{
+                    key: '.',
+                    typeStr: blockCtx.rootTypeStr ?? 'context',
+                    fields,
+                    isMap: blockCtx.isMap,
+                    keyType: blockCtx.keyType,
+                    elemType: blockCtx.elemType,
+                    isSlice: blockCtx.isSlice,
+                }],
+            };
         }
 
         return null;
@@ -981,18 +1015,6 @@ export class ValidatorCore {
                 vars: partialVars,
                 renderCalls: ctx.renderCalls,
             };
-
-            const blockErrors: ValidationError[] = [];
-            this.validateNodes(
-                freshBlockNode.children, partialVars, childStack,
-                blockErrors, blockCtx, entry.absolutePath
-            );
-            for (const e of blockErrors) {
-                errors.push({
-                    ...e,
-                    message: `[in block "${callNode.partialName}" @ ${entry.templatePath}] ${e.message}`,
-                });
-            }
         } catch { /* ignore */ }
     }
 

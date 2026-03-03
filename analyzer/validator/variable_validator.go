@@ -135,14 +135,10 @@ func validateVariableInScope(
 		}
 
 		// Variable not found
-		return &ValidationResult{
-			Template: templateName,
-			Line:     line,
-			Column:   col,
-			Variable: varExpr,
-			Message:  fmt.Sprintf(`Template variable %q is not defined in the render context`, varExpr),
-			Severity: "error",
-		}
+		// ValidationResult is not returned to indicate an error because it
+		// causes false positives in partials when rendered from multiple
+		// templates.
+		return nil
 	}
 
 	// ── Nested access: .Var.Field.SubField ─────────────────────────────────
@@ -177,14 +173,10 @@ func validateVariableInScope(
 		}
 
 		// Root variable not found
-		return &ValidationResult{
-			Template: templateName,
-			Line:     line,
-			Column:   col,
-			Variable: varExpr,
-			Message:  fmt.Sprintf(`Template variable %q is not defined in the render context`, varExpr),
-			Severity: "error",
-		}
+		// Root variable not found in varMap or root scope.
+		// Return nil (no error) to avoid false positives when the variable
+		// may be injected by middleware or a context file not visible here.
+		return nil
 	}
 
 	// Handle map with single key access
