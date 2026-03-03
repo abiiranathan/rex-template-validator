@@ -160,6 +160,9 @@ export interface TemplateNode {
   endLine?: number;
   endCol?: number;
   children?: TemplateNode[];
+  elseChildren?: TemplateNode[];
+  elseLine?: number;      // 1-based line number of the {{ else }} or {{ else if }} tag
+  elseCol?: number;       // 1-based column of the {{ else }} or {{ else if }} tag
   partialName?: string;   // for 'partial' kind
   partialContext?: string; // raw context arg, e.g. "." or ".User"
   blockName?: string;     // for 'block' and 'define' kind

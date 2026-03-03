@@ -137,21 +137,10 @@ export class ValidatorCore {
             }
 
             case 'if': {
-                if (node.path.length > 0) {
-                    if (!resolvePath(
-                        node.path, vars, scopeStack, blockLocals,
-                        this.scope.buildFieldResolver(vars, scopeStack)
-                    ).found) {
-                        errors.push({
-                            message: `".${node.path.join('.')}" is not defined`,
-                            line: node.line,
-                            col: node.col,
-                            severity: 'warning',
-                            variable: node.path[0],
-                        });
-                    }
-                }
-                break;
+                this.validateIf(
+                    node, vars, scopeStack, blockLocals, errors, ctx, filePath
+                );
+                return; // Children handled inside.
             }
 
             case 'partial': {
@@ -173,6 +162,11 @@ export class ValidatorCore {
         if (node.children) {
             this.validateNodes(
                 node.children, vars, scopeStack, errors, ctx, filePath, blockLocals
+            );
+        }
+        if (node.elseChildren) {
+            this.validateNodes(
+                node.elseChildren, vars, scopeStack, errors, ctx, filePath, blockLocals
             );
         }
     }
@@ -395,7 +389,61 @@ export class ValidatorCore {
         }
     }
 
-    // ── Range / With validation ───────────────────────────────────────────────
+    // ── If / Range / With validation ──────────────────────────────────────────
+
+    private validateIf(
+        node: TemplateNode,
+        vars: Map<string, TemplateVar>,
+        scopeStack: ScopeFrame[],
+        blockLocals: Map<string, TemplateVar>,
+        errors: ValidationError[],
+        ctx: TemplateContext,
+        filePath: string
+    ) {
+        if (node.path.length > 0) {
+            const result = resolvePath(
+                node.path, vars, scopeStack, blockLocals,
+                this.scope.buildFieldResolver(vars, scopeStack)
+            );
+            if (!result.found) {
+                const cleanExpr = node.rawText
+                    ? node.rawText.replace(/^\{\{-?\s*else\s+if\s+/, '').replace(/^\{\{-?\s*if\s+/, '').replace(/\s*-?\}\}$/, '')
+                    : '';
+
+                let exprType = null;
+                try {
+                    if (cleanExpr) {
+                        exprType = inferExpressionType(
+                            cleanExpr, vars, scopeStack, blockLocals,
+                            this.graphBuilder.getGraph().funcMaps,
+                            this.scope.buildFieldResolver(vars, scopeStack)
+                        );
+                    }
+                } catch { }
+
+                if (!exprType) {
+                    errors.push({
+                        message: `".${node.path.join('.')}" is not defined`,
+                        line: node.line,
+                        col: node.col,
+                        severity: 'warning',
+                        variable: node.path[0],
+                    });
+                }
+            }
+        }
+
+        if (node.children) {
+            this.validateNodes(
+                node.children, vars, scopeStack, errors, ctx, filePath, blockLocals
+            );
+        }
+        if (node.elseChildren) {
+            this.validateNodes(
+                node.elseChildren, vars, scopeStack, errors, ctx, filePath, blockLocals
+            );
+        }
+    }
 
     private validateRange(
         node: TemplateNode,
@@ -434,6 +482,12 @@ export class ValidatorCore {
             this.validateNodes(
                 node.children, vars, [...scopeStack, elemScope],
                 errors, ctx, filePath, blockLocals
+            );
+        }
+
+        if (node.elseChildren) {
+            this.validateNodes(
+                node.elseChildren, vars, scopeStack, errors, ctx, filePath, blockLocals
             );
         }
     }
@@ -492,6 +546,12 @@ export class ValidatorCore {
                     errors, ctx, filePath, blockLocals
                 );
             }
+        }
+
+        if (node.elseChildren) {
+            this.validateNodes(
+                node.elseChildren, vars, scopeStack, errors, ctx, filePath, blockLocals
+            );
         }
     }
 

@@ -126,6 +126,10 @@ func ValidateTemplateContent(
 		first := ""
 		if len(words) > 0 {
 			first = words[0]
+			// Handle cases like `if(eq` where there is no space before parenthesis
+			if idx := strings.IndexByte(first, '('); idx != -1 {
+				first = first[:idx]
+			}
 		}
 
 		// ── Skip everything inside {{define}} / {{block}} bodies ────────────
@@ -159,6 +163,10 @@ func ValidateTemplateContent(
 			openingActions = openingActions[:len(openingActions)-1]
 			if len(words) > 1 {
 				elseAction = words[1]
+				// Handle cases like `else if(eq`
+				if idx := strings.IndexByte(elseAction, '('); idx != -1 {
+					elseAction = elseAction[:idx]
+				}
 			}
 		} else if first == "end" {
 			if len(scopeStack) <= 1 {
@@ -201,8 +209,9 @@ func ValidateTemplateContent(
 
 		if isElse {
 			if elseAction != "" {
+				// Handle `else if`, `else with`, `else range`
 				actionToPush = elseAction
-				idx := strings.Index(action, elseAction)
+				idx := strings.Index(action, words[1])
 				if idx != -1 {
 					exprToParse = action[idx:]
 				}

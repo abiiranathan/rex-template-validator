@@ -47,6 +47,87 @@ export class TemplateParser {
 
   // ── Tree builder ───────────────────────────────────────────────────────────
 
+  private handleElse(childResult: { nodes: TemplateNode[]; nextPos: number; endToken?: Token }, tokens: Token[]): { falseBranch?: TemplateNode[]; elseToken?: Token; finalChild: { nodes: TemplateNode[]; nextPos: number; endToken?: Token } } {
+    if (!childResult.endToken || !childResult.endToken.inner.startsWith('else')) {
+      return { falseBranch: undefined, elseToken: undefined, finalChild: childResult };
+    }
+
+    const elseTok = childResult.endToken;
+    const elseInner = elseTok.inner;
+
+    if (elseInner === 'else') {
+      const elseChild = this.buildTree(tokens, childResult.nextPos);
+      return { falseBranch: elseChild.nodes, elseToken: elseTok, finalChild: elseChild };
+    }
+
+    let kind: 'if' | 'with' | 'range' | undefined;
+    let expr = '';
+    let keyVar: string | undefined;
+    let valVar: string | undefined;
+
+    let normalizedInner = elseInner;
+    const parenIdx = elseInner.indexOf('(');
+    if (parenIdx !== -1) {
+      const beforeParen = elseInner.slice(0, parenIdx).trim();
+      if (beforeParen === 'else if' || beforeParen === 'else with' || beforeParen === 'else range') {
+        normalizedInner = beforeParen + ' ' + elseInner.slice(parenIdx);
+      }
+    }
+
+    if (normalizedInner.startsWith('else if ')) {
+      kind = 'if';
+      expr = normalizedInner.slice(8).trim();
+    } else if (normalizedInner.startsWith('else with ')) {
+      kind = 'with';
+      expr = normalizedInner.slice(10).trim();
+      const assignMatch = expr.match(/^(\$\w+)\s*:=\s*(.*)/);
+      if (assignMatch) {
+        valVar = assignMatch[1];
+        expr = assignMatch[2].trim();
+      }
+    } else if (normalizedInner.startsWith('else range ')) {
+      kind = 'range';
+      expr = normalizedInner.slice(11).trim();
+      const assignMatch = expr.match(/^(\$\w+)\s*(?:,\s*(\$\w+))?\s*:=\s*(.*)/);
+      if (assignMatch) {
+        if (assignMatch[2]) {
+          keyVar = assignMatch[1];
+          valVar = assignMatch[2];
+        } else {
+          valVar = assignMatch[1];
+        }
+        expr = assignMatch[3].trim();
+      }
+    }
+
+    if (kind) {
+      const nextChild = this.buildTree(tokens, childResult.nextPos);
+      const nestedElse = this.handleElse(nextChild, tokens);
+
+      const node: TemplateNode = {
+        kind: kind,
+        path: this.parseDotPath(expr),
+        rawText: elseTok.raw,
+        line: elseTok.line,
+        col: elseTok.col,
+        endLine: nestedElse.finalChild.endToken?.line,
+        endCol: nestedElse.finalChild.endToken?.col,
+        children: nextChild.nodes,
+        elseChildren: nestedElse.falseBranch,
+        elseLine: nestedElse.elseToken?.line,
+        elseCol: nestedElse.elseToken?.col,
+        keyVar,
+        valVar
+      };
+
+      return { falseBranch: [node], elseToken: elseTok, finalChild: nestedElse.finalChild };
+    }
+
+    // Fallback for unknown else
+    const elseChild = this.buildTree(tokens, childResult.nextPos);
+    return { falseBranch: elseChild.nodes, elseToken: elseTok, finalChild: elseChild };
+  }
+
   private buildTree(tokens: Token[], pos: number): { nodes: TemplateNode[]; nextPos: number; endToken?: Token } {
     const nodes: TemplateNode[] = [];
 
@@ -79,14 +160,7 @@ export class TemplateParser {
         }
 
         let child = this.buildTree(tokens, pos + 1);
-        let trueBranch = child.nodes;
-        let falseBranch: TemplateNode[] | undefined;
-
-        if (child.endToken && (child.endToken.inner === 'else' || child.endToken.inner.startsWith('else '))) {
-          const elseChild = this.buildTree(tokens, child.nextPos);
-          falseBranch = elseChild.nodes;
-          child = elseChild;
-        }
+        const elseResult = this.handleElse(child, tokens);
 
         nodes.push({
           kind: 'range',
@@ -94,14 +168,16 @@ export class TemplateParser {
           rawText: tok.raw,
           line: tok.line,
           col: tok.col,
-          endLine: child.endToken?.line,
-          endCol: child.endToken?.col,
-          children: trueBranch,
-          elseChildren: falseBranch,
+          endLine: elseResult.finalChild.endToken?.line,
+          endCol: elseResult.finalChild.endToken?.col,
+          children: child.nodes,
+          elseChildren: elseResult.falseBranch,
+          elseLine: elseResult.elseToken?.line,
+          elseCol: elseResult.elseToken?.col,
           keyVar,
           valVar,
         } as any);
-        pos = child.nextPos;
+        pos = elseResult.finalChild.nextPos;
         continue;
       }
 
@@ -116,14 +192,7 @@ export class TemplateParser {
         }
 
         let child = this.buildTree(tokens, pos + 1);
-        let trueBranch = child.nodes;
-        let falseBranch: TemplateNode[] | undefined;
-
-        if (child.endToken && (child.endToken.inner === 'else' || child.endToken.inner.startsWith('else '))) {
-          const elseChild = this.buildTree(tokens, child.nextPos);
-          falseBranch = elseChild.nodes;
-          child = elseChild;
-        }
+        const elseResult = this.handleElse(child, tokens);
 
         nodes.push({
           kind: 'with',
@@ -131,27 +200,22 @@ export class TemplateParser {
           rawText: tok.raw,
           line: tok.line,
           col: tok.col,
-          endLine: child.endToken?.line,
-          endCol: child.endToken?.col,
-          children: trueBranch,
-          elseChildren: falseBranch,
+          endLine: elseResult.finalChild.endToken?.line,
+          endCol: elseResult.finalChild.endToken?.col,
+          children: child.nodes,
+          elseChildren: elseResult.falseBranch,
+          elseLine: elseResult.elseToken?.line,
+          elseCol: elseResult.elseToken?.col,
           valVar,
         } as any);
-        pos = child.nextPos;
+        pos = elseResult.finalChild.nextPos;
         continue;
       }
 
       if (inner.startsWith('if ')) {
         const expr = inner.slice(3).trim();
         let child = this.buildTree(tokens, pos + 1);
-        let trueBranch = child.nodes;
-        let falseBranch: TemplateNode[] | undefined;
-
-        if (child.endToken && (child.endToken.inner === 'else' || child.endToken.inner.startsWith('else '))) {
-          const elseChild = this.buildTree(tokens, child.nextPos);
-          falseBranch = elseChild.nodes;
-          child = elseChild;
-        }
+        const elseResult = this.handleElse(child, tokens);
 
         nodes.push({
           kind: 'if',
@@ -159,12 +223,14 @@ export class TemplateParser {
           rawText: tok.raw,
           line: tok.line,
           col: tok.col,
-          endLine: child.endToken?.line,
-          endCol: child.endToken?.col,
-          children: trueBranch,
-          elseChildren: falseBranch,
+          endLine: elseResult.finalChild.endToken?.line,
+          endCol: elseResult.finalChild.endToken?.col,
+          children: child.nodes,
+          elseChildren: elseResult.falseBranch,
+          elseLine: elseResult.elseToken?.line,
+          elseCol: elseResult.elseToken?.col,
         } as any);
-        pos = child.nextPos;
+        pos = elseResult.finalChild.nextPos;
         continue;
       }
 

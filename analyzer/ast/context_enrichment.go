@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"go/token"
 	"go/types"
+	"log"
 	"os"
 	"strings"
 
@@ -33,12 +34,12 @@ func enrichRenderCallsWithContext(
 	// Load context file
 	data, err := os.ReadFile(contextFile)
 	if err != nil {
-		return calls
+		log.Fatalf("context file not found: %v", contextFile)
 	}
 
 	var contextConfig map[string]map[string]string
 	if err := json.Unmarshal(data, &contextConfig); err != nil {
-		return calls
+		log.Fatalf("error parsing context file json: %v: %v", contextFile, err)
 	}
 
 	// Build type map from all packages

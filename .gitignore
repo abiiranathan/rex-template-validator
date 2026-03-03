@@ -31,3 +31,5 @@ analyzer/analyzer
 analyzer/rex-analyzer
 .opencode
 prompt*.txt
+*.test
+*.prof
