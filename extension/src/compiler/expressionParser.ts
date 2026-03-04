@@ -258,25 +258,17 @@ class ExpressionParser {
         while (true) {
             const tok = this.lexer.peek();
 
-            // Method or field access: .Method or .Field
             if (tok.type === 'DOT') {
                 this.lexer.next(); // consume '.'
                 const nameTok = this.lexer.next();
                 if (nameTok.type !== 'IDENT') break;
 
-                // Check if it's a method call (has arguments)
-                // In Go templates, method calls might not have arguments if they take 0 parameters.
-                // We should parse it as a method call if the field type is actually a method, but at parse time
-                // we don't know the type. So we parse EVERYTHING as a field access first, and let the type inferencer
-                // resolve if it's a method or field. Wait, no, we can just treat `.Method arg1` differently.
-                // Let's look ahead to see if there are arguments on the same line/expression.
-                if (this.lexer.peek().type === 'LPAREN' || this.lexer.peek().type === 'IDENT' || this.lexer.peek().type === 'DOT' || this.lexer.peek().type === 'STRING' || this.lexer.peek().type === 'NUMBER') {
+                const nextType = this.lexer.peek().type;
+                // Added 'DOLLAR' so variables ($var) are recognized as valid method arguments
+                if (nextType === 'LPAREN' || nextType === 'IDENT' || nextType === 'DOT' || nextType === 'STRING' || nextType === 'NUMBER' || nextType === 'DOLLAR') {
                     const args = this.parseArgList();
                     expr = { kind: 'method', receiver: expr, method: nameTok.value, args };
                 } else {
-                    // Field access - convert to path.
-                    // Note: This could also be a 0-argument method call!
-                    // The inferencer will need to handle this.
                     let basePath: string[];
                     if (expr.kind === 'field') {
                         basePath = expr.path;
@@ -285,10 +277,6 @@ class ExpressionParser {
                     } else {
                         basePath = [];
                     }
-                    // For method calls with 0 arguments, we might need to parse it as a method call.
-                    // Let's just create a method node if it's potentially a method call, or a field node.
-                    // Actually, treating it as field is fine, but in inferFieldType we need to check if the field
-                    // is actually a method with 0 arguments and if so, return its return type.
                     expr = { kind: 'field', path: [...basePath, nameTok.value] };
                 }
             } else {
@@ -682,8 +670,7 @@ export class TypeInferencer {
 
             let resolvedField = { ...field };
 
-            // If the field is actually a method with 0 arguments and has returns,
-            // we should treat its type as the return type of the method.
+            // Handle standard methods
             if (field.type === 'method' && field.returns && field.returns.length > 0) {
                 let retType = field.returns[0].type;
                 if (retType.startsWith('*')) {
@@ -697,6 +684,31 @@ export class TypeInferencer {
                     isSlice: retType.startsWith('[]'),
                     isMap: retType.startsWith('map['),
                 };
+            }
+            // Handle struct fields that are functions (e.g., Price func() float64)
+            else if (field.type.startsWith('func(')) {
+                const match = field.type.match(/func\([^)]*\)\s*(.+)/);
+                if (match && match[1]) {
+                    let retType = match[1].trim();
+                    // Handle multiple returns: func() (string, error) -> string
+                    if (retType.startsWith('(')) {
+                        const commaIdx = retType.indexOf(',');
+                        const endIdx = retType.indexOf(')');
+                        const cutIdx = commaIdx !== -1 ? commaIdx : endIdx;
+                        retType = retType.slice(1, cutIdx).trim();
+                    }
+                    if (retType.startsWith('*')) {
+                        retType = retType.substring(1);
+                    }
+                    const resolvedFields = this.fieldResolver?.(retType);
+                    resolvedField = {
+                        ...field,
+                        type: retType,
+                        fields: resolvedFields,
+                        isSlice: retType.startsWith('[]'),
+                        isMap: retType.startsWith('map['),
+                    };
+                }
             }
 
             if (i === path.length - 1) {
@@ -828,9 +840,35 @@ export class TypeInferencer {
 
             case 'call': {
                 // call function arg...
-                // First arg is the function, return type depends on it
-                // For now, return unknown
-                return { typeStr: 'unknown' };
+                if (args.length < 1) return { typeStr: 'unknown' };
+
+                const target = this.inferNodeType(args[0]);
+                if (!target) return { typeStr: 'unknown' };
+
+                // If the target is a direct variable holding a func (e.g., call $myFunc)
+                // we unwrap its return type here. (Field paths are already unwrapped by resolveFieldPath)
+                if (target.typeStr.startsWith('func(')) {
+                    const match = target.typeStr.match(/func\([^)]*\)\s*(.+)/);
+                    if (match && match[1]) {
+                        let retType = match[1].trim();
+                        if (retType.startsWith('(')) {
+                            const commaIdx = retType.indexOf(',');
+                            const endIdx = retType.indexOf(')');
+                            const cutIdx = commaIdx !== -1 ? commaIdx : endIdx;
+                            retType = retType.slice(1, cutIdx).trim();
+                        }
+                        if (retType.startsWith('*')) retType = retType.substring(1);
+                        return {
+                            typeStr: retType,
+                            fields: this.fieldResolver?.(retType),
+                            isSlice: retType.startsWith('[]'),
+                            isMap: retType.startsWith('map['),
+                        };
+                    }
+                }
+
+                // Return the evaluated target
+                return target;
             }
 
             // Comparison operators - all return bool

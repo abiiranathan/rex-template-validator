@@ -60,7 +60,7 @@
     {{ $large := index $.billedDrugs 0 }}
     {{ $drugName := $large.Name }}
 
-    {{ $authUser := getAuthUser 1 }}
+    {{ $authUser := call getAuthUser 1 }}
     {{ $authUser.PrintName }}
 
     {{/* ------------------------------------------------------------------ */}}
@@ -139,7 +139,6 @@
     {{ end }}
 
     {{ template "partial" . }}
-
 </body>
 
 </html>

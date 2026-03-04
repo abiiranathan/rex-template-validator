@@ -26,6 +26,15 @@ function createTestVars(): Map<string, TemplateVar> {
             { name: 'Avatar', type: 'string', isSlice: false },
           ],
         },
+        // Added for function/method testing
+        { name: 'GetAge', type: 'func() int', isSlice: false },
+        { name: 'GetProfile', type: 'func() Profile', isSlice: false },
+        {
+          name: 'HasRole',
+          type: 'method',
+          isSlice: false,
+          returns: [{ type: 'bool', name: '' }]
+        },
       ],
     }],
     ['Items', {
@@ -43,6 +52,8 @@ function createTestVars(): Map<string, TemplateVar> {
           isSlice: true,
           elemType: 'string',
         },
+        // Added for function testing
+        { name: 'GetPrice', type: 'func() float64', isSlice: false },
       ],
     }],
     ['Count', {
@@ -148,6 +159,7 @@ export function runAllTests() {
     { name: 'Scope and Context', fn: testScopeContext },
     { name: 'Local Variables', fn: testLocalVariables },
     { name: 'Complex Expressions', fn: testComplexExpressions },
+    { name: 'Function and Method Calls', fn: testFunctionAndMethodCalls },
     { name: 'Edge Cases', fn: testEdgeCases },
   ];
 
@@ -447,7 +459,52 @@ function testComplexExpressions(vars: Map<string, TemplateVar>): [number, number
   return [passed, failed];
 }
 
-// ── Test Suite 11: Edge Cases ─────────────────────────────────────────────
+// ── Test Suite 11: Function and Method Calls ──────────────────────────────
+
+function testFunctionAndMethodCalls(vars: Map<string, TemplateVar>): [number, number] {
+  const blockLocals = new Map<string, TemplateVar>([
+    ['$role', { name: '$role', type: 'string', isSlice: false }],
+    ['$getDiscount', { name: '$getDiscount', type: 'func() float64', isSlice: false }],
+  ]);
+
+  const itemScope: ScopeFrame[] = [
+    {
+      key: '.',
+      typeStr: 'Item',
+      fields: [
+        { name: 'Name', type: 'string', isSlice: false },
+        { name: 'GetPrice', type: 'func() float64', isSlice: false },
+      ],
+    },
+  ];
+
+  const tests: TestCase[] = [
+    // 1. Struct fields that are functions (unwrapping)
+    { name: 'Unwrap func field', expr: '.User.GetAge', expectedType: 'int' },
+    { name: 'Unwrap func field returning struct', expr: '.User.GetProfile', expectedType: 'Profile' },
+    { name: 'Unwrap func field in dot scope', expr: '.GetPrice', expectedType: 'float64', scope: itemScope },
+
+    // 2. The `call` keyword evaluating its target
+    { name: 'Call with func field', expr: 'call .User.GetAge', expectedType: 'int' },
+    { name: 'Call with dot scope func field', expr: 'call .GetPrice', expectedType: 'float64', scope: itemScope },
+    { name: 'Call with local func var', expr: 'call $getDiscount', expectedType: 'float64', blockLocals },
+
+    // 3. DOLLAR token in method arguments
+    { name: 'Method call with variable arg', expr: '.User.HasRole $role', expectedType: 'bool', blockLocals },
+  ];
+
+  let passed = 0;
+  let failed = 0;
+
+  for (const tc of tests) {
+    if (runTest(tc, vars)) passed++;
+    else failed++;
+  }
+
+  return [passed, failed];
+}
+
+// ── Test Suite 12: Edge Cases ─────────────────────────────────────────────
 
 function testEdgeCases(vars: Map<string, TemplateVar>): [number, number] {
   const tests: TestCase[] = [
