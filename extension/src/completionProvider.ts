@@ -25,6 +25,29 @@ export class CompletionProvider {
     private readonly graphBuilder: KnowledgeGraphBuilder;
     private readonly scope: ScopeUtils;
 
+    private readonly builtInFunctions = [
+        { name: 'and', doc: 'Returns the boolean AND of its arguments' },
+        { name: 'call', doc: 'Returns the result of calling the first argument' },
+        { name: 'html', doc: 'Returns the HTML-escaped equivalent of its arguments' },
+        { name: 'index', doc: 'Returns the result of indexing its first argument by the following arguments' },
+        { name: 'slice', doc: 'Returns the result of slicing its first argument' },
+        { name: 'js', doc: 'Returns the JavaScript-escaped equivalent of its arguments' },
+        { name: 'len', doc: 'Returns the integer length of its argument' },
+        { name: 'not', doc: 'Returns the boolean negation of its single argument' },
+        { name: 'or', doc: 'Returns the boolean OR of its arguments' },
+        { name: 'print', doc: 'An alias for fmt.Sprint' },
+        { name: 'printf', doc: 'An alias for fmt.Sprintf' },
+        { name: 'println', doc: 'An alias for fmt.Sprintln' },
+        { name: 'urlquery', doc: 'Returns the URL-escaped equivalent of its arguments' },
+        { name: 'eq', doc: 'Returns the boolean truth of arg1 == arg2' },
+        { name: 'ne', doc: 'Returns the boolean truth of arg1 != arg2' },
+        { name: 'lt', doc: 'Returns the boolean truth of arg1 < arg2' },
+        { name: 'le', doc: 'Returns the boolean truth of arg1 <= arg2' },
+        { name: 'gt', doc: 'Returns the boolean truth of arg1 > arg2' },
+        { name: 'ge', doc: 'Returns the boolean truth of arg1 >= arg2' },
+        { name: 'dict', doc: 'Creates a map from a list of key-value pairs' }
+    ];
+
     constructor(graphBuilder: KnowledgeGraphBuilder, scope: ScopeUtils) {
         this.graphBuilder = graphBuilder;
         this.parser = scope.parser;
@@ -70,6 +93,36 @@ export class CompletionProvider {
         const content = document.getText();
         const nodes = this.parser.parse(content);
 
+        const lineText = document.lineAt(position.line).text;
+        const linePrefix = lineText.slice(0, position.character);
+
+        // 0. Check if we are inside a template/block/define name string
+        const templateMatch = linePrefix.match(/\{\{\s*(?:template|block|define)\s+"([^"]*)$/);
+        if (templateMatch) {
+            const partialName = templateMatch[1];
+            const matchStart = position.character - partialName.length;
+            const repRange = new vscode.Range(position.line, matchStart, position.line, position.character);
+
+            const graph = this.graphBuilder.getGraph();
+            for (const [name, entries] of graph.namedBlocks) {
+                if (partialName && !name.startsWith(partialName)) continue;
+                const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Value);
+                item.detail = `Named block (defined in ${entries.length} places)`;
+                item.range = repRange;
+                completionItems.push(item);
+            }
+            for (const [tplPath, _] of graph.templates) {
+                if (partialName && !tplPath.startsWith(partialName)) continue;
+                if (!graph.namedBlocks.has(tplPath)) {
+                    const item = new vscode.CompletionItem(tplPath, vscode.CompletionItemKind.File);
+                    item.detail = `Template file`;
+                    item.range = repRange;
+                    completionItems.push(item);
+                }
+            }
+            return completionItems;
+        }
+
         // 1. Determine scope at cursor position.
         let scopeResult = this.scope.findScopeAtPosition(
             nodes, position, ctx.vars, [], nodes, ctx
@@ -105,8 +158,6 @@ export class CompletionProvider {
             locals: new Map<string, TemplateVar>(),
         };
 
-        const lineText = document.lineAt(position.line).text;
-        const linePrefix = lineText.slice(0, position.character);
         const replacementRange = new vscode.Range(
             position.line, position.character,
             position.line, position.character
@@ -138,15 +189,27 @@ export class CompletionProvider {
 
         // Case A: No dot/dollar prefix — offer globals, locals, and functions.
         if (!pathMatch) {
-            this.addGlobalVariablesToCompletion(
-                ctx.vars, completionItems, '', replacementRange
-            );
-            this.addLocalVariablesToCompletion(
-                stack, locals, completionItems, '', replacementRange
-            );
-            this.addFunctionsToCompletion(
-                this.graphBuilder.getGraph().funcMaps, completionItems, '', replacementRange
-            );
+            const lastOpen = linePrefix.lastIndexOf('{{');
+            const lastClose = linePrefix.lastIndexOf('}}');
+            const insideTag = lastOpen > lastClose;
+
+            if (insideTag) {
+                const wordMatch = linePrefix.match(/[a-zA-Z0-9_]+$/);
+                const filterPrefix = wordMatch ? wordMatch[0] : '';
+                const matchStart = wordMatch ? position.character - filterPrefix.length : position.character;
+                const repRange = new vscode.Range(position.line, matchStart, position.line, position.character);
+
+                this.addGlobalVariablesToCompletion(
+                    ctx.vars, completionItems, filterPrefix, repRange
+                );
+                this.addLocalVariablesToCompletion(
+                    stack, locals, completionItems, filterPrefix, repRange
+                );
+                this.addFunctionsToCompletion(
+                    this.graphBuilder.getGraph().funcMaps, completionItems, filterPrefix, repRange
+                );
+                this.addBuiltInFunctionsToCompletion(completionItems, filterPrefix, repRange);
+            }
             return completionItems;
         }
 
@@ -249,6 +312,24 @@ export class CompletionProvider {
     }
 
     // ── Completion item builders ──────────────────────────────────────────────
+
+    /**
+     * Adds built-in functions to completionItems.
+     */
+    addBuiltInFunctionsToCompletion(
+        completionItems: vscode.CompletionItem[],
+        partialName: string = '',
+        replacementRange: vscode.Range | null
+    ) {
+        for (const fn of this.builtInFunctions) {
+            if (partialName && !fn.name.startsWith(partialName)) continue;
+            const item = new vscode.CompletionItem(fn.name, vscode.CompletionItemKind.Function);
+            item.detail = `built-in function`;
+            item.documentation = new vscode.MarkdownString(fn.doc);
+            if (replacementRange) item.range = replacementRange;
+            completionItems.push(item);
+        }
+    }
 
     /**
      * Adds function completions from the funcMap registry to completionItems.
