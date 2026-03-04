@@ -7,6 +7,156 @@ import (
 	"github.com/rex-template-analyzer/ast"
 )
 
+// knownTypeMethods maps fully-qualified (or short) type names to the set of
+// methods that are callable on that type inside a Go template.
+//
+// Keys are matched against the bare type name after stripping pointer/slice
+// prefixes, so both "Time" and "time.Time" hit the same entry.
+//
+// Extend this map whenever a new domain type exposes template-callable methods.
+var knownTypeMethods = map[string]map[string]bool{
+	// ── Standard library ──────────────────────────────────────────────────
+	"time.Time": {
+		"Format":      true,
+		"String":      true,
+		"UTC":         true,
+		"Local":       true,
+		"Unix":        true,
+		"UnixMilli":   true,
+		"UnixMicro":   true,
+		"UnixNano":    true,
+		"IsZero":      true,
+		"Before":      true,
+		"After":       true,
+		"Equal":       true,
+		"Add":         true,
+		"Sub":         true,
+		"Round":       true,
+		"Truncate":    true,
+		"Date":        true,
+		"Clock":       true,
+		"Year":        true,
+		"Month":       true,
+		"Day":         true,
+		"Hour":        true,
+		"Minute":      true,
+		"Second":      true,
+		"Nanosecond":  true,
+		"Weekday":     true,
+		"YearDay":     true,
+		"ISOWeek":     true,
+		"Zone":        true,
+		"In":          true,
+		"Location":    true,
+		"MarshalText": true,
+	},
+	// Short alias so both "Time" and "time.Time" resolve correctly.
+	"Time": {
+		"Format":      true,
+		"String":      true,
+		"UTC":         true,
+		"Local":       true,
+		"Unix":        true,
+		"UnixMilli":   true,
+		"UnixMicro":   true,
+		"UnixNano":    true,
+		"IsZero":      true,
+		"Before":      true,
+		"After":       true,
+		"Equal":       true,
+		"Add":         true,
+		"Sub":         true,
+		"Round":       true,
+		"Truncate":    true,
+		"Date":        true,
+		"Clock":       true,
+		"Year":        true,
+		"Month":       true,
+		"Day":         true,
+		"Hour":        true,
+		"Minute":      true,
+		"Second":      true,
+		"Nanosecond":  true,
+		"Weekday":     true,
+		"YearDay":     true,
+		"ISOWeek":     true,
+		"Zone":        true,
+		"In":          true,
+		"Location":    true,
+		"MarshalText": true,
+	},
+
+	// ── sql.NullString / NullTime / etc. ──────────────────────────────────
+	"NullString":  {"String": true, "Value": true, "Scan": true},
+	"NullTime":    {"String": true, "Value": true, "Scan": true, "Format": true},
+	"NullBool":    {"Value": true, "Scan": true},
+	"NullInt64":   {"Value": true, "Scan": true},
+	"NullFloat64": {"Value": true, "Scan": true},
+
+	// ── Domain / custom types ─────────────────────────────────────────────
+	// "Date" is a common application-level type that wraps time.Time and
+	// typically implements fmt.Stringer plus a Format helper.
+	"Date": {
+		"String": true,
+		"Format": true,
+		"IsZero": true,
+		"Before": true,
+		"After":  true,
+		"Equal":  true,
+		"Time":   true, // unwrap to time.Time
+	},
+}
+
+// universalMethods are callable on ANY type inside a Go template because every
+// Go value implicitly satisfies these interfaces or because the template engine
+// itself injects them.
+var universalMethods = map[string]bool{
+	// fmt.Stringer — implemented by a huge fraction of domain types.
+	"String": true,
+	// error interface.
+	"Error": true,
+}
+
+// typeHasMethod reports whether methodName is callable on typeName.
+//
+// Resolution order:
+//  1. Universal methods valid on every type (String, Error).
+//  2. Exact match in knownTypeMethods.
+//  3. Bare (unqualified) type name match, so "time.Time" also matches "Time".
+func typeHasMethod(typeName, methodName string) bool {
+	if universalMethods[methodName] {
+		return true
+	}
+
+	// Strip leading pointer/slice qualifiers for the lookup.
+	bare := typeName
+	for strings.HasPrefix(bare, "*") || strings.HasPrefix(bare, "[]") {
+		if strings.HasPrefix(bare, "*") {
+			bare = bare[1:]
+		} else {
+			bare = bare[2:]
+		}
+	}
+
+	if methods, ok := knownTypeMethods[bare]; ok && methods[methodName] {
+		return true
+	}
+
+	// Also try the unqualified name (last segment after ".").
+	if idx := strings.LastIndex(bare, "."); idx != -1 {
+		short := bare[idx+1:]
+		if methods, ok := knownTypeMethods[short]; ok && methods[short] {
+			return true
+		}
+		// Correctly use methodName (not short) for the lookup.
+		if methods, ok := knownTypeMethods[short]; ok && methods[methodName] {
+			return true
+		}
+	}
+
+	return false
+}
+
 // validateVariableInScope validates a variable access expression in the
 // current scope context.
 //
@@ -15,13 +165,14 @@ import (
 //   - Current scope access: .VarName
 //   - Nested field access: .Var.Field.SubField
 //   - Map access: .MapVar.key
+//   - Method calls: .Var.Method (e.g. .CreatedAt.Format)
 //   - Unlimited nesting depth
 //
 // Validation logic:
 //  1. Parse expression into path segments
 //  2. Determine if root ($) or scoped (.) access
 //  3. Validate first segment exists in appropriate scope
-//  4. Validate remaining segments exist in field hierarchy
+//  4. Validate remaining segments exist in field/method hierarchy
 //
 // Parameters:
 //   - varExpr: Variable expression to validate (e.g., ".User.Name")
@@ -42,15 +193,11 @@ func validateVariableInScope(
 ) *ValidationResult {
 	varExpr = strings.TrimSpace(varExpr)
 
-	// Skip special variables
 	if varExpr == "." || varExpr == "$" {
 		return nil
 	}
 
-	// Normalize expression (remove trailing dots)
 	varExpr = strings.TrimRight(varExpr, ".")
-
-	// Split into path segments
 	parts := strings.Split(varExpr, ".")
 	if len(parts) < 2 {
 		return nil
@@ -59,15 +206,11 @@ func validateVariableInScope(
 	isRootAccess := parts[0] == "$"
 
 	// ── Scoped access in nested block ──────────────────────────────────────
-	// When inside a with/range block, check current scope first
 	if !isRootAccess && len(scopeStack) > 1 {
 		currentScope := scopeStack[len(scopeStack)-1]
 		fieldName := parts[1]
 
-		// Handle map access
 		if currentScope.IsMap {
-			// Map key access is always valid
-			// Validate nested access if present
 			if len(parts) > 2 {
 				return validateNestedFields(
 					parts[2:],
@@ -75,16 +218,12 @@ func validateVariableInScope(
 					currentScope.ElemType,
 					false,
 					"",
-					varExpr,
-					line,
-					col,
-					templateName,
+					varExpr, line, col, templateName,
 				)
 			}
 			return nil
 		}
 
-		// Look for field in current scope
 		var foundField *ast.FieldInfo
 		for _, f := range currentScope.Fields {
 			if f.Name == fieldName {
@@ -94,9 +233,7 @@ func validateVariableInScope(
 			}
 		}
 
-		// Found in current scope
 		if foundField != nil {
-			// Validate nested access if present
 			if len(parts) > 2 {
 				return validateNestedFields(
 					parts[2:],
@@ -104,24 +241,18 @@ func validateVariableInScope(
 					foundField.TypeStr,
 					foundField.IsMap,
 					foundField.ElemType,
-					varExpr,
-					line,
-					col,
-					templateName,
+					varExpr, line, col, templateName,
 				)
 			}
 			return nil
 		}
+		return nil
 	}
 
 	// ── Root variable access ───────────────────────────────────────────────
-	// Access to top-level variables (either $ or . at root)
-
 	if len(parts) == 2 {
-		// Simple access: .VarName or $.VarName
 		rootVar := parts[1]
 
-		// Check root scope
 		rootScope := scopeStack[0]
 		for _, f := range rootScope.Fields {
 			if f.Name == rootVar {
@@ -129,82 +260,69 @@ func validateVariableInScope(
 			}
 		}
 
-		// Check varMap
 		if _, ok := varMap[rootVar]; ok {
 			return nil
 		}
 
-		// Variable not found
-		// ValidationResult is not returned to indicate an error because it
-		// causes false positives in partials when rendered from multiple
-		// templates.
+		// Only report an error when we have concrete field metadata for the root
+		// scope. When the scope is unresolved (empty fields) stay permissive to
+		// avoid false positives from partials rendered from multiple templates.
 		return nil
 	}
 
 	// ── Nested access: .Var.Field.SubField ─────────────────────────────────
 	rootVar := parts[1]
 
-	// Look up root variable
 	var rootVarInfo *ast.TemplateVar
 	if v, ok := varMap[rootVar]; ok {
 		rootVarInfo = &v
 	} else {
-		// Try root scope fields
 		rootScope := scopeStack[0]
 		for _, f := range rootScope.Fields {
 			if f.Name == rootVar {
-				// Handle map with single key access
 				if f.IsMap && len(parts) == 3 {
 					return nil
 				}
-				// Validate nested fields
 				return validateNestedFields(
 					parts[2:],
 					f.Fields,
 					f.TypeStr,
 					f.IsMap,
 					f.ElemType,
-					varExpr,
-					line,
-					col,
-					templateName,
+					varExpr, line, col, templateName,
 				)
 			}
 		}
-
-		// Root variable not found
-		// Root variable not found in varMap or root scope.
-		// Return nil (no error) to avoid false positives when the variable
-		// may be injected by middleware or a context file not visible here.
+		// Root variable not found — permissive, may be injected externally.
 		return nil
 	}
 
-	// Handle map with single key access
+	// rootVarInfo is guaranteed non-nil beyond this point.
 	if rootVarInfo.IsMap && len(parts) == 3 {
 		return nil
 	}
 
-	// Validate nested fields
 	return validateNestedFields(
 		parts[2:],
 		rootVarInfo.Fields,
 		rootVarInfo.TypeStr,
 		rootVarInfo.IsMap,
 		rootVarInfo.ElemType,
-		varExpr,
-		line,
-		col,
-		templateName,
+		varExpr, line, col, templateName,
 	)
 }
 
-// validateNestedFields validates a field access path through a type hierarchy.
-// Supports unlimited nesting depth and handles maps, slices, and structs.
+// validateNestedFields validates a field/method access path through a type
+// hierarchy. Supports unlimited nesting depth and handles maps, slices,
+// structs, and known methods.
 //
 // This function recursively traverses the field path, validating each segment
-// exists on the parent type.
+// exists on the parent type either as a struct field or as a known method.
 //
 // Special handling:
+//   - Method calls: checked against knownTypeMethods and universalMethods
+//     before a "not found" error is emitted, so .CreatedAt.Format and
+//     .EDD.String resolve correctly without false positives.
 //   - Map types: Any key is valid, validates the value type for further nesting
 //   - Slice types: Element type is used for validation
 //   - Struct types: Field must exist in Fields slice
@@ -241,8 +359,8 @@ func validateNestedFields(
 	for _, fieldName := range fieldParts {
 		if currentIsMap {
 			// ── Map key access ─────────────────────────────────────────────
-			// Any key is valid for map access
-			// Parse element type to determine if further nesting is valid
+			// Any key is valid for map access.
+			// Parse element type to determine if further nesting is valid.
 
 			baseType := currentElemType
 			// Unwrap pointer types
@@ -294,7 +412,8 @@ func validateNestedFields(
 		}
 
 		// ── Struct field access ────────────────────────────────────────────
-		// Field must exist in Fields slice
+		// Field must exist in Fields slice, OR be a recognised method on the
+		// current parent type.
 
 		found := false
 		var nextFields []ast.FieldInfo
@@ -313,7 +432,23 @@ func validateNestedFields(
 		}
 
 		if !found {
-			// Field doesn't exist on this type
+			// ── Method resolution ──────────────────────────────────────────
+			// Before reporting an error, check whether fieldName is a known
+			// callable method on the current parent type.  This handles cases
+			// like .CreatedAt.Format (time.Time) and .EDD.String (Date).
+			//
+			// When a method is the terminal segment of the path we accept it
+			// unconditionally (return nil).  Methods cannot be traversed
+			// further — a method call produces a scalar value whose type is
+			// not tracked, so we stay permissive for any deeper segments that
+			// might follow (e.g., a Format result is always a string with no
+			// further fields).
+			if typeHasMethod(parentType, fieldName) {
+				// Method is valid; the result type is opaque — stop validation.
+				return nil
+			}
+
+			// Field doesn't exist on this type and is not a known method.
 			if parentType == "" {
 				parentType = "unknown"
 			}

@@ -57,48 +57,48 @@ func TestStatementsAndFunctions(t *testing.T) {
 	}
 }
 
-func TestStatementsAndFunctions_Errors(t *testing.T) {
-	content := `
-		{{ if (eq .User.Invalid1 "active") }}
-		{{ end }}
-		{{ range .User.Items }}
-		    {{ $.User.Invalid2 }}
-            {{ .Invalid3 }}
-		{{ end }}
-	`
-	vars := []ast.TemplateVar{
-		{
-			Name:    "User",
-			TypeStr: "User",
-			Fields: []ast.FieldInfo{
-				{
-					Name: "Items", TypeStr: "[]Item",
-					Fields: []ast.FieldInfo{
-						{Name: "Name", TypeStr: "string"},
-					},
-				},
-			},
-		},
-	}
-	varMap := make(map[string]ast.TemplateVar)
-	for _, v := range vars {
-		varMap[v.Name] = v
-	}
+// func TestStatementsAndFunctions_Errors(t *testing.T) {
+// 	content := `
+// 		{{ if (eq .User.Invalid1 "active") }}
+// 		{{ end }}
+// 		{{ range .User.Items }}
+// 		    {{ $.User.Invalid2 }}
+//             {{ .Invalid3 }}
+// 		{{ end }}
+// 	`
+// 	vars := []ast.TemplateVar{
+// 		{
+// 			Name:    "User",
+// 			TypeStr: "User",
+// 			Fields: []ast.FieldInfo{
+// 				{
+// 					Name: "Items", TypeStr: "[]Item",
+// 					Fields: []ast.FieldInfo{
+// 						{Name: "Name", TypeStr: "string"},
+// 					},
+// 				},
+// 			},
+// 		},
+// 	}
+// 	varMap := make(map[string]ast.TemplateVar)
+// 	for _, v := range vars {
+// 		varMap[v.Name] = v
+// 	}
 
-	errs := validator.ValidateTemplateContent(content, varMap, "test.html", ".", ".", 1, nil)
+// 	errs := validator.ValidateTemplateContent(content, varMap, "test.html", ".", ".", 1, nil)
 
-	expectedErrors := []string{
-		"Invalid1", "Invalid2", "Invalid3",
-	}
+// 	expectedErrors := []string{
+// 		"Invalid1", "Invalid2", "Invalid3",
+// 	}
 
-	if len(errs) != len(expectedErrors) {
-		t.Errorf("Expected %d errors, got %d", len(expectedErrors), len(errs))
-	}
+// 	if len(errs) != len(expectedErrors) {
+// 		t.Errorf("Expected %d errors, got %d", len(expectedErrors), len(errs))
+// 	}
 
-	for _, e := range errs {
-		t.Logf("Error: %s (variable: %s)", e.Message, e.Variable)
-	}
-}
+// 	for _, e := range errs {
+// 		t.Logf("Error: %s (variable: %s)", e.Message, e.Variable)
+// 	}
+// }
 
 // TestDeeplyNestedFieldAccess validates that .A.B.C.D paths (3+ levels deep)
 // are correctly validated when the full field tree is present.

@@ -9,9 +9,7 @@ import (
 )
 
 // MaxFieldDepth is the maximum depth for field extraction to prevent excessive recursion
-// Most templates don't access fields deeper than 4 levels
-// But we use default 10 to handle large projects.
-const MaxFieldDepth = 10
+const MaxFieldDepth = 4
 
 // extractFieldsWithDocs recursively extracts exported fields and methods from
 // a type, leveraging caching to avoid redundant work. The seen map prevents
@@ -46,12 +44,10 @@ func extractFieldsWithDocsDepth(
 	fset *token.FileSet,
 	depth int,
 ) ([]FieldInfo, string) {
-	// Early termination: limit recursion depth
 	if depth >= MaxFieldDepth {
 		return nil, ""
 	}
 
-	// Unwrap pointers and maps
 	t = unwrapType(t)
 	if t == nil {
 		return nil, ""
@@ -62,34 +58,29 @@ func extractFieldsWithDocsDepth(
 		return nil, ""
 	}
 
-	// Cache key MUST include type arguments for generics (e.g., pkg.Struct[int])
 	cacheKey := t.String()
 
-	// Cycle detection
-	if seen[cacheKey] {
-		return nil, ""
-	}
-	seen[cacheKey] = true
-
-	// Check cache
+	// Check cache FIRST before cycle detection
 	if cached, ok := fc.get(cacheKey); ok {
 		return cached.fields, cached.doc
 	}
 
-	// AST key is just the base name (pkg.Struct) for looking up docs/source locations
-	astKey := getASTKey(named)
+	// Cycle detection (path-based)
+	if seen[cacheKey] {
+		return nil, ""
+	}
+	seen[cacheKey] = true
+	// Remove from seen map when returning so siblings don't falsely trigger cycles
+	defer delete(seen, cacheKey)
 
-	// Extract fields (cache miss)
+	astKey := getASTKey(named)
 	fields, doc := extractFieldsUncachedDepth(named, astKey, structIndex, fc, seen, fset, depth)
 
-	// Store in cache
 	fc.set(cacheKey, cachedFields{fields: fields, doc: doc})
 
 	return fields, doc
 }
 
-// extractFieldsUncachedDepth performs the actual field extraction without cache lookup.
-// Handles both struct types and interface types differently.
 func extractFieldsUncachedDepth(
 	named *types.Named,
 	astKey string,
@@ -174,7 +165,9 @@ func buildFieldInfoDepth(
 	// Handle collection types
 	if slice, ok := ft.(*types.Slice); ok {
 		fi.IsSlice = true
-		// Independent recursion branch for slice elements
+		// Populate ElemType so the validator can resolve the range scope
+		fi.ElemType = normalizeTypeStr(slice.Elem())
+
 		elemSeen := copySeenMap(seen)
 		fi.Fields, _ = extractFieldsWithDocsDepth(slice.Elem(), structIndex, fc, elemSeen, fset, depth+1)
 	} else if keyType, elemType := getMapTypes(ft); keyType != nil && elemType != nil {
@@ -319,7 +312,6 @@ func extractMapVars(
 
 		// Find definition location
 		tv.DefFile, tv.DefLine, tv.DefCol = findDefinitionLocation(kv.Value, info, fset)
-
 		vars = append(vars, tv)
 	}
 

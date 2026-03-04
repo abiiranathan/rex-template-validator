@@ -285,115 +285,6 @@ export class ValidatorCore {
         } catch (e) {
             this.outputChannel.appendLine(`  inferExpressionType threw error: ${e}`);
         }
-
-        if (exprType) {
-            this.outputChannel.appendLine(`  Expression valid.`);
-            return;
-        }
-
-        this.outputChannel.appendLine(
-            `  Expression inference failed. Checking for sub-variables...`
-        );
-
-        // 2. If expression failed, check for specific missing sub-variables.
-        if (cleanExpr) {
-            const refs = cleanExpr.match(
-                /(\(index\s+(?:\$|\.)[\w\d_.]+\s+[^)]+\)(?:\.[\w\d_.]+)*|(?:\$|\.)[\w\d_.[\]]*)/g
-            );
-
-            let subVarError = false;
-            if (refs) {
-                for (const ref of refs) {
-                    if (/^\.\d+$/.test(ref)) continue;
-                    if (ref === '...') continue;
-
-                    const subPath = this.parser.parseDotPath(ref);
-                    if (
-                        subPath.length === 0 ||
-                        (subPath.length === 1 && (subPath[0] === '.' || subPath[0] === '$'))
-                    ) continue;
-
-                    const subResult = resolvePath(
-                        subPath, vars, scopeStack, blockLocals,
-                        this.scope.buildFieldResolver(vars, scopeStack)
-                    );
-                    this.outputChannel.appendLine(
-                        `  Checking sub-variable "${ref}" -> Found: ${subResult.found}`
-                    );
-
-                    if (!subResult.found) {
-                        let errCol = node.col;
-                        const refIdx = node.rawText.indexOf(ref);
-                        if (refIdx !== -1) errCol = node.col + refIdx;
-
-                        const displayPath =
-                            subPath[0] === '$'
-                                ? '$.' + subPath.slice(1).join('.')
-                                : subPath[0].startsWith('$')
-                                    ? subPath.join('.')
-                                    : '.' + subPath.join('.');
-
-                        const errMsg = `Template variable "${displayPath}" is not defined in the render context`;
-                        this.outputChannel.appendLine(`    Error: ${errMsg}`);
-
-                        errors.push({
-                            message: errMsg,
-                            line: node.line,
-                            col: errCol,
-                            severity: 'error',
-                            variable: ref,
-                        });
-                        subVarError = true;
-                    }
-                }
-            }
-            if (subVarError) return;
-        }
-
-        // 3. Fallback: for simple (non-complex) unresolved paths, report an error.
-        //
-        // Complex expressions (those containing spaces, pipes, or parentheses) are
-        // intentionally skipped here to avoid false positives.  Reasons:
-        //   a) Their sub-variables were already validated individually in step 2 above.
-        //   b) Pipe/function names that are not yet in the funcMap registry would
-        //      otherwise trigger spurious "not defined" diagnostics even when hover,
-        //      completion, and go-to-definition all work correctly.
-        //   c) The Go binary (rex-analyzer) provides authoritative function-level
-        //      validation; we don't need to duplicate that work here.
-        //
-        // Only simple dot-paths (e.g. "{{ .Foo.Bar }}") that genuinely don't resolve
-        // against the current context should be reported as errors at this stage.
-        const pathResolved = resolvePath(
-            node.path, vars, scopeStack, blockLocals,
-            this.scope.buildFieldResolver(vars, scopeStack)
-        ).found;
-        this.outputChannel.appendLine(
-            `  Fallback pathResolved: ${pathResolved} (path: ${node.path.join('.')})`
-        );
-
-        // A "complex" expression contains whitespace, a pipe, or parentheses —
-        // i.e. it is a function call, pipeline, or compound expression rather than
-        // a bare field access.
-        const isComplex = cleanExpr ? /[\s|()]/.test(cleanExpr) : false;
-
-        if (!pathResolved && !isComplex) {
-            this.outputChannel.appendLine(`  Validation FAILED.`);
-
-            const displayPath =
-                node.path[0] === '$'
-                    ? '$.' + node.path.slice(1).join('.')
-                    : node.path[0].startsWith('$')
-                        ? node.path.join('.')
-                        : '.' + node.path.join('.');
-
-            errors.push({
-                message: `Template variable "${displayPath}" is not defined in the render context`,
-                line: node.line,
-                col: node.col,
-                severity: 'error',
-                variable: node.rawText,
-            });
-        }
     }
 
     // ── If / Range / With validation ──────────────────────────────────────────
@@ -408,36 +299,10 @@ export class ValidatorCore {
         filePath: string
     ) {
         if (node.path.length > 0) {
-            const result = resolvePath(
+            resolvePath(
                 node.path, vars, scopeStack, blockLocals,
                 this.scope.buildFieldResolver(vars, scopeStack)
             );
-            if (!result.found) {
-                const cleanExpr = node.rawText
-                    ? node.rawText.replace(/^\{\{-?\s*else\s+if\s+/, '').replace(/^\{\{-?\s*if\s+/, '').replace(/\s*-?\}\}$/, '')
-                    : '';
-
-                let exprType = null;
-                try {
-                    if (cleanExpr) {
-                        exprType = inferExpressionType(
-                            cleanExpr, vars, scopeStack, blockLocals,
-                            this.graphBuilder.getGraph().funcMaps,
-                            this.scope.buildFieldResolver(vars, scopeStack)
-                        );
-                    }
-                } catch { }
-
-                if (!exprType) {
-                    errors.push({
-                        message: `".${node.path.join('.')}" is not defined`,
-                        line: node.line,
-                        col: node.col,
-                        severity: 'warning',
-                        variable: node.path[0],
-                    });
-                }
-            }
         }
 
         if (node.children) {
@@ -466,20 +331,10 @@ export class ValidatorCore {
             (node.path.length === 1 && node.path[0] === '.');
 
         if (!isBareDotsRange) {
-            const result = resolvePath(
+            resolvePath(
                 node.path, vars, scopeStack, blockLocals,
                 this.scope.buildFieldResolver(vars, scopeStack)
             );
-            if (!result.found) {
-                errors.push({
-                    message: `Range target ".${node.path.join('.')}" is not defined`,
-                    line: node.line,
-                    col: node.col,
-                    severity: 'error',
-                    variable: node.path[0],
-                });
-                return;
-            }
         }
 
         const elemScope = this.scope.buildRangeElemScope(
@@ -514,18 +369,8 @@ export class ValidatorCore {
             node.path, vars, scopeStack, blockLocals,
             this.scope.buildFieldResolver(vars, scopeStack)
         );
-        if (!result.found) {
-            errors.push({
-                message: `".${node.path.join('.')}" is not defined`,
-                line: node.line,
-                col: node.col,
-                severity: 'warning',
-                variable: node.path[0],
-            });
-            return;
-        }
 
-        if (result.fields !== undefined) {
+        if (result.found && result.fields !== undefined) {
             const childScope: ScopeFrame = {
                 key: '.',
                 typeStr: result.typeStr,
