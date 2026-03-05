@@ -202,13 +202,6 @@ export async function activate(context: vscode.ExtensionContext) {
   // ── Initial build ──────────────────────────────────────────────────────────
 
   await rebuildIndex(workspaceRoot);
-
-  for (const doc of vscode.workspace.textDocuments) {
-    if (isTemplate(doc)) {
-      await validateDocument(doc);
-    }
-  }
-
   outputChannel.appendLine('[Rex] Ready');
 }
 
@@ -303,11 +296,8 @@ async function rebuildIndex(workspaceRoot: string) {
     // Surface named-block duplicate errors
     applyNamedBlockDiagnostics();
 
-    for (const doc of vscode.workspace.textDocuments) {
-      if (isTemplate(doc)) {
-        await validateDocument(doc);
-      }
-    }
+    // Validate all workspace templates.
+    await validateAllKnownTemplates();
   } catch (err) {
     outputChannel.appendLine(`[Rex] Rebuild failed: ${err}`);
     statusBarItem.text = '$(error) Rex: Analysis failed';
@@ -516,17 +506,36 @@ function scheduleRebuild(workspaceRoot: string) {
   rebuildTimer = setTimeout(() => rebuildIndex(workspaceRoot), debounceMs * 2);
 }
 
+async function validateAllKnownTemplates() {
+  if (!currentGraph || !validator || !graphBuilder) return;
+
+  const allPaths = new Set<string>();
+  for (const [, ctx] of currentGraph.templates) {
+    if (ctx.absolutePath) allPaths.add(ctx.absolutePath);
+  }
+
+  outputChannel.appendLine(`[Rex] Validating ${allPaths.size} template(s)...`);
+
+  for (const filePath of allPaths) {
+    try {
+      const doc =
+        vscode.workspace.textDocuments.find(d => d.uri.fsPath === filePath) ??
+        (await vscode.workspace.openTextDocument(filePath));
+
+      await validateDocument(doc);
+    } catch {
+      // file deleted between index build and now
+    }
+  }
+}
+
 function scheduleValidateAllOpenTemplates() {
   const config = vscode.workspace.getConfiguration('rex-analyzer');
   const debounceMs = config.get<number>('debounceMs') ?? 1500;
 
   if (validateAllTimer) clearTimeout(validateAllTimer);
-  validateAllTimer = setTimeout(() => {
-    for (const doc of vscode.workspace.textDocuments) {
-      if (isTemplate(doc)) {
-        validateDocument(doc);
-      }
-    }
+  validateAllTimer = setTimeout(async () => {
+    await validateAllKnownTemplates()
   }, debounceMs);
 }
 

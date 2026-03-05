@@ -128,6 +128,11 @@ func extractStructFieldsDepth(
 
 		fi := buildFieldInfoDepth(field, entry, structIndex, fc, seen, fset, depth)
 		fields = append(fields, fi)
+
+		// Add fields for embedded structs
+		if field.Embedded() {
+			fields = append(fields, fi.Fields...)
+		}
 	}
 
 	return fields
