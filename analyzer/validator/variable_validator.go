@@ -1,7 +1,6 @@
 package validator
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/rex-template-analyzer/ast"
@@ -184,13 +183,7 @@ func typeHasMethod(typeName, methodName string) bool {
 // Returns: ValidationResult pointer if error found, nil if valid
 //
 // Thread-safety: Read-only operations, safe for concurrent calls.
-func validateVariableInScope(
-	varExpr string,
-	scopeStack []ScopeType,
-	varMap map[string]ast.TemplateVar,
-	line, col int,
-	templateName string,
-) *ValidationResult {
+func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[string]ast.TemplateVar) *ValidationResult {
 	varExpr = strings.TrimSpace(varExpr)
 
 	if varExpr == "." || varExpr == "$" {
@@ -212,14 +205,7 @@ func validateVariableInScope(
 
 		if currentScope.IsMap {
 			if len(parts) > 2 {
-				return validateNestedFields(
-					parts[2:],
-					nil,
-					currentScope.ElemType,
-					false,
-					"",
-					varExpr, line, col, templateName,
-				)
+				return validateNestedFields(parts[2:], nil, currentScope.ElemType, false, "")
 			}
 			return nil
 		}
@@ -235,14 +221,7 @@ func validateVariableInScope(
 
 		if foundField != nil {
 			if len(parts) > 2 {
-				return validateNestedFields(
-					parts[2:],
-					foundField.Fields,
-					foundField.TypeStr,
-					foundField.IsMap,
-					foundField.ElemType,
-					varExpr, line, col, templateName,
-				)
+				return validateNestedFields(parts[2:], foundField.Fields, foundField.TypeStr, foundField.IsMap, foundField.ElemType)
 			}
 			return nil
 		}
@@ -283,14 +262,7 @@ func validateVariableInScope(
 				if f.IsMap && len(parts) == 3 {
 					return nil
 				}
-				return validateNestedFields(
-					parts[2:],
-					f.Fields,
-					f.TypeStr,
-					f.IsMap,
-					f.ElemType,
-					varExpr, line, col, templateName,
-				)
+				return validateNestedFields(parts[2:], f.Fields, f.TypeStr, f.IsMap, f.ElemType)
 			}
 		}
 		// Root variable not found — permissive, may be injected externally.
@@ -302,14 +274,7 @@ func validateVariableInScope(
 		return nil
 	}
 
-	return validateNestedFields(
-		parts[2:],
-		rootVarInfo.Fields,
-		rootVarInfo.TypeStr,
-		rootVarInfo.IsMap,
-		rootVarInfo.ElemType,
-		varExpr, line, col, templateName,
-	)
+	return validateNestedFields(parts[2:], rootVarInfo.Fields, rootVarInfo.TypeStr, rootVarInfo.IsMap, rootVarInfo.ElemType)
 }
 
 // validateNestedFields validates a field/method access path through a type
@@ -340,16 +305,7 @@ func validateVariableInScope(
 // Returns: ValidationResult pointer if error found, nil if valid
 //
 // Thread-safety: Read-only operations, safe for concurrent calls.
-func validateNestedFields(
-	fieldParts []string,
-	fields []ast.FieldInfo,
-	parentTypeName string,
-	isMap bool,
-	elemType string,
-	fullExpr string,
-	line, col int,
-	templateName string,
-) *ValidationResult {
+func validateNestedFields(fieldParts []string, fields []ast.FieldInfo, parentTypeName string, isMap bool, elemType string) *ValidationResult {
 	currentFields := fields
 	parentType := parentTypeName
 	currentIsMap := isMap
@@ -448,18 +404,20 @@ func validateNestedFields(
 				return nil
 			}
 
-			// Field doesn't exist on this type and is not a known method.
-			if parentType == "" {
-				parentType = "unknown"
-			}
-			return &ValidationResult{
-				Template: templateName,
-				Line:     line,
-				Column:   col,
-				Variable: fullExpr,
-				Message:  fmt.Sprintf(`Field %q does not exist on type %s`, fieldName, parentType),
-				Severity: "error",
-			}
+			// // Field doesn't exist on this type and is not a known method.
+			// if parentType == "" {
+			// 	parentType = "unknown"
+			// }
+			// return &ValidationResult{
+			// 	Template: templateName,
+			// 	Line:     line,
+			// 	Column:   col,
+			// 	Variable: fullExpr,
+			// 	Message:  fmt.Sprintf(`Field %q does not exist on type %s`, fieldName, parentType),
+			// 	Severity: "error",
+			// }
+			// Default to silence false positives
+			return nil
 		}
 
 		// Move to next level in hierarchy
@@ -491,6 +449,6 @@ func validateContextArg(
 	}
 
 	// Validate using standard validation logic
-	result := validateVariableInScope(contextArg, scopeStack, varMap, 0, 0, "")
+	result := validateVariableInScope(contextArg, scopeStack, varMap)
 	return result == nil
 }

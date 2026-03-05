@@ -1,3 +1,4 @@
+// src/templateParser.ts
 import { FieldInfo, ScopeFrame, TemplateNode, TemplateVar, ParamInfo } from './types';
 
 /**
@@ -449,6 +450,70 @@ function cleanFields(fields?: FieldInfo[]): FieldInfo[] | undefined {
     return fields && fields.length > 0 ? fields : undefined;
 }
 
+function unwrapField(
+    field: FieldInfo,
+    fieldResolver?: (typeStr: string) => FieldInfo[] | undefined
+): FieldInfo {
+    let retType = '';
+    if (field.type === 'method' && field.returns && field.returns.length > 0) {
+        retType = field.returns[0].type;
+    } else if (field.type.startsWith('func(')) {
+        const match = field.type.match(/func\([^)]*\)\s*(.+)/);
+        if (match && match[1]) {
+            retType = match[1].trim();
+            if (retType.startsWith('(')) {
+                const commaIdx = retType.indexOf(',');
+                const endIdx = retType.indexOf(')');
+                const cutIdx = commaIdx !== -1 ? commaIdx : endIdx;
+                retType = retType.slice(1, cutIdx).trim();
+            }
+        }
+    }
+
+    if (retType) {
+        if (retType.startsWith('*')) retType = retType.substring(1);
+        return {
+            ...field,
+            type: retType,
+            isSlice: retType.startsWith('[]'),
+            isMap: retType.startsWith('map['),
+            fields: fieldResolver ? fieldResolver(retType) || [] : []
+        };
+    }
+    return field;
+}
+
+function unwrapVar(
+    v: TemplateVar,
+    fieldResolver?: (typeStr: string) => FieldInfo[] | undefined
+): TemplateVar {
+    let retType = '';
+    if (v.type.startsWith('func(')) {
+        const match = v.type.match(/func\([^)]*\)\s*(.+)/);
+        if (match && match[1]) {
+            retType = match[1].trim();
+            if (retType.startsWith('(')) {
+                const commaIdx = retType.indexOf(',');
+                const endIdx = retType.indexOf(')');
+                const cutIdx = commaIdx !== -1 ? commaIdx : endIdx;
+                retType = retType.slice(1, cutIdx).trim();
+            }
+        }
+    }
+
+    if (retType) {
+        if (retType.startsWith('*')) retType = retType.substring(1);
+        return {
+            ...v,
+            type: retType,
+            isSlice: retType.startsWith('[]'),
+            isMap: retType.startsWith('map['),
+            fields: fieldResolver ? fieldResolver(retType) || [] : []
+        };
+    }
+    return v;
+}
+
 /**
  * Resolve a dot-path against the current variable context and scope stack.
  */
@@ -501,6 +566,7 @@ export function resolvePath(
             }
         }
         if (local) {
+            local = unwrapVar(local, fieldResolver);
             const info = extractTypeInfo(local.type, local.isSlice, local.isMap, local.elemType);
             if (path.length === 1) {
                 return {
@@ -557,9 +623,10 @@ export function resolvePath(
     // Root-anchored path "$." → resolve against root vars, bypassing scope stack
     if (path[0] === '$') {
         const remaining = path.slice(1);
-        const topVar = vars.get(remaining[0]);
+        let topVar = vars.get(remaining[0]);
         if (!topVar) return { typeStr: 'unknown', found: false };
 
+        topVar = unwrapVar(topVar, fieldResolver);
         const info = extractTypeInfo(topVar.type, topVar.isSlice, topVar.isMap, topVar.elemType);
 
         if (remaining.length === 1) {
@@ -602,8 +669,9 @@ export function resolvePath(
         // Fallback for isolated block validation:
         const f = getFields(dotFrame.typeStr, dotFrame.fields);
         if (f.length === 0) {
-            const topVar = vars.get(path[0]);
+            let topVar = vars.get(path[0]);
             if (topVar) {
+                topVar = unwrapVar(topVar, fieldResolver);
                 const info = extractTypeInfo(topVar.type, topVar.isSlice, topVar.isMap, topVar.elemType);
                 if (path.length === 1) {
                     return {
@@ -634,11 +702,12 @@ export function resolvePath(
     }
 
     // Root scope: resolve against top-level vars
-    const topVar = vars.get(path[0]);
+    let topVar = vars.get(path[0]);
     if (!topVar) {
         return { typeStr: 'unknown', found: false };
     }
 
+    topVar = unwrapVar(topVar, fieldResolver);
     const info = extractTypeInfo(topVar.type, topVar.isSlice, topVar.isMap, topVar.elemType);
 
     if (path.length === 1) {
@@ -756,36 +825,38 @@ function resolveFieldsDeep(
         return { typeStr: 'unknown', found: false };
     }
 
+    const currentField = unwrapField(field, fieldResolver);
+
     if (tail.length > 0) {
-        let nextFields = field.fields ?? [];
-        if (nextFields.length === 0 && field.type && fieldResolver) {
-            let bare = field.type.startsWith('*') ? field.type.slice(1) : field.type;
+        let nextFields = currentField.fields ?? [];
+        if (nextFields.length === 0 && currentField.type && fieldResolver) {
+            let bare = currentField.type.startsWith('*') ? currentField.type.slice(1) : currentField.type;
             if (bare.startsWith('[]')) bare = bare.slice(2);
             if (bare.startsWith('map[')) bare = bare.slice(bare.indexOf(']') + 1);
             nextFields = fieldResolver(bare) || [];
         }
 
-        if (field.isMap) {
-            return resolveFields(tail, nextFields, true, field.elemType, false, fieldResolver);
+        if (currentField.isMap) {
+            return resolveFields(tail, nextFields, true, currentField.elemType, false, fieldResolver);
         }
         return resolveFieldsDeep(tail, nextFields, fieldResolver);
     }
 
-    const info = extractTypeInfo(field.type, field.isSlice, field.isMap, field.elemType);
+    const info = extractTypeInfo(currentField.type, currentField.isSlice, currentField.isMap, currentField.elemType);
 
     return {
-        typeStr: field.type,
+        typeStr: currentField.type,
         found: true,
-        fields: cleanFields(field.fields),
+        fields: cleanFields(currentField.fields),
         isSlice: info.isSlice,
         isMap: info.isMap,
         elemType: info.elemType,
-        keyType: field.keyType,
-        params: field.params,
-        returns: field.returns,
-        defFile: field.defFile,
-        defLine: field.defLine,
-        defCol: field.defCol,
-        doc: field.doc,
+        keyType: currentField.keyType,
+        params: currentField.params,
+        returns: currentField.returns,
+        defFile: currentField.defFile,
+        defLine: currentField.defLine,
+        defCol: currentField.defCol,
+        doc: currentField.doc,
     };
 }

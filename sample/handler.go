@@ -73,6 +73,10 @@ type Management struct {
 	Prescription Prescription
 }
 
+func (m Management) AsPresc() Prescription {
+	return m.Prescription
+}
+
 // Handler holds service dependencies
 type Handler struct{}
 

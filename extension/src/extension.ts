@@ -112,7 +112,7 @@ export async function activate(context: vscode.ExtensionContext) {
           return await validator.getCompletionItems(document, position, ctx);
         },
       },
-      '.', '$'
+      '.', '$', '"'
     )
   );
 
@@ -272,6 +272,13 @@ async function rebuildIndex(workspaceRoot: string) {
       if (isNotFoundMsg && extensionMissingTemplateLogicalPaths.has(analyzerErr.template)) {
         continue;
       }
+
+      // Filter out known Go analyzer false positives for method chaining
+      if (analyzerErr.message.includes('does not exist on type method') ||
+        analyzerErr.message.includes('does not exist on type func')) {
+        continue;
+      }
+
       finalValidationErrors.push(analyzerErr);
     }
     finalValidationErrors.push(...extensionGeneratedErrors);
@@ -331,7 +338,7 @@ function applyNamedBlockDiagnostics() {
       diag.source = 'Rex';
       diag.code = 'duplicate-named-block';
 
-      // Add related information pointing to all other declarations
+      // Add related information pointing to all declarations
       diag.relatedInformation = err.entries
         .filter(e => e !== entry)
         .map(

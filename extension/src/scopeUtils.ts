@@ -924,7 +924,9 @@ export class ScopeUtils {
         }
 
         return (typeStr: string) => {
-            const bare = typeStr.startsWith('*') ? typeStr.slice(1) : typeStr;
+            let bare = typeStr.startsWith('*') ? typeStr.slice(1) : typeStr;
+            if (bare.startsWith('[]')) bare = bare.slice(2);
+            else if (bare.startsWith('map[')) bare = bare.slice(bare.indexOf(']') + 1);
             return typeIndex.get(bare);
         };
     }

@@ -184,14 +184,7 @@ func ValidateTemplateContent(
 		// ── Validate variables in action ────────────────────────────────
 		// Extract and validate all variable references in this action.
 		extractVariablesFromAction(action, func(v string) {
-			if err := validateVariableInScope(
-				v,
-				scopeStack,
-				varMap,
-				actualLineNum,
-				col,
-				templateName,
-			); err != nil {
+			if err := validateVariableInScope(v, scopeStack, varMap); err != nil {
 				errors = append(errors, *err)
 			}
 		})
