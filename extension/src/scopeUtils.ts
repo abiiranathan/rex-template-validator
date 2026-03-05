@@ -14,6 +14,7 @@ import {
     TemplateContext,
     TemplateNode,
     TemplateVar,
+    extractBareType,
 } from './types';
 import { TemplateParser, resolvePath } from './templateParser';
 import { KnowledgeGraphBuilder } from './knowledgeGraph';
@@ -174,16 +175,8 @@ export class ScopeUtils {
         const callCtx = this.findCallSiteContext(rootNodes, name, vars, []);
         if (callCtx) {
             return {
-                childVars: this.fieldsToVarMap(callCtx.fields ?? []),
-                childStack: [{
-                    key: '.',
-                    typeStr: callCtx.typeStr,
-                    fields: callCtx.fields ?? [],
-                    isMap: callCtx.isMap,
-                    keyType: callCtx.keyType,
-                    elemType: callCtx.elemType,
-                    isSlice: callCtx.isSlice,
-                }],
+                childVars: vars,   // root vars preserved for $ resolution
+                childStack: [{ key: '.', typeStr: callCtx.typeStr, fields: callCtx.fields ?? [] }],
             };
         }
 
@@ -221,23 +214,66 @@ export class ScopeUtils {
     }
 
     /**
-     * Builds a ScopeFrame representing the element type of a range target.
-     * Returns null when the range target cannot be resolved.
-     */
+   * Builds a ScopeFrame representing the element type of a range target.
+   * Tries expression inference first (handles index/funcMap expressions),
+   * then falls back to path resolution for simple field ranges.
+   * Returns null when the range target cannot be resolved.
+   */
     buildRangeElemScope(
         node: TemplateNode,
         vars: Map<string, TemplateVar>,
         scopeStack: ScopeFrame[],
         blockLocals?: Map<string, TemplateVar>
     ): ScopeFrame | null {
-        // Extract fieldResolver once so we can reuse it for element-type field hydration.
         const fieldResolver = this.buildFieldResolver(vars, scopeStack);
 
-        const result = resolvePath(
-            node.path, vars, scopeStack, blockLocals, fieldResolver
-        );
-        if (!result.found) return null;
+        // Primary: use expression inference when a full expression string is present.
+        // This correctly handles complex range targets like `(index $.paymentsMap $id)`
+        // where parseDotPath reduces the expression to just the collection path,
+        // losing the index call and returning the map type instead of its value type.
+        if (node.assignExpr) {
+            try {
+                const exprType = inferExpressionType(
+                    node.assignExpr,
+                    vars,
+                    scopeStack,
+                    blockLocals,
+                    this.graphBuilder.getGraph().funcMaps,
+                    fieldResolver,
+                );
+                if (exprType && (exprType.isSlice || exprType.isMap)) {
+                    return this.buildRangeElemScopeFromType(
+                        node, exprType, vars, scopeStack, fieldResolver
+                    );
+                }
+            } catch { /* fall through to path-based resolution */ }
+        }
 
+        // Fallback: resolve via the pre-parsed dot-path (covers simple `.Field` ranges).
+        const result = resolvePath(node.path, vars, scopeStack, blockLocals, fieldResolver);
+        if (!result.found) return null;
+        return this.buildRangeElemScopeFromType(node, result, vars, scopeStack, fieldResolver);
+    }
+
+    /**
+     * Constructs a ScopeFrame from an already-resolved collection type.
+     * Shared by both the expression-inference and path-resolution paths of
+     * buildRangeElemScope.
+     */
+    private buildRangeElemScopeFromType(
+        node: TemplateNode,
+        result: {
+            typeStr: string;
+            isSlice?: boolean;
+            isMap?: boolean;
+            elemType?: string;
+            keyType?: string;
+            fields?: FieldInfo[];
+        },
+        vars: Map<string, TemplateVar>,
+        scopeStack: ScopeFrame[],
+        fieldResolver: (typeStr: string) => FieldInfo[] | undefined,
+    ): ScopeFrame | null {
         let sourceVar: TemplateVar | undefined = vars.get(node.path[0]);
         if (!sourceVar) {
             const df = scopeStack.slice().reverse().find(f => f.key === '.');
@@ -246,17 +282,12 @@ export class ScopeUtils {
         }
 
         // Strip a leading pointer sigil before inspecting the type shape.
-        // Without this, `*[]MgtHints` fails the `startsWith('[]')` check and the
-        // full pointer-to-slice type leaks into the range scope as `.`, meaning
-        // every field access inside the loop resolves to `unknown`.
         const rawTypeStr = result.typeStr.startsWith('*')
             ? result.typeStr.slice(1)
             : result.typeStr;
 
-        // Prefer the explicitly-computed elemType (set by extractTypeInfo and
-        // propagated through resolvePath) over re-deriving it from the raw string.
-        // This is more reliable for aliased / nested generic types.
-        const elemTypeStr =
+        // Prefer the explicitly-computed elemType over re-deriving from the raw string.
+        let elemTypeStr =
             result.isSlice && result.elemType
                 ? result.elemType
                 : result.isSlice && rawTypeStr.startsWith('[]')
@@ -264,6 +295,11 @@ export class ScopeUtils {
                     : result.isMap && result.elemType
                         ? result.elemType
                         : rawTypeStr;
+
+        // Strip pointer — Go templates auto-dereference.
+        // Without this, ranging over []*Payment gives typeStr '*Payment' in the scope
+        // frame, breaking all field lookups inside the loop body.
+        while (elemTypeStr.startsWith('*')) elemTypeStr = elemTypeStr.slice(1);
 
         let isElemSlice = false;
         let isElemMap = false;
@@ -273,6 +309,8 @@ export class ScopeUtils {
         if (elemTypeStr.startsWith('[]')) {
             isElemSlice = true;
             elemInnerType = elemTypeStr.slice(2);
+            // Strip pointer from the slice's own element type.
+            while (elemInnerType.startsWith('*')) elemInnerType = elemInnerType.slice(1);
         } else if (elemTypeStr.startsWith('map[')) {
             isElemMap = true;
             let depth = 0;
@@ -287,13 +325,11 @@ export class ScopeUtils {
             if (splitIdx !== -1) {
                 elemKeyType = elemTypeStr.slice(4, splitIdx).trim();
                 elemInnerType = elemTypeStr.slice(splitIdx + 1).trim();
+                // Strip pointer from map value type.
+                while (elemInnerType.startsWith('*')) elemInnerType = elemInnerType.slice(1);
             }
         }
 
-        // Field hydration: result.fields is often undefined when the iterable came
-        // from a funcMap call (funcMap entries carry no inline field metadata).
-        // Fall back to the field resolver so struct types like MgtHints are
-        // explorable via hover / completion / definition even in that case.
         const elemFields: FieldInfo[] =
             (result.fields && result.fields.length > 0)
                 ? result.fields
@@ -311,13 +347,12 @@ export class ScopeUtils {
             isSlice: isElemSlice,
         };
 
-
         if (node.keyVar || node.valVar) {
             elemScope.locals = new Map();
             if (node.keyVar && node.valVar) {
                 elemScope.locals.set(node.keyVar, {
                     name: node.keyVar,
-                    type: result.isMap ? (result.keyType ?? 'unknown') : 'int',
+                    type: result.isMap ? (result.keyType ?? 'unknown') : 'unknown',
                     isSlice: false,
                 });
                 elemScope.locals.set(node.valVar, {
@@ -433,7 +468,11 @@ export class ScopeUtils {
                     !(node.path.length === 1 && node.path[0] === '.' && !isExplicitContext)) ||
                 isExplicitContext;
 
-            if (result.found && isValidPath) {
+            // Do not apply the path-based fallback for 'index' or 'slice' calls: the
+            // extracted path refers to the *collection*, not the *element* the expression
+            // produces.  A wrong type here is worse than no type.
+            const isCollectionOp = /^\s*(?:index|slice)\s+/.test(node.assignExpr ?? '');
+            if (!isCollectionOp && result.found && isValidPath) {
                 resolvedType = result;
             }
         }
@@ -928,16 +967,22 @@ export class ScopeUtils {
         const typeIndex = new Map<string, FieldInfo[]>();
 
         const indexVar = (v: TemplateVar | FieldInfo) => {
-            const typeName = v.type.startsWith('*') ? v.type.slice(1) : v.type;
-            const bare = typeName.startsWith('[]')
-                ? typeName.slice(2)
-                : typeName.startsWith('map[')
-                    ? typeName.slice(typeName.indexOf(']') + 1)
-                    : typeName;
-
-            if (v.fields && v.fields.length > 0 && !typeIndex.has(bare)) {
-                typeIndex.set(bare, v.fields);
-                for (const f of v.fields) indexVar(f);
+            const bare = extractBareType(v.type);
+            if (bare && v.fields && v.fields.length > 0) {
+                const existing = typeIndex.get(bare);
+                if (existing) {
+                    // Merge fields to prevent collisions from hiding data in large projects
+                    const existingNames = new Set(existing.map(f => f.name));
+                    for (const f of v.fields) {
+                        if (!existingNames.has(f.name)) {
+                            existing.push(f);
+                            indexVar(f);
+                        }
+                    }
+                } else {
+                    typeIndex.set(bare, [...v.fields]);
+                    for (const f of v.fields) indexVar(f);
+                }
             }
         };
 
@@ -965,23 +1010,27 @@ export class ScopeUtils {
         for (const [, fn] of graph.funcMaps) {
             if (!fn.returnTypeFields || fn.returnTypeFields.length === 0) continue;
 
-            // Derive the bare element type from the return type string.
-            // e.g. '*[]MgtHints' → 'MgtHints'
             const retType = fn.returns?.[0]?.type ?? '';
-            let bare = retType.startsWith('*') ? retType.slice(1) : retType;
-            if (bare.startsWith('[]')) bare = bare.slice(2);
-            if (bare.startsWith('map[')) bare = bare.slice(bare.indexOf(']') + 1);
-
-            if (bare && !typeIndex.has(bare)) {
-                typeIndex.set(bare, fn.returnTypeFields);
-                for (const f of fn.returnTypeFields) indexVar(f);
+            const bare = extractBareType(retType);
+            if (bare) {
+                const existing = typeIndex.get(bare);
+                if (existing) {
+                    const existingNames = new Set(existing.map(f => f.name));
+                    for (const f of fn.returnTypeFields) {
+                        if (!existingNames.has(f.name)) {
+                            existing.push(f);
+                            indexVar(f);
+                        }
+                    }
+                } else {
+                    typeIndex.set(bare, [...fn.returnTypeFields]);
+                    for (const f of fn.returnTypeFields) indexVar(f);
+                }
             }
         }
 
         return (typeStr: string) => {
-            let bare = typeStr.startsWith('*') ? typeStr.slice(1) : typeStr;
-            if (bare.startsWith('[]')) bare = bare.slice(2);
-            else if (bare.startsWith('map[')) bare = bare.slice(bare.indexOf(']') + 1);
+            const bare = extractBareType(typeStr);
             return typeIndex.get(bare);
         };
     }

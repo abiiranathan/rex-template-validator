@@ -125,6 +125,14 @@ func (h *Handler) RenderTreatmentChart(inpatient bool) rex.HandlerFunc {
 			label = "OPD"
 		}
 
+		data := map[uint][]*User{
+			10: {
+				&User{
+					Name: "Nathan",
+				},
+			},
+		}
+
 		// Func Map
 		funcMap := template.FuncMap{
 			"getAuthUser": getAuthUser,
@@ -143,6 +151,7 @@ func (h *Handler) RenderTreatmentChart(inpatient bool) rex.HandlerFunc {
 			"visit":         visit,
 			"Title":         title,
 			"newuser":       newuser,
+			"data":          data,
 			"PathPrefix":    pathPrefix,
 			"billedDrugs":   billedDrugs,
 			"prescriptions": prescriptions,

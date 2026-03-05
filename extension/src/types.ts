@@ -217,3 +217,23 @@ export interface DefinitionLocation {
   /** 0-based column */
   col: number;
 }
+
+
+/**
+ * Extracts the bare type name by stripping pointer (*), slice ([]), 
+ * and map (map[K]) prefixes, as well as trimming whitespace.
+ */
+export function extractBareType(typeStr: string): string {
+  if (!typeStr) return '';
+  let bare = typeStr.trim();
+  while (true) {
+    if (bare.startsWith('*')) bare = bare.slice(1).trim();
+    else if (bare.startsWith('[]')) bare = bare.slice(2).trim();
+    else if (bare.startsWith('map[')) {
+      const idx = bare.indexOf(']');
+      if (idx !== -1) bare = bare.slice(idx + 1).trim();
+      else break;
+    } else break;
+  }
+  return bare;
+}

@@ -14,7 +14,7 @@
  * - Pipeline operations: value | func
  */
 
-import { FieldInfo, TemplateVar, ScopeFrame, FuncMapInfo, ParamInfo } from '../types';
+import { FieldInfo, TemplateVar, ScopeFrame, FuncMapInfo, ParamInfo, extractBareType } from '../types';
 
 // ── Token types ────────────────────────────────────────────────────────────
 
@@ -79,6 +79,14 @@ class Lexer {
         const saved = this.pos;
         const tok = this.next();
         this.pos = saved;
+        return tok;
+    }
+
+    peekNext(): Token {
+        const saved = this.pos;
+        this.next(); // skip current token
+        const tok = this.next(); // get next token
+        this.pos = saved; // restore position
         return tok;
     }
 
@@ -259,9 +267,11 @@ class ExpressionParser {
             const tok = this.lexer.peek();
 
             if (tok.type === 'DOT') {
+                const nextTok = this.lexer.peekNext();
+                if (nextTok.type !== 'IDENT') break;
+
                 this.lexer.next(); // consume '.'
-                const nameTok = this.lexer.next();
-                if (nameTok.type !== 'IDENT') break;
+                const nameTok = this.lexer.next(); // consume IDENT
 
                 const nextType = this.lexer.peek().type;
                 // Added 'DOLLAR' so variables ($var) are recognized as valid method arguments
@@ -378,9 +388,10 @@ class ExpressionParser {
 
         // Continue with additional .Field segments
         while (this.lexer.peek().type === 'DOT') {
-            this.lexer.next(); // consume '.'
-            if (this.lexer.peek().type === 'IDENT') {
-                const nameTok = this.lexer.next();
+            const next = this.lexer.peekNext();
+            if (next.type === 'IDENT') {
+                this.lexer.next(); // consume '.'
+                const nameTok = this.lexer.next(); // consume IDENT
                 path.push(nameTok.value);
             } else {
                 break;
@@ -509,13 +520,31 @@ export class TypeInferencer {
             && result.typeStr !== 'bool' && result.typeStr !== 'string'
             && result.typeStr !== 'int' && result.typeStr !== 'float64'
             && result.typeStr !== 'context') {
-            const bare = result.typeStr.startsWith('*')
-                ? result.typeStr.slice(1) : result.typeStr;
+
+            const bare = extractBareType(result.typeStr);
             const resolved = this.fieldResolver?.(bare);
             if (resolved) return { ...result, fields: resolved };
         }
 
         return result;
+    }
+
+    /**
+     * Extracts the value type from a map type string using bracket-balanced scanning.
+     * Handles nested maps like map[map[K]V]W correctly, where a naive indexOf(']')
+     * would grab the inner bracket and return a garbage value type.
+     * typeStr must already have its leading pointer stripped.
+     */
+    private extractMapValueType(typeStr: string): string {
+        let depth = 0;
+        for (let i = 4; i < typeStr.length; i++) {
+            if (typeStr[i] === '[') depth++;
+            else if (typeStr[i] === ']') {
+                if (depth === 0) return typeStr.slice(i + 1);
+                depth--;
+            }
+        }
+        return 'unkown';
     }
 
     private inferNodeTypeRaw(node: ExprNode): TypeResult | null {
@@ -673,10 +702,9 @@ export class TypeInferencer {
             // Handle standard methods
             if (field.type === 'method' && field.returns && field.returns.length > 0) {
                 let retType = field.returns[0].type;
-                if (retType.startsWith('*')) {
-                    retType = retType.substring(1);
-                }
-                const resolvedFields = this.fieldResolver?.(retType);
+                const bare = extractBareType(retType);
+
+                const resolvedFields = this.fieldResolver?.(bare);
                 resolvedField = {
                     ...field,
                     type: retType,
@@ -697,10 +725,10 @@ export class TypeInferencer {
                         const cutIdx = commaIdx !== -1 ? commaIdx : endIdx;
                         retType = retType.slice(1, cutIdx).trim();
                     }
-                    if (retType.startsWith('*')) {
-                        retType = retType.substring(1);
-                    }
-                    const resolvedFields = this.fieldResolver?.(retType);
+
+                    const bare = extractBareType(retType);
+
+                    const resolvedFields = this.fieldResolver?.(bare);
                     resolvedField = {
                         ...field,
                         type: retType,
@@ -738,12 +766,9 @@ export class TypeInferencer {
             const fn = this.funcMaps.get(func)!;
             if (fn.returns && fn.returns.length > 0) {
                 let retType = fn.returns[0].type;
+                const bare = extractBareType(retType);
 
-                if (retType.startsWith('*')) {
-                    retType = retType.substring(1);
-                }
-
-                const resolvedFields = this.fieldResolver?.(retType);
+                const resolvedFields = this.fieldResolver?.(bare);
                 return { typeStr: retType, fields: resolvedFields };
             }
         }
@@ -751,22 +776,65 @@ export class TypeInferencer {
         // 2. Fallback to built-in template functions and operators
         switch (func) {
             case 'index': {
-                // index collection key...
                 if (args.length < 2) return null;
                 const target = this.inferNodeType(args[0]);
                 if (!target) return null;
 
-                if (target.isMap && target.elemType) {
-                    return { typeStr: target.elemType, fields: target.fields };
+                // Strip pointer from the collection type before inspecting its shape.
+                let targetTypeStr = target.typeStr;
+                while (targetTypeStr.startsWith('*')) targetTypeStr = targetTypeStr.slice(1);
+
+                let elemTypeStr = '';
+                if (target.elemType) {
+                    elemTypeStr = target.elemType;
+                } else if (targetTypeStr.startsWith('[]')) {
+                    elemTypeStr = targetTypeStr.slice(2);
+                } else if (targetTypeStr.startsWith('map[')) {
+                    elemTypeStr = this.extractMapValueType(targetTypeStr);
                 }
-                if (target.isSlice && target.elemType) {
-                    return { typeStr: target.elemType, fields: target.fields };
+
+                if (!elemTypeStr) return null;
+
+                // Go templates auto-dereference pointers; strip so that downstream type
+                // lookups and field resolution always receive a bare struct name.
+                // e.g. map[uint][]*Payment → index → '[]*Payment' → elemType 'Payment'
+                while (elemTypeStr.startsWith('*')) elemTypeStr = elemTypeStr.slice(1);
+
+                const bareType = extractBareType(elemTypeStr);
+                let isSlice = false, isMap = false;
+                let nextElemType = '', nextKeyType = '';
+
+                if (elemTypeStr.startsWith('[]')) {
+                    isSlice = true;
+                    nextElemType = elemTypeStr.slice(2);
+                    // Strip pointer from the slice's own element type.
+                    while (nextElemType.startsWith('*')) nextElemType = nextElemType.slice(1);
+                } else if (elemTypeStr.startsWith('map[')) {
+                    isMap = true;
+                    let depth = 0, splitIdx = -1;
+                    for (let i = 4; i < elemTypeStr.length; i++) {
+                        if (elemTypeStr[i] === '[') depth++;
+                        else if (elemTypeStr[i] === ']') {
+                            if (depth === 0) { splitIdx = i; break; }
+                            depth--;
+                        }
+                    }
+                    if (splitIdx !== -1) {
+                        nextKeyType = elemTypeStr.slice(4, splitIdx);
+                        nextElemType = elemTypeStr.slice(splitIdx + 1);
+                        // Strip pointer from map value type.
+                        while (nextElemType.startsWith('*')) nextElemType = nextElemType.slice(1);
+                    }
                 }
-                // Array index
-                if (target.typeStr.startsWith('[]')) {
-                    return { typeStr: target.typeStr.slice(2), fields: target.fields };
-                }
-                return null;
+
+                return {
+                    typeStr: elemTypeStr,
+                    fields: this.fieldResolver?.(bareType),
+                    isSlice,
+                    isMap,
+                    elemType: nextElemType || undefined,
+                    keyType: nextKeyType || undefined,
+                };
             }
 
             case 'slice': {
@@ -857,10 +925,12 @@ export class TypeInferencer {
                             const cutIdx = commaIdx !== -1 ? commaIdx : endIdx;
                             retType = retType.slice(1, cutIdx).trim();
                         }
-                        if (retType.startsWith('*')) retType = retType.substring(1);
+
+                        const bare = extractBareType(retType);
+
                         return {
                             typeStr: retType,
-                            fields: this.fieldResolver?.(retType),
+                            fields: this.fieldResolver?.(bare),
                             isSlice: retType.startsWith('[]'),
                             isMap: retType.startsWith('map['),
                         };
@@ -924,12 +994,9 @@ export class TypeInferencer {
         // Check if returns has values
         if (methodField.returns && methodField.returns.length > 0) {
             let retType = methodField.returns[0].type;
+            const bare = extractBareType(retType);
 
-            if (retType.startsWith('*')) {
-                retType = retType.substring(1);
-            }
-
-            const resolvedFields = this.fieldResolver?.(retType);
+            const resolvedFields = this.fieldResolver?.(bare);
             return {
                 typeStr: retType,
                 fields: resolvedFields,
@@ -946,18 +1013,57 @@ export class TypeInferencer {
         const targetType = this.inferNodeType(target);
         if (!targetType) return null;
 
-        if (targetType.isMap && targetType.elemType) {
-            return { typeStr: targetType.elemType, fields: this.fieldResolver?.(targetType.elemType) };
-        }
-        if (targetType.isSlice && targetType.elemType) {
-            return { typeStr: targetType.elemType, fields: this.fieldResolver?.(targetType.elemType) };
-        }
-        if (targetType.typeStr.startsWith('[]')) {
-            const elemTypeStr = targetType.typeStr.slice(2);
-            return { typeStr: elemTypeStr, fields: this.fieldResolver?.(elemTypeStr) };
+        // Strip pointer from the collection type before inspecting its shape.
+        let targetTypeStr = targetType.typeStr;
+        while (targetTypeStr.startsWith('*')) targetTypeStr = targetTypeStr.slice(1);
+
+        let elemTypeStr = '';
+        if (targetType.elemType) {
+            elemTypeStr = targetType.elemType;
+        } else if (targetTypeStr.startsWith('[]')) {
+            elemTypeStr = targetTypeStr.slice(2);
+        } else if (targetTypeStr.startsWith('map[')) {
+            elemTypeStr = this.extractMapValueType(targetTypeStr);
         }
 
-        return null;
+        if (!elemTypeStr) return null;
+
+        // Go templates auto-dereference pointers.
+        while (elemTypeStr.startsWith('*')) elemTypeStr = elemTypeStr.slice(1);
+
+        const bareType = extractBareType(elemTypeStr);
+        let isSlice = false, isMap = false;
+        let nextElemType = '', nextKeyType = '';
+
+        if (elemTypeStr.startsWith('[]')) {
+            isSlice = true;
+            nextElemType = elemTypeStr.slice(2);
+            while (nextElemType.startsWith('*')) nextElemType = nextElemType.slice(1);
+        } else if (elemTypeStr.startsWith('map[')) {
+            isMap = true;
+            let depth = 0, splitIdx = -1;
+            for (let i = 4; i < elemTypeStr.length; i++) {
+                if (elemTypeStr[i] === '[') depth++;
+                else if (elemTypeStr[i] === ']') {
+                    if (depth === 0) { splitIdx = i; break; }
+                    depth--;
+                }
+            }
+            if (splitIdx !== -1) {
+                nextKeyType = elemTypeStr.slice(4, splitIdx);
+                nextElemType = elemTypeStr.slice(splitIdx + 1);
+                while (nextElemType.startsWith('*')) nextElemType = nextElemType.slice(1);
+            }
+        }
+
+        return {
+            typeStr: elemTypeStr,
+            fields: this.fieldResolver?.(bareType),
+            isSlice,
+            isMap,
+            elemType: nextElemType || undefined,
+            keyType: nextKeyType || undefined,
+        };
     }
 
     private inferSliceType(target: ExprNode, _low?: ExprNode, _high?: ExprNode, _max?: ExprNode): TypeResult | null {

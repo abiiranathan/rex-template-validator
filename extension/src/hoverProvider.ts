@@ -7,6 +7,7 @@
 import * as vscode from 'vscode';
 import {
     FieldInfo,
+    FuncMapInfo,
     ScopeFrame,
     TemplateContext,
     TemplateNode,
@@ -349,9 +350,7 @@ export class HoverProvider {
 
     // ── Private: type/doc lookup ──────────────────────────────────────────────
 
-    private buildFuncMapHover(
-        fn: import('./types').FuncMapInfo
-    ): vscode.Hover {
+    private buildFuncMapHover(fn: FuncMapInfo): vscode.Hover {
         const md = new vscode.MarkdownString();
         md.isTrusted = true;
 

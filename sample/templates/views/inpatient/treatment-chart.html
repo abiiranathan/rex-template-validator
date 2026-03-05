@@ -142,6 +142,15 @@
 
     {{ $pres := .management.AsPresc }}
     {{ $pres.DrugName }}
+
+    {{ range .billedDrugs }}
+    {{ $userData := index $.data 10 }}
+    {{ $firstRecord := index $userData 0 }}
+    {{ $firstRecord.Name }}
+    {{ range $userData }}
+    <p>{{ .Name }}</p>
+    {{ end }}
+    {{ end }}
 </body>
 
 </html>

@@ -87,6 +87,20 @@ function createTestVars(): Map<string, TemplateVar> {
       elemType: 'string',
       isSlice: false,
     }],
+    ['paymentsMap', {
+      name: 'paymentsMap',
+      type: 'map[uint][]*Payment',
+      isMap: true,
+      keyType: 'uint',
+      elemType: '[]*Payment',
+      isSlice: false,
+    }],
+    ['visitIDS', {
+      name: 'visitIDS',
+      type: '[]uint',
+      isSlice: true,
+      elemType: 'uint',
+    }],
   ]);
 }
 
@@ -161,6 +175,7 @@ export function runAllTests() {
     { name: 'Complex Expressions', fn: testComplexExpressions },
     { name: 'Function and Method Calls', fn: testFunctionAndMethodCalls },
     { name: 'Edge Cases', fn: testEdgeCases },
+    { name: 'Pointer Slice Map Operations', fn: testPointerSliceMapOps },
   ];
 
   for (const suite of suites) {
@@ -523,6 +538,147 @@ function testEdgeCases(vars: Map<string, TemplateVar>): [number, number] {
 
   return [passed, failed];
 }
+
+// ── Test Suite 13: Pointer Slice Map Operations ───────────────────────────
+
+function testPointerSliceMapOps(vars: Map<string, TemplateVar>): [number, number] {
+  // Simulates:
+  //   {{ range .visitIDS }}
+  //     {{ $visitId := . }}
+  //     {{ $paymentSlice := index $.paymentsMap . }}
+  //     {{ $firstPayment := index $paymentSlice 0 }}
+  //     {{ $lastPayment := index $paymentSlice (minus (len $paymentSlice) 1) }}
+  //   {{ end }}
+
+  // fieldResolver that knows Payment has Amount and Reference fields.
+  const paymentFields = [
+    { name: 'Amount', type: 'float64', isSlice: false },
+    { name: 'Reference', type: 'string', isSlice: false },
+  ];
+  const fieldResolver = (typeStr: string) => {
+    if (typeStr === 'Payment') return paymentFields;
+    return undefined;
+  };
+
+  // After `$paymentSlice := index $.paymentsMap .` the local is []*Payment.
+  const paymentSliceLocal = new Map<string, TemplateVar>([
+    ['$paymentSlice', {
+      name: '$paymentSlice',
+      type: '[]*Payment',
+      isSlice: true,
+      elemType: 'Payment',   // pointer already stripped by the inferencer
+    }],
+  ]);
+
+  // After `$firstPayment := index $paymentSlice 0` the local is Payment.
+  const paymentItemLocal = new Map<string, TemplateVar>([
+    ['$paymentSlice', {
+      name: '$paymentSlice',
+      type: '[]*Payment',
+      isSlice: true,
+      elemType: 'Payment',
+    }],
+    ['$firstPayment', {
+      name: '$firstPayment',
+      type: 'Payment',
+      isSlice: false,
+      fields: paymentFields,
+    }],
+  ]);
+
+  const tests: TestCase[] = [
+    // map[uint][]*Payment — indexing yields []*Payment
+    {
+      name: 'index map[uint][]*Payment → []*Payment',
+      expr: 'index $.paymentsMap .',
+      expectedType: '[]*Payment',
+      expectedSlice: true,
+      expectedMap: false,
+    },
+    // []*Payment — indexing yields Payment (pointer stripped)
+    {
+      name: 'index []*Payment → Payment',
+      expr: 'index $paymentSlice 0',
+      expectedType: 'Payment',
+      expectedSlice: false,
+      blockLocals: paymentSliceLocal,
+    },
+    // len of []*Payment → int
+    {
+      name: 'len []*Payment → int',
+      expr: 'len $paymentSlice',
+      expectedType: 'int',
+      blockLocals: paymentSliceLocal,
+    },
+    // slice of []*Payment → []*Payment
+    {
+      name: 'slice []*Payment → []*Payment',
+      expr: 'slice $paymentSlice 0 2',
+      expectedType: '[]*Payment',
+      expectedSlice: true,
+      blockLocals: paymentSliceLocal,
+    },
+    // field access on indexed Payment
+    {
+      name: 'field access on Payment from index',
+      expr: '$firstPayment.Amount',
+      expectedType: 'float64',
+      blockLocals: paymentItemLocal,
+    },
+    {
+      name: 'field access Reference on Payment from index',
+      expr: '$firstPayment.Reference',
+      expectedType: 'string',
+      blockLocals: paymentItemLocal,
+    },
+  ];
+
+  let passed = 0;
+  let failed = 0;
+
+  // Pass the fieldResolver so Payment fields are resolvable.
+  for (const tc of tests) {
+    try {
+      const result = inferExpressionType(
+        tc.expr, vars, tc.scope || [], tc.blockLocals,
+        undefined,   // funcMaps
+        fieldResolver
+      );
+
+      if (!result) {
+        console.log(`✗ FAIL: ${tc.name}`);
+        console.log(`  Expression: "${tc.expr}"`);
+        console.log(`  Expected: ${tc.expectedType}`);
+        console.log(`  Got: null`);
+        failed++;
+        continue;
+      }
+
+      const typeMatch = result.typeStr === tc.expectedType;
+      const sliceMatch = tc.expectedSlice === undefined || result.isSlice === tc.expectedSlice;
+      const mapMatch = tc.expectedMap === undefined || result.isMap === tc.expectedMap;
+
+      if (typeMatch && sliceMatch && mapMatch) {
+        console.log(`✓ PASS: ${tc.name}`);
+        passed++;
+      } else {
+        console.log(`✗ FAIL: ${tc.name}`);
+        console.log(`  Expression: "${tc.expr}"`);
+        console.log(`  Expected: ${tc.expectedType} (slice=${tc.expectedSlice}, map=${tc.expectedMap})`);
+        console.log(`  Got:      ${result.typeStr} (slice=${result.isSlice}, map=${result.isMap})`);
+        failed++;
+      }
+    } catch (err) {
+      console.log(`✗ ERROR: ${tc.name}`);
+      console.log(`  Expression: "${tc.expr}"`);
+      console.log(`  Error: ${err}`);
+      failed++;
+    }
+  }
+
+  return [passed, failed];
+}
+
 
 // ── Main Entry Point ───────────────────────────────────────────────────────
 

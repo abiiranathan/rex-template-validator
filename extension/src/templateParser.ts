@@ -1,5 +1,5 @@
 // src/templateParser.ts
-import { FieldInfo, ScopeFrame, TemplateNode, TemplateVar, ParamInfo } from './types';
+import { FieldInfo, ScopeFrame, TemplateNode, TemplateVar, ParamInfo, extractBareType } from './types';
 
 /**
  * Go template parser that produces a proper nested AST.
@@ -118,7 +118,8 @@ export class TemplateParser {
                 elseLine: nestedElse.elseToken?.line,
                 elseCol: nestedElse.elseToken?.col,
                 keyVar,
-                valVar
+                valVar,
+                assignExpr: expr,
             };
 
             return { falseBranch: [node], elseToken: elseTok, finalChild: nestedElse.finalChild };
@@ -177,11 +178,13 @@ export class TemplateParser {
                     elseCol: elseResult.elseToken?.col,
                     keyVar,
                     valVar,
+                    assignExpr: cleanExpr,
                 } as any);
                 pos = elseResult.finalChild.nextPos;
                 continue;
             }
 
+            // ── with branch — add assignExpr: cleanExpr ───────────────────────────────
             if (inner.startsWith('with ')) {
                 const expr = inner.slice(5).trim();
                 let valVar: string | undefined;
@@ -208,6 +211,7 @@ export class TemplateParser {
                     elseLine: elseResult.elseToken?.line,
                     elseCol: elseResult.elseToken?.col,
                     valVar,
+                    assignExpr: cleanExpr,
                 } as any);
                 pos = elseResult.finalChild.nextPos;
                 continue;
@@ -416,7 +420,7 @@ function extractTypeInfo(typeStr: string, explicitIsSlice?: boolean, explicitIsM
     let isMap = explicitIsMap ?? false;
     let elemType = explicitElemType;
 
-    if (!isSlice && !isMap && typeStr) {
+    if (typeStr) {
         let bare = typeStr.startsWith('*') ? typeStr.slice(1) : typeStr;
         if (bare.startsWith('[]')) {
             isSlice = true;
@@ -471,13 +475,14 @@ function unwrapField(
     }
 
     if (retType) {
-        if (retType.startsWith('*')) retType = retType.substring(1);
+        const bare = extractBareType(retType);
+
         return {
             ...field,
             type: retType,
             isSlice: retType.startsWith('[]'),
             isMap: retType.startsWith('map['),
-            fields: fieldResolver ? fieldResolver(retType) || [] : []
+            fields: fieldResolver ? fieldResolver(bare) || [] : []
         };
     }
     return field;
@@ -502,13 +507,14 @@ function unwrapVar(
     }
 
     if (retType) {
-        if (retType.startsWith('*')) retType = retType.substring(1);
+        const bare = extractBareType(retType);
+
         return {
             ...v,
             type: retType,
             isSlice: retType.startsWith('[]'),
             isMap: retType.startsWith('map['),
-            fields: fieldResolver ? fieldResolver(retType) || [] : []
+            fields: fieldResolver ? fieldResolver(bare) || [] : []
         };
     }
     return v;
@@ -548,9 +554,7 @@ export function resolvePath(
     const getFields = (typeStr: string, existingFields?: FieldInfo[]): FieldInfo[] => {
         if (existingFields && existingFields.length > 0) return existingFields;
         if (!typeStr || !fieldResolver) return [];
-        let bare = typeStr.startsWith('*') ? typeStr.slice(1) : typeStr;
-        if (bare.startsWith('[]')) bare = bare.slice(2);
-        if (bare.startsWith('map[')) bare = bare.slice(bare.indexOf(']') + 1);
+        const bare = extractBareType(typeStr);
         return fieldResolver(bare) || [];
     };
 
@@ -565,6 +569,7 @@ export function resolvePath(
                 }
             }
         }
+
         if (local) {
             local = unwrapVar(local, fieldResolver);
             const info = extractTypeInfo(local.type, local.isSlice, local.isMap, local.elemType);
@@ -788,8 +793,9 @@ function resolveFields(
     if (parts[0] === '[]' || isMap) {
         const rest = parts[0] === '[]' ? parts.slice(1) : parts.slice(1);
 
-        let nextTypeStr = elemType || 'unknown';
-        while (nextTypeStr.startsWith('*')) nextTypeStr = nextTypeStr.slice(1);
+        // ONLY strip pointers here so we can manually inspect map/slice prefixes
+        let nextTypeStr = (elemType || 'unknown').trim();
+        while (nextTypeStr.startsWith('*')) nextTypeStr = nextTypeStr.slice(1).trim();
 
         let nextIsMap = false;
         let nextIsSlice = false;
@@ -866,9 +872,7 @@ function resolveFieldsDeep(
     if (tail.length > 0) {
         let nextFields = currentField.fields ?? [];
         if (nextFields.length === 0 && currentField.type && fieldResolver) {
-            let bare = currentField.type.startsWith('*') ? currentField.type.slice(1) : currentField.type;
-            if (bare.startsWith('[]')) bare = bare.slice(2);
-            if (bare.startsWith('map[')) bare = bare.slice(bare.indexOf(']') + 1);
+            const bare = extractBareType(currentField.type);
             nextFields = fieldResolver(bare) || [];
         }
 
