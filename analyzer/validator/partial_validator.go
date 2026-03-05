@@ -25,80 +25,91 @@ func validateTemplateCall(
 	var errors []ValidationResult
 	parts := parseTemplateAction(action)
 
-	if len(parts) >= 1 {
-		tmplName := parts[0]
-		var contextArg string
-		if len(parts) >= 2 {
-			contextArg = parts[1]
+	if len(parts) < 1 {
+		return errors
+	}
+
+	tmplName := parts[0]
+	var contextArg string
+	if len(parts) >= 2 {
+		contextArg = parts[1]
+	}
+
+	if contextArg != "" && contextArg != "." {
+		if !validateContextArg(contextArg, scopeStack, varMap) {
+			return errors
 		}
+	}
 
-		// Validate context argument exists
-		if contextArg != "" && contextArg != "." {
-			if !validateContextArg(contextArg, scopeStack, varMap) {
-				// Validation failed, skip recursive check to prevent cascading errors
-				return errors
-			}
-		}
-
-		// Validate nested template
-		if entries, ok := registry[tmplName]; ok && len(entries) > 0 {
-			nt := entries[0]
-
-			// Skip deep validation for untracked local vars
-			if contextArg != "" && contextArg != "." && !strings.HasPrefix(contextArg, ".") {
-				return errors
-			}
-
-			// Build scope for nested template
-			partialScope := resolvePartialScope(contextArg, scopeStack, varMap)
-			partialVarMap := buildPartialVarMap(contextArg, partialScope, scopeStack, varMap)
-
-			// Recursively validate nested template
-			// NOTE: We DON'T pass blockLocals here because the nested template
-			// has its own scope - local variables don't cross template boundaries
-			partialErrors := ValidateTemplateContent(
-				nt.Content,
-				partialVarMap,
-				nt.TemplatePath,
-				baseDir,
-				templateRoot,
-				nt.Line,
-				registry,
+	// pinCallSite rewrites every diagnostic that came from inside the
+	// named block / partial so it points at the {{ template }} call site
+	// in the CALLER, not at an internal line inside the callee.
+	// The callee path is preserved in the Message so it's still visible.
+	pinCallSite := func(inner []ValidationResult) []ValidationResult {
+		for i := range inner {
+			e := &inner[i]
+			e.Message = fmt.Sprintf(
+				`[in block %q @ %s] %s`,
+				tmplName, e.Template, e.Message,
 			)
-			errors = append(errors, partialErrors...)
-
-		} else if IsFileBasedPartial(tmplName) {
-			fullPath := filepath.Join(baseDir, templateRoot, tmplName)
-			if _, err := os.Stat(fullPath); os.IsNotExist(err) {
-				errors = append(errors, ValidationResult{
-					Template: templateName,
-					Line:     actualLineNum,
-					Column:   col,
-					Variable: tmplName,
-					Message:  fmt.Sprintf(`Partial template "%s" could not be found at %s`, tmplName, fullPath),
-					Severity: "error",
-				})
-				return errors
-			}
-
-			if contextArg != "" && contextArg != "." && !strings.HasPrefix(contextArg, ".") {
-				return errors
-			}
-
-			partialScope := resolvePartialScope(contextArg, scopeStack, varMap)
-			partialVarMap := buildPartialVarMap(contextArg, partialScope, scopeStack, varMap)
-
-			// Recursively validate file-based partial
-			partialErrors := ValidateTemplateFile(
-				fullPath,
-				scopeVarsToTemplateVars(partialVarMap),
-				tmplName,
-				baseDir,
-				templateRoot,
-				registry,
-			)
-			errors = append(errors, partialErrors...)
+			e.Template = templateName
+			e.Line = actualLineNum
+			e.Column = col
 		}
+		return inner
+	}
+
+	if entries, ok := registry[tmplName]; ok && len(entries) > 0 {
+		nt := entries[0]
+
+		if contextArg != "" && contextArg != "." && !strings.HasPrefix(contextArg, ".") {
+			return errors
+		}
+
+		partialScope := resolvePartialScope(contextArg, scopeStack, varMap)
+		partialVarMap := buildPartialVarMap(contextArg, partialScope, scopeStack, varMap)
+
+		partialErrors := ValidateTemplateContent(
+			nt.Content,
+			partialVarMap,
+			nt.TemplatePath,
+			baseDir,
+			templateRoot,
+			nt.Line,
+			registry,
+		)
+		errors = append(errors, pinCallSite(partialErrors)...)
+
+	} else if IsFileBasedPartial(tmplName) {
+		fullPath := filepath.Join(baseDir, templateRoot, tmplName)
+		if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+			errors = append(errors, ValidationResult{
+				Template: templateName,
+				Line:     actualLineNum,
+				Column:   col,
+				Variable: tmplName,
+				Message:  fmt.Sprintf(`Partial template "%s" could not be found at %s`, tmplName, fullPath),
+				Severity: "error",
+			})
+			return errors
+		}
+
+		if contextArg != "" && contextArg != "." && !strings.HasPrefix(contextArg, ".") {
+			return errors
+		}
+
+		partialScope := resolvePartialScope(contextArg, scopeStack, varMap)
+		partialVarMap := buildPartialVarMap(contextArg, partialScope, scopeStack, varMap)
+
+		partialErrors := ValidateTemplateFile(
+			fullPath,
+			scopeVarsToTemplateVars(partialVarMap),
+			tmplName,
+			baseDir,
+			templateRoot,
+			registry,
+		)
+		errors = append(errors, pinCallSite(partialErrors)...)
 	}
 
 	return errors

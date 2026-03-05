@@ -254,10 +254,13 @@ export class ValidatorCore {
         blockLocals: Map<string, TemplateVar>,
         errors: ValidationError[]
     ) {
+        // Skip context-relative references and root-scope shortcuts — these are always valid.
         if (node.path.length === 0) return;
         if (node.path[0] === '.') return;
         if (node.path[0] === '$' && node.path.length === 1) return;
 
+        // Strip Mustache delimiters (including optional whitespace-trimming dashes) to get
+        // a clean expression string we can pass to the type inferencer and regex matchers.
         const cleanExpr = node.rawText
             ? node.rawText.replace(/^\{\{-?\s*/, '').replace(/\s*-?\}\}$/, '')
             : '';
@@ -266,25 +269,105 @@ export class ValidatorCore {
             `Validating variable/expression: "${cleanExpr}" at ${node.line}:${node.col}`
         );
 
-        // 1. Always attempt expression evaluation first.
-        let exprType = null;
-        try {
-            if (cleanExpr) {
-                this.outputChannel.appendLine(
-                    `  Attempting inferExpressionType for: "${cleanExpr}"`
-                );
-                exprType = inferExpressionType(
+        const fieldResolver = this.scope.buildFieldResolver(vars, scopeStack);
+
+        // ── Step 1: Type-inference pass ─────────────────────────────────────────
+        // If the expression resolves to a known type (including pipelines, function
+        // calls, and compound expressions), it is valid — nothing more to check.
+        if (cleanExpr) {
+            try {
+                const exprType = inferExpressionType(
                     cleanExpr, vars, scopeStack, blockLocals,
                     this.graphBuilder.getGraph().funcMaps,
-                    this.scope.buildFieldResolver(vars, scopeStack)
+                    fieldResolver
                 );
-                this.outputChannel.appendLine(
-                    `  inferExpressionType result: ${exprType ? JSON.stringify(exprType) : 'null'}`
-                );
+                if (exprType) return;
+            } catch (e) {
+                this.outputChannel.appendLine(`  inferExpressionType threw error: ${e}`);
             }
-        } catch (e) {
-            this.outputChannel.appendLine(`  inferExpressionType threw error: ${e}`);
         }
+
+        // ── Step 2: Sub-variable resolution pass ────────────────────────────────
+        // When the top-level expression couldn't be typed, extract every variable
+        // reference within it (e.g. `$.foo`, `.bar`, `(index $list 0).name`) and
+        // check each one individually.  Reporting at the sub-variable level gives
+        // the user a more precise error location than pointing at the whole node.
+        if (cleanExpr) {
+            const varRefPattern =
+                /(\(index\s+(?:\$|\.)[\w\d_.]+\s+[^)]+\)(?:\.[\w\d_.]+)*|(?:\$|\.)[\w\d_.[\]]*)/g;
+            const refs = cleanExpr.match(varRefPattern);
+
+            if (refs) {
+                let foundMissingRef = false;
+
+                for (const ref of refs) {
+                    // Skip numeric tuple indices (`.0`, `.1`, …) and spread tokens.
+                    if (/^\.\d+$/.test(ref) || ref === '...') continue;
+
+                    const subPath = this.parser.parseDotPath(ref);
+
+                    // Skip degenerate paths that are just `.` or `$` on their own.
+                    const isRootOnlyPath =
+                        subPath.length === 0 ||
+                        (subPath.length === 1 && (subPath[0] === '.' || subPath[0] === '$'));
+                    if (isRootOnlyPath) continue;
+
+                    const { found } = resolvePath(subPath, vars, scopeStack, blockLocals, fieldResolver);
+                    if (found) continue;
+
+                    // Pinpoint the column to where this specific ref starts inside the node.
+                    const refOffset = node.rawText.indexOf(ref);
+                    const errCol = refOffset !== -1 ? node.col + refOffset : node.col;
+
+                    // Normalise the display path to always start with `$.` or `.`.
+                    const displayPath = this.formatDisplayPath(subPath);
+
+                    errors.push({
+                        message: `Template variable "${displayPath}" is not defined in the render context`,
+                        line: node.line,
+                        col: errCol,
+                        severity: 'error',
+                        variable: ref,
+                    });
+                    foundMissingRef = true;
+                }
+
+                // At least one sub-variable error was emitted — stop here to avoid
+                // a redundant whole-expression error from Step 3.
+                if (foundMissingRef) return;
+            }
+        }
+
+        // ── Step 3: Bare-path fallback ───────────────────────────────────────────
+        // For simple field accesses (no whitespace, pipes, or parens) that still
+        // couldn't be resolved, emit a single error on the whole node.
+        // Complex expressions (function calls, pipelines, etc.) are intentionally
+        // skipped here because their constituent parts were already checked above,
+        // and unknown built-ins / helpers should not produce spurious errors.
+        const isComplexExpr = cleanExpr ? /[\s|()]/.test(cleanExpr) : false;
+        if (isComplexExpr) return;
+
+        const { found: pathResolved } = resolvePath(
+            node.path, vars, scopeStack, blockLocals, fieldResolver
+        );
+
+        if (!pathResolved) {
+            const displayPath = this.formatDisplayPath(node.path);
+            errors.push({
+                message: `Template variable "${displayPath}" is not defined in the render context`,
+                line: node.line,
+                col: node.col,
+                severity: 'error',
+                variable: node.rawText,
+            });
+        }
+    }
+
+    /** Formats a parsed path array into a human-readable `$.x.y` or `.x.y` string. */
+    private formatDisplayPath(path: string[]): string {
+        if (path[0] === '$') return '$.' + path.slice(1).join('.');
+        if (path[0].startsWith('$')) return path.join('.');
+        return '.' + path.join('.');
     }
 
     // ── If / Range / With validation ──────────────────────────────────────────
@@ -860,6 +943,19 @@ export class ValidatorCore {
                 vars: partialVars,
                 renderCalls: ctx.renderCalls,
             };
+
+            const blockErrors: ValidationError[] = [];
+            this.validateNodes(
+                freshBlockNode.children, partialVars, childStack,
+                blockErrors, blockCtx, entry.absolutePath
+            );
+
+            for (const e of blockErrors) {
+                errors.push({
+                    ...e,
+                    message: `[in block "${callNode.partialName}" @ ${entry.templatePath}] ${e.message}`,
+                });
+            }
         } catch { /* ignore */ }
     }
 

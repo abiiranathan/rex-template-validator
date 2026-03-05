@@ -39,7 +39,7 @@ func processFunc(
 	funcMapAssignments := make(map[string]*goast.CompositeLit, 4)
 
 	// Pass 1: Collect assignments
-	collectAssignments(n, info, fset, filesMap, &scope, stringAssignments, funcMapAssignments)
+	collectAssignments(n, info, fset, filesMap, &scope, stringAssignments, funcMapAssignments, structIndex, fc, seenPool)
 
 	// Pass 2: Find template operations
 	findTemplateOperations(n, info, fset, structIndex, fc, config, filesMap, seenPool, &scope, stringAssignments)
@@ -57,23 +57,22 @@ func collectAssignments(
 	scope *FuncScope,
 	stringAssignments map[string][]string,
 	funcMapAssignments map[string]*goast.CompositeLit,
+	structIndex map[string]structIndexEntry,
+	fc *fieldCache,
+	seenPool *seenMapPool,
 ) {
 	goast.Inspect(n, func(child goast.Node) bool {
-		// Stop at nested function literals to maintain scope boundaries
 		if child != n {
 			if _, isFunc := child.(*goast.FuncLit); isFunc {
 				return false
 			}
 		}
-
 		switch node := child.(type) {
 		case *goast.AssignStmt:
-			processAssignStmt(node, info, fset, filesMap, scope, stringAssignments, funcMapAssignments)
-
+			processAssignStmt(node, info, fset, filesMap, scope, stringAssignments, funcMapAssignments, structIndex, fc, seenPool)
 		case *goast.GenDecl:
-			processGenDecl(node, info, fset, filesMap, scope, stringAssignments, funcMapAssignments)
+			processGenDecl(node, info, fset, filesMap, scope, stringAssignments, funcMapAssignments, structIndex, fc, seenPool)
 		}
-
 		return true
 	})
 }
@@ -91,6 +90,9 @@ func processAssignStmt(
 	scope *FuncScope,
 	stringAssignments map[string][]string,
 	funcMapAssignments map[string]*goast.CompositeLit,
+	structIndex map[string]structIndexEntry,
+	fc *fieldCache,
+	seenPool *seenMapPool,
 ) {
 	for i, lhs := range assign.Lhs {
 		if i >= len(assign.Rhs) {
@@ -98,39 +100,31 @@ func processAssignStmt(
 		}
 		rhs := assign.Rhs[i]
 
-		// Handle map index assignments: funcMap["key"] = value
 		if indexExpr, ok := lhs.(*goast.IndexExpr); ok {
-			if processFuncMapIndexAssign(indexExpr, rhs, info, fset, i, assign, scope) {
+			if processFuncMapIndexAssign(indexExpr, rhs, info, fset, i, assign, scope, structIndex, fc, seenPool) {
 				continue
 			}
-			// Also track map[string]interface{} index mutations so we can
-			// resolve data variables built up via ctx["key"] = val.
 			trackMapIndexAssign(indexExpr, rhs, scope)
 			continue
 		}
 
-		// Handle regular variable assignments
 		ident, ok := lhs.(*goast.Ident)
 		if !ok {
 			continue
 		}
 
-		// Collect string literal assignments with limit
 		if s := extractStringFast(rhs); s != "" {
 			if len(stringAssignments[ident.Name]) < MaxAssignmentsPerVar {
 				stringAssignments[ident.Name] = append(stringAssignments[ident.Name], s)
 			}
 		}
 
-		// Collect composite literal assignments.
-		// This covers both template.FuncMap and map[string]interface{} data maps.
 		if comp, ok := rhs.(*goast.CompositeLit); ok {
 			funcMapAssignments[ident.Name] = comp
 
 			if isFuncMapType(ident, info) {
-				scope.FuncMaps = append(scope.FuncMaps, extractFuncMaps(comp, info, fset, filesMap)...)
+				scope.FuncMaps = append(scope.FuncMaps, extractFuncMaps(comp, info, fset, filesMap, structIndex, fc, seenPool)...)
 			} else if isDataMapType(ident, info) {
-				// Track as a potential render data variable map.
 				scope.MapAssignments[ident.Name] = comp
 			}
 		}
@@ -222,6 +216,9 @@ func processGenDecl(
 	scope *FuncScope,
 	stringAssignments map[string][]string,
 	funcMapAssignments map[string]*goast.CompositeLit,
+	structIndex map[string]structIndexEntry,
+	fc *fieldCache,
+	seenPool *seenMapPool,
 ) {
 	if decl.Tok != token.VAR && decl.Tok != token.CONST {
 		return
@@ -239,27 +236,23 @@ func processGenDecl(
 			}
 			rhs := vspec.Values[i]
 
-			// Collect string literals with limit
 			if s := extractStringFast(rhs); s != "" {
 				if len(stringAssignments[name.Name]) < MaxAssignmentsPerVar {
 					stringAssignments[name.Name] = append(stringAssignments[name.Name], s)
 				}
 			}
 
-			// Collect composite literal assignments
 			if comp, ok := rhs.(*goast.CompositeLit); ok {
 				funcMapAssignments[name.Name] = comp
 
 				if info != nil {
 					if tv, ok := info.Defs[name]; ok && tv.Type() != nil {
-						typeStr := tv.Type().String()
-						if strings.HasSuffix(typeStr, "template.FuncMap") {
-							scope.FuncMaps = append(scope.FuncMaps, extractFuncMaps(comp, info, fset, filesMap)...)
+						if strings.HasSuffix(tv.Type().String(), "template.FuncMap") {
+							scope.FuncMaps = append(scope.FuncMaps, extractFuncMaps(comp, info, fset, filesMap, structIndex, fc, seenPool)...)
 						}
 					}
 				}
 
-				// Also track data map literals declared via var/const
 				if info != nil {
 					if isDataMapType(name, info) {
 						scope.MapAssignments[name.Name] = comp
@@ -298,7 +291,7 @@ func findTemplateOperations(
 		case *goast.CompositeLit:
 			// Inline FuncMap literals
 			if isFuncMapCompositeLit(node, info) {
-				scope.FuncMaps = append(scope.FuncMaps, extractFuncMaps(node, info, fset, filesMap)...)
+				scope.FuncMaps = append(scope.FuncMaps, extractFuncMaps(node, info, fset, filesMap, structIndex, fc, seenPool)...)
 			}
 
 		case *goast.CallExpr:

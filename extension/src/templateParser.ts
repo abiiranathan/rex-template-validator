@@ -652,8 +652,44 @@ export function resolvePath(
     const dotFrame = findDotFrame(scopeStack);
     if (dotFrame) {
         if (dotFrame.isMap) {
-            // It's a map context, any key is valid
-            if (path.length === 2) { // e.g. [".", "key"]
+            // If the map has explicit typed fields (e.g. produced by a `dict` call),
+            // resolve against the specific key's declared type rather than the generic
+            // element type.  This is what makes `.diagnosis.ID` work inside a block
+            // called with `dict "diagnosis" .` — without this, every key resolves to
+            // `unknown` and intellisense / validation break for all sub-fields.
+            const knownField = dotFrame.fields?.find(f => f.name === path[0]);
+            if (knownField) {
+                const unwrapped = unwrapField(knownField, fieldResolver);
+                const info = extractTypeInfo(unwrapped.type, unwrapped.isSlice, unwrapped.isMap, unwrapped.elemType);
+
+                if (path.length === 1) {
+                    return {
+                        typeStr: unwrapped.type,
+                        found: true,
+                        // Prefer inline fields; fall back to the type registry so that
+                        // struct types returned from dict values are fully explorable.
+                        fields: cleanFields(unwrapped.fields) ?? fieldResolver?.(unwrapped.type),
+                        isSlice: info.isSlice,
+                        isMap: info.isMap,
+                        elemType: info.elemType,
+                        keyType: unwrapped.keyType,
+                        defFile: unwrapped.defFile,
+                        defLine: unwrapped.defLine,
+                        defCol: unwrapped.defCol,
+                        doc: unwrapped.doc,
+                    };
+                }
+
+                // Resolve the remaining path segments through this field's type.
+                const nextFields =
+                    cleanFields(unwrapped.fields) ??
+                    fieldResolver?.(unwrapped.type) ??
+                    [];
+                return resolveFieldsDeep(path.slice(1), nextFields, fieldResolver);
+            }
+
+            // Generic map with no known typed keys — any key is considered valid.
+            if (path.length === 2) {
                 return { typeStr: dotFrame.elemType || 'unknown', found: true };
             } else if (path.length > 2) {
                 return resolveFields(path.slice(2), [], false, undefined, false, fieldResolver);

@@ -17,18 +17,19 @@ func processFuncMapIndexAssign(
 	rhsIdx int,
 	assign *goast.AssignStmt,
 	scope *FuncScope,
+	structIndex map[string]structIndexEntry,
+	fc *fieldCache,
+	seenPool *seenMapPool,
 ) bool {
 	if info == nil {
 		return false
 	}
 
-	// Check if the indexed object is a FuncMap
 	tv, ok := info.Types[indexExpr.X]
 	if !ok || tv.Type == nil || !strings.HasSuffix(tv.Type.String(), "template.FuncMap") {
 		return false
 	}
 
-	// Extract the key (function name)
 	keyLit, ok := indexExpr.Index.(*goast.BasicLit)
 	if !ok || keyLit.Kind != token.STRING {
 		return false
@@ -37,12 +38,12 @@ func processFuncMapIndexAssign(
 	name := strings.Trim(keyLit.Value, "\"")
 	fInfo := FuncMapInfo{Name: name}
 
-	// Extract function definition location and signature
 	if rhsIdx < len(assign.Rhs) {
 		fInfo.DefFile, fInfo.DefLine, fInfo.DefCol = resolveFuncDefLocation(rhs, info, fset)
 
 		if rtv, ok := info.Types[rhs]; ok && rtv.Type != nil {
 			fInfo.Params, fInfo.Returns, fInfo.Args = extractSignatureFromType(rtv.Type)
+			fInfo.ReturnTypeFields = extractFuncReturnFields(rtv.Type, structIndex, fc, seenPool, fset)
 		}
 	}
 
@@ -52,7 +53,15 @@ func processFuncMapIndexAssign(
 
 // extractFuncMaps extracts function definitions from a FuncMap composite literal.
 // Example: template.FuncMap{"add": addFunc, "multiply": multiplyFunc}
-func extractFuncMaps(comp *goast.CompositeLit, info *types.Info, fset *token.FileSet, filesMap map[string]*goast.File) []FuncMapInfo {
+func extractFuncMaps(
+	comp *goast.CompositeLit,
+	info *types.Info,
+	fset *token.FileSet,
+	filesMap map[string]*goast.File,
+	structIndex map[string]structIndexEntry,
+	fc *fieldCache,
+	seenPool *seenMapPool,
+) []FuncMapInfo {
 	var result []FuncMapInfo
 
 	for _, elt := range comp.Elts {
@@ -69,14 +78,13 @@ func extractFuncMaps(comp *goast.CompositeLit, info *types.Info, fset *token.Fil
 		name := strings.Trim(key.Value, "\"")
 		fInfo := FuncMapInfo{Name: name}
 
-		// Extract function metadata
 		fInfo.DefFile, fInfo.DefLine, fInfo.DefCol = resolveFuncDefLocation(kv.Value, info, fset)
 		fInfo.Doc = resolveFuncDoc(kv.Value, info, filesMap)
 
-		// Extract signature if available
 		if info != nil {
 			if tv, ok := info.Types[kv.Value]; ok && tv.Type != nil {
 				fInfo.Params, fInfo.Returns, fInfo.Args = extractSignatureFromType(tv.Type)
+				fInfo.ReturnTypeFields = extractFuncReturnFields(tv.Type, structIndex, fc, seenPool, fset)
 			}
 		}
 
@@ -84,6 +92,43 @@ func extractFuncMaps(comp *goast.CompositeLit, info *types.Info, fset *token.Fil
 	}
 
 	return result
+}
+
+// extractFuncReturnFields resolves the exported fields of a funcmap entry's
+// primary return type. Unwraps pointer and slice wrappers so that a function
+// returning *[]MgtHints yields the fields of MgtHints.
+func extractFuncReturnFields(
+	funcType types.Type,
+	structIndex map[string]structIndexEntry,
+	fc *fieldCache,
+	seenPool *seenMapPool,
+	fset *token.FileSet,
+) []FieldInfo {
+	// Unwrap a leading pointer to reach the signature itself.
+	if ptr, ok := funcType.(*types.Pointer); ok {
+		funcType = ptr.Elem()
+	}
+
+	sig, ok := funcType.(*types.Signature)
+	if !ok || sig.Results().Len() == 0 {
+		return nil
+	}
+
+	// Primary return value — the one templates will range/access over.
+	retType := sig.Results().At(0).Type()
+
+	// Unwrap *[]T → T.  getElementType handles Pointer and Slice recursively.
+	elemType := getElementType(retType)
+	if elemType == nil {
+		// Not a slice/array — try to extract fields directly (e.g. *MyStruct).
+		elemType = retType
+	}
+
+	seen := seenPool.get()
+	fields, _ := extractFieldsWithDocs(elemType, structIndex, fc, seen, fset)
+	seenPool.put(seen)
+
+	return fields
 }
 
 // isFuncMapType checks if an identifier has type template.FuncMap.

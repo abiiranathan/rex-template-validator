@@ -230,9 +230,11 @@ export class ScopeUtils {
         scopeStack: ScopeFrame[],
         blockLocals?: Map<string, TemplateVar>
     ): ScopeFrame | null {
+        // Extract fieldResolver once so we can reuse it for element-type field hydration.
+        const fieldResolver = this.buildFieldResolver(vars, scopeStack);
+
         const result = resolvePath(
-            node.path, vars, scopeStack, blockLocals,
-            this.buildFieldResolver(vars, scopeStack)
+            node.path, vars, scopeStack, blockLocals, fieldResolver
         );
         if (!result.found) return null;
 
@@ -243,12 +245,25 @@ export class ScopeUtils {
             if (field) sourceVar = fieldInfoToTemplateVar(field);
         }
 
+        // Strip a leading pointer sigil before inspecting the type shape.
+        // Without this, `*[]MgtHints` fails the `startsWith('[]')` check and the
+        // full pointer-to-slice type leaks into the range scope as `.`, meaning
+        // every field access inside the loop resolves to `unknown`.
+        const rawTypeStr = result.typeStr.startsWith('*')
+            ? result.typeStr.slice(1)
+            : result.typeStr;
+
+        // Prefer the explicitly-computed elemType (set by extractTypeInfo and
+        // propagated through resolvePath) over re-deriving it from the raw string.
+        // This is more reliable for aliased / nested generic types.
         const elemTypeStr =
-            result.isSlice && result.typeStr.startsWith('[]')
-                ? result.typeStr.slice(2)
-                : result.isMap && result.elemType
-                    ? result.elemType
-                    : result.typeStr;
+            result.isSlice && result.elemType
+                ? result.elemType
+                : result.isSlice && rawTypeStr.startsWith('[]')
+                    ? rawTypeStr.slice(2)
+                    : result.isMap && result.elemType
+                        ? result.elemType
+                        : rawTypeStr;
 
         let isElemSlice = false;
         let isElemMap = false;
@@ -275,10 +290,19 @@ export class ScopeUtils {
             }
         }
 
+        // Field hydration: result.fields is often undefined when the iterable came
+        // from a funcMap call (funcMap entries carry no inline field metadata).
+        // Fall back to the field resolver so struct types like MgtHints are
+        // explorable via hover / completion / definition even in that case.
+        const elemFields: FieldInfo[] =
+            (result.fields && result.fields.length > 0)
+                ? result.fields
+                : fieldResolver(elemTypeStr) ?? [];
+
         const elemScope: ScopeFrame = {
             key: '.',
             typeStr: elemTypeStr,
-            fields: result.fields ?? [],
+            fields: elemFields,
             isRange: true,
             sourceVar,
             isMap: isElemMap,
@@ -286,6 +310,7 @@ export class ScopeUtils {
             elemType: elemInnerType,
             isSlice: isElemSlice,
         };
+
 
         if (node.keyVar || node.valVar) {
             elemScope.locals = new Map();
@@ -916,11 +941,41 @@ export class ScopeUtils {
             }
         };
 
+        // Index current scope vars.
         for (const v of vars.values()) indexVar(v);
 
+        // Index dot frame fields.
         const dotFrame = scopeStack.slice().reverse().find(f => f.key === '.');
         if (dotFrame?.fields) {
             for (const f of dotFrame.fields) indexVar(f);
+        }
+
+        // Index ALL vars from ALL templates in the knowledge graph.
+        // This catches types (like MgtHints) that only appear as funcMap
+        // return types and never as top-level template vars in the current file.
+        const graph = this.graphBuilder.getGraph();
+        for (const [, ctx] of graph.templates) {
+            for (const v of ctx.vars.values()) indexVar(v);
+        }
+
+        // ── Key fix: index return-type fields from funcMap registry ──────────────
+        // FuncMaps like `ManagementHints` return `*[]MgtHints`. Without this block,
+        // `MgtHints` fields are entirely invisible to the type index unless they
+        // happen to appear as a template var somewhere else — which they often don't.
+        for (const [, fn] of graph.funcMaps) {
+            if (!fn.returnTypeFields || fn.returnTypeFields.length === 0) continue;
+
+            // Derive the bare element type from the return type string.
+            // e.g. '*[]MgtHints' → 'MgtHints'
+            const retType = fn.returns?.[0]?.type ?? '';
+            let bare = retType.startsWith('*') ? retType.slice(1) : retType;
+            if (bare.startsWith('[]')) bare = bare.slice(2);
+            if (bare.startsWith('map[')) bare = bare.slice(bare.indexOf(']') + 1);
+
+            if (bare && !typeIndex.has(bare)) {
+                typeIndex.set(bare, fn.returnTypeFields);
+                for (const f of fn.returnTypeFields) indexVar(f);
+            }
         }
 
         return (typeStr: string) => {

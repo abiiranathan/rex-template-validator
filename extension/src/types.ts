@@ -71,6 +71,11 @@ export interface FuncMapInfo {
   defFile?: string;
   defLine?: number;
   defCol?: number;
+
+  // field metadata for the primary return type, so range loops over
+  // funcMap results get proper intellisense without needing a separate
+  // template render call for the return type.
+  returnTypeFields?: FieldInfo[];
 }
 
 export interface AnalysisResult {

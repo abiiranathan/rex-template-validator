@@ -105,6 +105,12 @@ type FuncMapInfo struct {
 	DefLine int `json:"defLine,omitempty"`
 	// DefCol is the column number where the function is defined.
 	DefCol int `json:"defCol,omitempty"`
+
+	// Fields of the primary return type after unwrapping pointer and slice.
+	// e.g. func() *[]MgtHints → fields of MgtHints.
+	// The TypeScript extension uses this to provide intellisense inside
+	// {{ range $hints }} without needing a separate render-call entry.
+	ReturnTypeFields []FieldInfo `json:"returnTypeFields,omitempty"`
 }
 
 // ParamInfo represents a single function parameter or return value with its

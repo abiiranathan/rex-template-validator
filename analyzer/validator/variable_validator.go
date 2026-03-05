@@ -389,33 +389,11 @@ func validateNestedFields(fieldParts []string, fields []ast.FieldInfo, parentTyp
 
 		if !found {
 			// ── Method resolution ──────────────────────────────────────────
-			// Before reporting an error, check whether fieldName is a known
-			// callable method on the current parent type.  This handles cases
-			// like .CreatedAt.Format (time.Time) and .EDD.String (Date).
-			//
-			// When a method is the terminal segment of the path we accept it
-			// unconditionally (return nil).  Methods cannot be traversed
-			// further — a method call produces a scalar value whose type is
-			// not tracked, so we stay permissive for any deeper segments that
-			// might follow (e.g., a Format result is always a string with no
-			// further fields).
 			if typeHasMethod(parentType, fieldName) {
 				// Method is valid; the result type is opaque — stop validation.
 				return nil
 			}
 
-			// // Field doesn't exist on this type and is not a known method.
-			// if parentType == "" {
-			// 	parentType = "unknown"
-			// }
-			// return &ValidationResult{
-			// 	Template: templateName,
-			// 	Line:     line,
-			// 	Column:   col,
-			// 	Variable: fullExpr,
-			// 	Message:  fmt.Sprintf(`Field %q does not exist on type %s`, fieldName, parentType),
-			// 	Severity: "error",
-			// }
 			// Default to silence false positives
 			return nil
 		}
