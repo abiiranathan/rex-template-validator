@@ -27,6 +27,35 @@ export class HoverProvider {
     private readonly graphBuilder: KnowledgeGraphBuilder;
     private readonly scope: ScopeUtils;
 
+    // A registry of built-in functions to provide signatures and docs on hover
+    private readonly builtInFunctions: Map<string, FuncMapInfo> = new Map([
+        ['and', { name: 'and', params: [{ name: 'arg', type: '...any' }], returns: [{ type: 'bool' }], doc: 'Returns the boolean AND of its arguments' }],
+        ['call', { name: 'call', params: [{ name: 'fn', type: 'any' }, { name: 'args', type: '...any' }], returns: [{ type: 'any' }], doc: 'Returns the result of calling the first argument' }],
+        ['html', { name: 'html', params: [{ name: 'args', type: '...any' }], returns: [{ type: 'string' }], doc: 'Returns the HTML-escaped equivalent of its arguments' }],
+        ['index', { name: 'index', params: [{ name: 'item', type: 'any' }, { name: 'indices', type: '...any' }], returns: [{ type: 'any' }], doc: 'Returns the result of indexing its first argument by the following arguments' }],
+        ['slice', { name: 'slice', params: [{ name: 'item', type: 'any' }, { name: 'indices', type: '...any' }], returns: [{ type: 'any' }], doc: 'Returns the result of slicing its first argument' }],
+        ['js', { name: 'js', params: [{ name: 'args', type: '...any' }], returns: [{ type: 'string' }], doc: 'Returns the JavaScript-escaped equivalent of its arguments' }],
+        ['len', { name: 'len', params: [{ name: 'arg', type: 'any' }], returns: [{ type: 'int' }], doc: 'Returns the integer length of its argument' }],
+        ['not', { name: 'not', params: [{ name: 'arg', type: 'any' }], returns: [{ type: 'bool' }], doc: 'Returns the boolean negation of its single argument' }],
+        ['or', { name: 'or', params: [{ name: 'arg', type: '...any' }], returns: [{ type: 'bool' }], doc: 'Returns the boolean OR of its arguments' }],
+        ['print', { name: 'print', params: [{ name: 'args', type: '...any' }], returns: [{ type: 'string' }], doc: 'An alias for fmt.Sprint' }],
+        ['printf', { name: 'printf', params: [{ name: 'format', type: 'string' }, { name: 'args', type: '...any' }], returns: [{ type: 'string' }], doc: 'An alias for fmt.Sprintf' }],
+        ['println', { name: 'println', params: [{ name: 'args', type: '...any' }], returns: [{ type: 'string' }], doc: 'An alias for fmt.Sprintln' }],
+        ['urlquery', { name: 'urlquery', params: [{ name: 'args', type: '...any' }], returns: [{ type: 'string' }], doc: 'Returns the URL-escaped equivalent of its arguments' }],
+        ['eq', { name: 'eq', params: [{ name: 'arg1', type: 'any' }, { name: 'arg2', type: '...any' }], returns: [{ type: 'bool' }], doc: 'Returns the boolean truth of arg1 == arg2' }],
+        ['ne', { name: 'ne', params: [{ name: 'arg1', type: 'any' }, { name: 'arg2', type: '...any' }], returns: [{ type: 'bool' }], doc: 'Returns the boolean truth of arg1 != arg2' }],
+        ['lt', { name: 'lt', params: [{ name: 'arg1', type: 'any' }, { name: 'arg2', type: '...any' }], returns: [{ type: 'bool' }], doc: 'Returns the boolean truth of arg1 < arg2' }],
+        ['le', { name: 'le', params: [{ name: 'arg1', type: 'any' }, { name: 'arg2', type: '...any' }], returns: [{ type: 'bool' }], doc: 'Returns the boolean truth of arg1 <= arg2' }],
+        ['gt', { name: 'gt', params: [{ name: 'arg1', type: 'any' }, { name: 'arg2', type: '...any' }], returns: [{ type: 'bool' }], doc: 'Returns the boolean truth of arg1 > arg2' }],
+        ['ge', { name: 'ge', params: [{ name: 'arg1', type: 'any' }, { name: 'arg2', type: '...any' }], returns: [{ type: 'bool' }], doc: 'Returns the boolean truth of arg1 >= arg2' }],
+        ['dict', { name: 'dict', params: [{ name: 'args', type: '...any' }], returns: [{ type: 'map[string]any' }], doc: 'Creates a map from a list of key-value pairs' }],
+        ['add', { name: 'add', params: [{ name: 'a', type: 'any' }, { name: 'b', type: 'any' }], returns: [{ type: 'any' }], doc: 'Returns the sum of a and b' }],
+        ['sub', { name: 'sub', params: [{ name: 'a', type: 'any' }, { name: 'b', type: 'any' }], returns: [{ type: 'any' }], doc: 'Returns the difference of a and b' }],
+        ['mul', { name: 'mul', params: [{ name: 'a', type: 'any' }, { name: 'b', type: 'any' }], returns: [{ type: 'any' }], doc: 'Returns the product of a and b' }],
+        ['div', { name: 'div', params: [{ name: 'a', type: 'any' }, { name: 'b', type: 'any' }], returns: [{ type: 'any' }], doc: 'Returns the quotient of a and b' }],
+        ['mod', { name: 'mod', params: [{ name: 'a', type: 'any' }, { name: 'b', type: 'any' }], returns: [{ type: 'any' }], doc: 'Returns the remainder of a / b' }]
+    ]);
+
     constructor(graphBuilder: KnowledgeGraphBuilder, scope: ScopeUtils) {
         this.graphBuilder = graphBuilder;
         this.parser = scope.parser;
@@ -88,9 +117,15 @@ export class HoverProvider {
             const subPathStr = this.extractPathAtCursor(node.rawText, cursorOffset);
 
             if (subPathStr) {
+                // User-defined Functions
                 const funcMaps = this.graphBuilder.getGraph().funcMaps;
                 if (funcMaps && funcMaps.has(subPathStr)) {
                     return this.buildFuncMapHover(funcMaps.get(subPathStr)!);
+                }
+
+                // Built-in Functions
+                if (this.builtInFunctions.has(subPathStr)) {
+                    return this.buildFuncMapHover(this.builtInFunctions.get(subPathStr)!);
                 }
 
                 const parts = this.parser.parseDotPath(subPathStr);
@@ -164,20 +199,10 @@ export class HoverProvider {
     // ── Private helpers ────────────────────────────────────────────────────────
 
     /**
- * Returns the dot-path prefix that ends at the identifier segment under
- * the cursor, so that hovering over any segment of `.Visit.Patient.ID`
- * resolves only as far as that segment.
- *
- * Strategy:
- *  - Walk BACKWARD using pathChar (includes '.') to reach the path start.
- *  - Walk FORWARD using identChar (no '.') to reach the end of the current
- *    segment — stopping before the next dot.
- *
- * Examples for `.Visit.Patient.ID`:
- *   cursor on "Visit"   → ".Visit"
- *   cursor on "Patient" → ".Visit.Patient"
- *   cursor on "ID"      → ".Visit.Patient.ID"
- */
+     * Returns the dot-path prefix that ends at the identifier segment under
+     * the cursor, so that hovering over any segment of `.Visit.Patient.ID`
+     * resolves only as far as that segment.
+     */
     extractPathAtCursor(text: string, offset: number): string | null {
         const pathChar = /[a-zA-Z0-9_$.]/;   // includes '.' — for backward scan
         const identChar = /[a-zA-Z0-9_$]/;    // excludes '.' — for forward scan
