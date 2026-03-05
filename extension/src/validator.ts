@@ -23,6 +23,7 @@ import { ValidatorCore } from './validatorCore';
 import { HoverProvider } from './hoverProvider';
 import { DefinitionProvider } from './definitionProvider';
 import { CompletionProvider } from './completionProvider';
+import { ReferenceProvider } from './referenceProvider';
 
 export class TemplateValidator {
     private readonly parser: TemplateParser;
@@ -35,6 +36,7 @@ export class TemplateValidator {
     private readonly hover: HoverProvider;
     private readonly definition: DefinitionProvider;
     private readonly completion: CompletionProvider;
+    private readonly reference: ReferenceProvider;
 
     constructor(
         outputChannel: vscode.OutputChannel,
@@ -49,9 +51,22 @@ export class TemplateValidator {
         this.hover = new HoverProvider(graphBuilder, this.scope);
         this.definition = new DefinitionProvider(graphBuilder, this.scope, this.hover);
         this.completion = new CompletionProvider(graphBuilder, this.scope);
+        this.reference = new ReferenceProvider(graphBuilder);
     }
 
     // ── Public API ─────────────────────────────────────────────────────────────
+
+    /**
+ * Returns all reference locations for the named block under the cursor,
+ * or null when the cursor is not on a block name.
+ */
+    async getReferences(
+        document: vscode.TextDocument,
+        position: vscode.Position,
+        includeDeclaration: boolean
+    ): Promise<vscode.Location[] | null> {
+        return this.reference.getReferences(document, position, includeDeclaration);
+    }
 
     /**
      * Validates a VS Code TextDocument against the Rex render context and returns

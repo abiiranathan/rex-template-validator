@@ -163,18 +163,42 @@ export class HoverProvider {
     // ── Private helpers ────────────────────────────────────────────────────────
 
     /**
-     * Returns the word-like token under cursor offset inside rawText,
-     * allowing the characters [a-zA-Z0-9_$.].  Returns null when no token
-     * is found.
-     */
+ * Returns the dot-path prefix that ends at the identifier segment under
+ * the cursor, so that hovering over any segment of `.Visit.Patient.ID`
+ * resolves only as far as that segment.
+ *
+ * Strategy:
+ *  - Walk BACKWARD using pathChar (includes '.') to reach the path start.
+ *  - Walk FORWARD using identChar (no '.') to reach the end of the current
+ *    segment — stopping before the next dot.
+ *
+ * Examples for `.Visit.Patient.ID`:
+ *   cursor on "Visit"   → ".Visit"
+ *   cursor on "Patient" → ".Visit.Patient"
+ *   cursor on "ID"      → ".Visit.Patient.ID"
+ */
     extractPathAtCursor(text: string, offset: number): string | null {
-        const allowed = /[a-zA-Z0-9_$.]/;
-        let start = offset;
-        while (start > 0 && allowed.test(text[start - 1])) start--;
-        let end = offset;
-        while (end < text.length && allowed.test(text[end])) end++;
-        if (start >= end) return null;
-        return text.substring(start, end);
+        const pathChar = /[a-zA-Z0-9_$.]/;   // includes '.' — for backward scan
+        const identChar = /[a-zA-Z0-9_$]/;    // excludes '.' — for forward scan
+
+        // If the cursor is sitting exactly on a dot, there is no identifier to resolve.
+        if (offset < text.length && text[offset] === '.') return null;
+
+        // Walk backward through the whole path expression (including dots).
+        let pathStart = offset;
+        while (pathStart > 0 && pathChar.test(text[pathStart - 1])) pathStart--;
+
+        // Walk forward only through the current identifier segment (stop at next dot).
+        let segEnd = offset;
+        while (segEnd < text.length && identChar.test(text[segEnd])) segEnd++;
+
+        if (pathStart >= segEnd) return null;
+
+        const result = text.substring(pathStart, segEnd);
+        // Reject bare '$' or '.' — they have no useful sub-path to resolve.
+        if (result === '.' || result === '$') return null;
+
+        return result;
     }
 
     /** Builds a hover card for a path that was successfully resolved. */

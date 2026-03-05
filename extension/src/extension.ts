@@ -184,6 +184,21 @@ export async function activate(context: vscode.ExtensionContext) {
     })
   );
 
+  context.subscriptions.push(
+    vscode.languages.registerReferenceProvider(TEMPLATE_SELECTOR, {
+      async provideReferences(document, position, refCtx) {
+        if (!validator) return [];
+
+        const locs = await validator.getReferences(
+          document,
+          position,
+          refCtx.includeDeclaration
+        );
+        return locs ?? [];
+      },
+    })
+  );
+
   // ── Initial build ──────────────────────────────────────────────────────────
 
   await rebuildIndex(workspaceRoot);
