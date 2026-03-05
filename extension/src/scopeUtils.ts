@@ -989,10 +989,13 @@ export class ScopeUtils {
         // Index current scope vars.
         for (const v of vars.values()) indexVar(v);
 
-        // Index dot frame fields.
-        const dotFrame = scopeStack.slice().reverse().find(f => f.key === '.');
-        if (dotFrame?.fields) {
-            for (const f of dotFrame.fields) indexVar(f);
+        // Index all dot frames in the scope stack.
+        // This ensures types defined in the root context (or any parent context)
+        // are indexed even when we are inside a range block.
+        for (const frame of scopeStack) {
+            if (frame.key === '.' && frame.fields) {
+                for (const f of frame.fields) indexVar(f);
+            }
         }
 
         // Index ALL vars from ALL templates in the knowledge graph.

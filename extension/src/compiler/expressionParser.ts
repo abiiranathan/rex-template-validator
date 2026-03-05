@@ -777,64 +777,68 @@ export class TypeInferencer {
         switch (func) {
             case 'index': {
                 if (args.length < 2) return null;
-                const target = this.inferNodeType(args[0]);
-                if (!target) return null;
+                let currentType = this.inferNodeType(args[0]);
+                if (!currentType) return null;
 
-                // Strip pointer from the collection type before inspecting its shape.
-                let targetTypeStr = target.typeStr;
-                while (targetTypeStr.startsWith('*')) targetTypeStr = targetTypeStr.slice(1);
+                for (let i = 1; i < args.length; i++) {
+                    // Strip pointer from the collection type before inspecting its shape.
+                    let targetTypeStr = currentType.typeStr;
+                    while (targetTypeStr.startsWith('*')) targetTypeStr = targetTypeStr.slice(1);
 
-                let elemTypeStr = '';
-                if (target.elemType) {
-                    elemTypeStr = target.elemType;
-                } else if (targetTypeStr.startsWith('[]')) {
-                    elemTypeStr = targetTypeStr.slice(2);
-                } else if (targetTypeStr.startsWith('map[')) {
-                    elemTypeStr = this.extractMapValueType(targetTypeStr);
-                }
+                    let elemTypeStr = '';
+                    if (currentType.elemType) {
+                        elemTypeStr = currentType.elemType;
+                    } else if (targetTypeStr.startsWith('[]')) {
+                        elemTypeStr = targetTypeStr.slice(2);
+                    } else if (targetTypeStr.startsWith('map[')) {
+                        elemTypeStr = this.extractMapValueType(targetTypeStr);
+                    }
 
-                if (!elemTypeStr) return null;
+                    if (!elemTypeStr) return null;
 
-                // Go templates auto-dereference pointers; strip so that downstream type
-                // lookups and field resolution always receive a bare struct name.
-                // e.g. map[uint][]*Payment → index → '[]*Payment' → elemType 'Payment'
-                while (elemTypeStr.startsWith('*')) elemTypeStr = elemTypeStr.slice(1);
+                    // Go templates auto-dereference pointers; strip so that downstream type
+                    // lookups and field resolution always receive a bare struct name.
+                    // e.g. map[uint][]*Payment → index → '[]*Payment' → elemType 'Payment'
+                    while (elemTypeStr.startsWith('*')) elemTypeStr = elemTypeStr.slice(1);
 
-                const bareType = extractBareType(elemTypeStr);
-                let isSlice = false, isMap = false;
-                let nextElemType = '', nextKeyType = '';
+                    const bareType = extractBareType(elemTypeStr);
+                    let isSlice = false, isMap = false;
+                    let nextElemType = '', nextKeyType = '';
 
-                if (elemTypeStr.startsWith('[]')) {
-                    isSlice = true;
-                    nextElemType = elemTypeStr.slice(2);
-                    // Strip pointer from the slice's own element type.
-                    while (nextElemType.startsWith('*')) nextElemType = nextElemType.slice(1);
-                } else if (elemTypeStr.startsWith('map[')) {
-                    isMap = true;
-                    let depth = 0, splitIdx = -1;
-                    for (let i = 4; i < elemTypeStr.length; i++) {
-                        if (elemTypeStr[i] === '[') depth++;
-                        else if (elemTypeStr[i] === ']') {
-                            if (depth === 0) { splitIdx = i; break; }
-                            depth--;
+                    if (elemTypeStr.startsWith('[]')) {
+                        isSlice = true;
+                        nextElemType = elemTypeStr.slice(2);
+                        // Strip pointer from the slice's own element type.
+                        while (nextElemType.startsWith('*')) nextElemType = nextElemType.slice(1);
+                    } else if (elemTypeStr.startsWith('map[')) {
+                        isMap = true;
+                        let depth = 0, splitIdx = -1;
+                        for (let j = 4; j < elemTypeStr.length; j++) {
+                            if (elemTypeStr[j] === '[') depth++;
+                            else if (elemTypeStr[j] === ']') {
+                                if (depth === 0) { splitIdx = j; break; }
+                                depth--;
+                            }
+                        }
+                        if (splitIdx !== -1) {
+                            nextKeyType = elemTypeStr.slice(4, splitIdx);
+                            nextElemType = elemTypeStr.slice(splitIdx + 1);
+                            // Strip pointer from map value type.
+                            while (nextElemType.startsWith('*')) nextElemType = nextElemType.slice(1);
                         }
                     }
-                    if (splitIdx !== -1) {
-                        nextKeyType = elemTypeStr.slice(4, splitIdx);
-                        nextElemType = elemTypeStr.slice(splitIdx + 1);
-                        // Strip pointer from map value type.
-                        while (nextElemType.startsWith('*')) nextElemType = nextElemType.slice(1);
-                    }
+
+                    currentType = {
+                        typeStr: elemTypeStr,
+                        fields: this.fieldResolver?.(bareType),
+                        isSlice,
+                        isMap,
+                        elemType: nextElemType || undefined,
+                        keyType: nextKeyType || undefined,
+                    };
                 }
 
-                return {
-                    typeStr: elemTypeStr,
-                    fields: this.fieldResolver?.(bareType),
-                    isSlice,
-                    isMap,
-                    elemType: nextElemType || undefined,
-                    keyType: nextKeyType || undefined,
-                };
+                return currentType;
             }
 
             case 'slice': {

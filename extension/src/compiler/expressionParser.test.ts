@@ -87,6 +87,14 @@ function createTestVars(): Map<string, TemplateVar> {
       elemType: 'string',
       isSlice: false,
     }],
+    ['NestedConfig', {
+      name: 'NestedConfig',
+      type: 'map[string]map[string]Item',
+      isMap: true,
+      keyType: 'string',
+      elemType: 'map[string]Item',
+      isSlice: false,
+    }],
     ['paymentsMap', {
       name: 'paymentsMap',
       type: 'map[uint][]*Payment',
@@ -225,6 +233,7 @@ function testBuiltinFunctions(vars: Map<string, TemplateVar>): [number, number] 
     { name: 'len on map', expr: 'len .Config', expectedType: 'int' },
     { name: 'index on slice', expr: 'index .Items 0', expectedType: 'Item' },
     { name: 'index on map', expr: 'index .Config "key"', expectedType: 'interface{}' },
+    { name: 'index on map multiple keys', expr: 'index .NestedConfig "key1" "key2"', expectedType: 'Item' },
     { name: 'slice operation', expr: 'slice .Items 0 5', expectedType: '[]Item' },
     { name: 'print function', expr: 'print .Count', expectedType: 'string' },
     { name: 'printf function', expr: 'printf "%d" .Count', expectedType: 'string' },
