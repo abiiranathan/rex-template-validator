@@ -49,6 +49,18 @@ func extractFieldsWithDocsDepth(
 	}
 
 	t = unwrapType(t)
+	// Additional unwrapping for slice and array types so we extract
+	// fields of the underlying struct instead of returning empty fields.
+	for {
+		if s, ok := t.(*types.Slice); ok {
+			t = unwrapType(s.Elem())
+		} else if a, ok := t.(*types.Array); ok {
+			t = unwrapType(a.Elem())
+		} else {
+			break
+		}
+	}
+
 	if t == nil {
 		return nil, ""
 	}
