@@ -287,19 +287,39 @@ export class ScopeUtils {
             : result.typeStr;
 
         // Prefer the explicitly-computed elemType over re-deriving from the raw string.
-        let elemTypeStr =
-            result.isSlice && result.elemType
-                ? result.elemType
-                : result.isSlice && rawTypeStr.startsWith('[]')
-                    ? rawTypeStr.slice(2)
-                    : result.isMap && result.elemType
-                        ? result.elemType
-                        : rawTypeStr;
+        let elemTypeStr = result.elemType;
+        let mapKeyType = result.keyType;
+
+        if (!elemTypeStr) {
+            if (result.isSlice && rawTypeStr.startsWith('[]')) {
+                elemTypeStr = rawTypeStr.slice(2);
+            } else if (result.isMap && rawTypeStr.startsWith('map[')) {
+                let depth = 0;
+                let splitIdx = -1;
+                for (let i = 4; i < rawTypeStr.length; i++) {
+                    if (rawTypeStr[i] === '[') depth++;
+                    else if (rawTypeStr[i] === ']') {
+                        if (depth === 0) { splitIdx = i; break; }
+                        depth--;
+                    }
+                }
+                if (splitIdx !== -1) {
+                    mapKeyType = rawTypeStr.slice(4, splitIdx).trim();
+                    elemTypeStr = rawTypeStr.slice(splitIdx + 1).trim();
+                } else {
+                    elemTypeStr = rawTypeStr; // fallback
+                }
+            } else {
+                elemTypeStr = rawTypeStr;
+            }
+        }
 
         // Strip pointer — Go templates auto-dereference.
         // Without this, ranging over []*Payment gives typeStr '*Payment' in the scope
         // frame, breaking all field lookups inside the loop body.
-        while (elemTypeStr.startsWith('*')) elemTypeStr = elemTypeStr.slice(1);
+        while (elemTypeStr && elemTypeStr.startsWith('*')) {
+            elemTypeStr = elemTypeStr.slice(1);
+        }
 
         let isElemSlice = false;
         let isElemMap = false;
