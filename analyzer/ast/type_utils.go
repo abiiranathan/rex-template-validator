@@ -20,15 +20,16 @@ func getASTKey(named *types.Named) string {
 	return obj.Name()
 }
 
-// normalizeTypeStr makes type strings more readable by removing package paths.
-// It correctly handles generic instantiations.
+// normalizeTypeStr makes type strings readable by replacing full import paths
+// with their package names, while preserving the package qualifier.
+// Example: "github.com/user/pkg.PatientPayments" → "views.PatientPayments"
 // Example: "github.com/user/pkg.Page[github.com/user/pkg.User]" → "Page[User]"
 func normalizeTypeStr(t types.Type) string {
 	if t == nil {
 		return ""
 	}
-	return types.TypeString(t, func(*types.Package) string {
-		return "" // Omits package paths completely
+	return types.TypeString(t, func(pkg *types.Package) string {
+		return pkg.Name() // keep short package name, drop import path
 	})
 }
 
