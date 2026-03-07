@@ -1,12 +1,5 @@
 /**
  * Package validatorCore provides the core template validation logic for the Rex Template Validator.
- * It handles AST traversal, scope resolution, and diagnostic generation.
- *
- * Named blocks ({{ define "name" }} / {{ block "name" ... }}) are resolved
- * from a cross-file NamedBlockRegistry built by KnowledgeGraphBuilder.
- *
- * Duplicate block-name detection: if the same name is declared in more than one
- * file, a diagnostic error is surfaced on every call-site that references it.
  */
 
 import * as fs from 'fs';
@@ -23,11 +16,10 @@ import { TemplateParser, resolvePath } from './templateParser';
 import { KnowledgeGraphBuilder } from './knowledgeGraph';
 import { inferExpressionType, TypeResult } from './compiler/expressionParser';
 import { ResolveResult } from './templateParser';
-import { ScopeUtils, fieldInfoToTemplateVar, isFileBasedPartial } from './scopeUtils';
+import { ScopeUtils, fieldInfoToTemplateVar, isFileBasedPartial, normalizeDictArg } from './scopeUtils';
 
 /**
  * ValidatorCore performs structural validation of Go templates.
- * It emits ValidationError values; conversion to vscode.Diagnostic is handled by TemplateValidator.
  */
 export class ValidatorCore {
     private readonly parser: TemplateParser;
@@ -48,10 +40,6 @@ export class ValidatorCore {
 
     // ── Public API ─────────────────────────────────────────────────────────────
 
-    /**
-     * Validates a template document's content against the provided context.
-     * Returns a list of ValidationError values; never throws.
-     */
     validate(content: string, ctx: TemplateContext, filePath: string): ValidationError[] {
         const errors: ValidationError[] = [];
         const nodes = this.parser.parse(content);
@@ -75,10 +63,6 @@ export class ValidatorCore {
 
     // ── Node traversal ─────────────────────────────────────────────────────────
 
-    /**
-     * Recursively validates a list of template nodes, maintaining inherited
-     * blockLocals across siblings.
-     */
     validateNodes(
         nodes: TemplateNode[],
         vars: Map<string, TemplateVar>,
@@ -109,65 +93,41 @@ export class ValidatorCore {
     ) {
         switch (node.kind) {
             case 'assignment': {
-                this.validateAssignment(
-                    node, vars, scopeStack, blockLocals, errors
-                );
+                this.validateAssignment(node, vars, scopeStack, blockLocals, errors);
                 break;
             }
-
             case 'variable': {
-                this.validateVariable(
-                    node, vars, scopeStack, blockLocals, errors
-                );
+                this.validateVariable(node, vars, scopeStack, blockLocals, errors);
                 break;
             }
-
             case 'range': {
-                this.validateRange(
-                    node, vars, scopeStack, blockLocals, errors, ctx, filePath
-                );
-                return; // Children handled inside.
-            }
-
-            case 'with': {
-                this.validateWith(
-                    node, vars, scopeStack, blockLocals, errors, ctx, filePath
-                );
-                return; // Children handled inside.
-            }
-
-            case 'if': {
-                this.validateIf(
-                    node, vars, scopeStack, blockLocals, errors, ctx, filePath
-                );
-                return; // Children handled inside.
-            }
-
-            case 'partial': {
-                this.validatePartial(
-                    node, vars, scopeStack, blockLocals, errors, ctx, filePath
-                );
+                this.validateRange(node, vars, scopeStack, blockLocals, errors, ctx, filePath);
                 return;
             }
-
+            case 'with': {
+                this.validateWith(node, vars, scopeStack, blockLocals, errors, ctx, filePath);
+                return;
+            }
+            case 'if': {
+                this.validateIf(node, vars, scopeStack, blockLocals, errors, ctx, filePath);
+                return;
+            }
+            case 'partial': {
+                this.validatePartial(node, vars, scopeStack, blockLocals, errors, ctx, filePath);
+                return;
+            }
             case 'block':
             case 'define': {
-                this.validateNamedBlockBody(
-                    node, vars, scopeStack, blockLocals, errors, ctx, filePath
-                );
+                this.validateNamedBlockBody(node, vars, scopeStack, blockLocals, errors, ctx, filePath);
                 return;
             }
         }
 
         if (node.children) {
-            this.validateNodes(
-                node.children, vars, scopeStack, errors, ctx, filePath, blockLocals
-            );
+            this.validateNodes(node.children, vars, scopeStack, errors, ctx, filePath, blockLocals);
         }
         if (node.elseChildren) {
-            this.validateNodes(
-                node.elseChildren, vars, scopeStack, errors, ctx, filePath, blockLocals
-            );
+            this.validateNodes(node.elseChildren, vars, scopeStack, errors, ctx, filePath, blockLocals);
         }
     }
 
@@ -186,7 +146,6 @@ export class ValidatorCore {
 
         let resolvedType: TypeResult | ResolveResult | null = null;
 
-        // 1. Try expression evaluation first.
         try {
             if (node.assignExpr) {
                 const exprType = inferExpressionType(
@@ -205,7 +164,6 @@ export class ValidatorCore {
             this.outputChannel.appendLine(`  Assignment inference error: ${e}`);
         }
 
-        // 2. Fallback to path resolution.
         if (!resolvedType) {
             const result = resolvePath(
                 node.path, vars, scopeStack, blockLocals,
@@ -223,9 +181,7 @@ export class ValidatorCore {
                     `  Assignment resolved via path: ${JSON.stringify(result)}`
                 );
             } else {
-                this.outputChannel.appendLine(
-                    `  Assignment path resolution ignored (empty path or invalid).`
-                );
+                this.outputChannel.appendLine(`  Assignment path resolution ignored.`);
             }
         }
 
@@ -235,8 +191,9 @@ export class ValidatorCore {
             }
         } else {
             this.outputChannel.appendLine(`  Assignment validation failed.`);
+            const available = this.scope.formatAvailableVars(vars, scopeStack, blockLocals);
             errors.push({
-                message: `Expression "${node.assignExpr}" is invalid or undefined`,
+                message: `Expression "${node.assignExpr}" is invalid or undefined. Available: ${available}`,
                 line: node.line,
                 col: node.col,
                 severity: 'error',
@@ -254,13 +211,10 @@ export class ValidatorCore {
         blockLocals: Map<string, TemplateVar>,
         errors: ValidationError[]
     ) {
-        // Skip context-relative references and root-scope shortcuts — these are always valid.
         if (node.path.length === 0) return;
         if (node.path[0] === '.') return;
         if (node.path[0] === '$' && node.path.length === 1) return;
 
-        // Strip Mustache delimiters (including optional whitespace-trimming dashes) to get
-        // a clean expression string we can pass to the type inferencer and regex matchers.
         const cleanExpr = node.rawText
             ? node.rawText.replace(/^\{\{-?\s*/, '').replace(/\s*-?\}\}$/, '')
             : '';
@@ -272,8 +226,6 @@ export class ValidatorCore {
         const fieldResolver = this.scope.buildFieldResolver(vars, scopeStack);
 
         // ── Step 1: Type-inference pass ─────────────────────────────────────────
-        // If the expression resolves to a known type (including pipelines, function
-        // calls, and compound expressions), it is valid — nothing more to check.
         if (cleanExpr) {
             try {
                 const exprType = inferExpressionType(
@@ -288,10 +240,6 @@ export class ValidatorCore {
         }
 
         // ── Step 2: Sub-variable resolution pass ────────────────────────────────
-        // When the top-level expression couldn't be typed, extract every variable
-        // reference within it (e.g. `$.foo`, `.bar`, `(index $list 0).name`) and
-        // check each one individually.  Reporting at the sub-variable level gives
-        // the user a more precise error location than pointing at the whole node.
         if (cleanExpr) {
             const varRefPattern =
                 /(\(index\s+(?:\$|\.)[\w\d_.]+\s+[^)]+\)(?:\.[\w\d_.]+)*|(?:\$|\.)[\w\d_.[\]]*)/g;
@@ -301,12 +249,10 @@ export class ValidatorCore {
                 let foundMissingRef = false;
 
                 for (const ref of refs) {
-                    // Skip numeric tuple indices (`.0`, `.1`, …) and spread tokens.
                     if (/^\.\d+$/.test(ref) || ref === '...') continue;
 
                     const subPath = this.parser.parseDotPath(ref);
 
-                    // Skip degenerate paths that are just `.` or `$` on their own.
                     const isRootOnlyPath =
                         subPath.length === 0 ||
                         (subPath.length === 1 && (subPath[0] === '.' || subPath[0] === '$'));
@@ -315,15 +261,14 @@ export class ValidatorCore {
                     const { found } = resolvePath(subPath, vars, scopeStack, blockLocals, fieldResolver);
                     if (found) continue;
 
-                    // Pinpoint the column to where this specific ref starts inside the node.
                     const refOffset = node.rawText.indexOf(ref);
                     const errCol = refOffset !== -1 ? node.col + refOffset : node.col;
 
-                    // Normalise the display path to always start with `$.` or `.`.
                     const displayPath = this.formatDisplayPath(subPath);
+                    const available = this.scope.formatAvailableVars(vars, scopeStack, blockLocals);
 
                     errors.push({
-                        message: `Template variable "${displayPath}" is not defined in the render context`,
+                        message: `Template variable "${displayPath}" is not defined in the render context. Available: ${available}`,
                         line: node.line,
                         col: errCol,
                         severity: 'error',
@@ -332,18 +277,11 @@ export class ValidatorCore {
                     foundMissingRef = true;
                 }
 
-                // At least one sub-variable error was emitted — stop here to avoid
-                // a redundant whole-expression error from Step 3.
                 if (foundMissingRef) return;
             }
         }
 
         // ── Step 3: Bare-path fallback ───────────────────────────────────────────
-        // For simple field accesses (no whitespace, pipes, or parens) that still
-        // couldn't be resolved, emit a single error on the whole node.
-        // Complex expressions (function calls, pipelines, etc.) are intentionally
-        // skipped here because their constituent parts were already checked above,
-        // and unknown built-ins / helpers should not produce spurious errors.
         const isComplexExpr = cleanExpr ? /[\s|()]/.test(cleanExpr) : false;
         if (isComplexExpr) return;
 
@@ -353,8 +291,9 @@ export class ValidatorCore {
 
         if (!pathResolved) {
             const displayPath = this.formatDisplayPath(node.path);
+            const available = this.scope.formatAvailableVars(vars, scopeStack, blockLocals);
             errors.push({
-                message: `Template variable "${displayPath}" is not defined in the render context`,
+                message: `Template variable "${displayPath}" is not defined in the render context. Available: ${available}`,
                 line: node.line,
                 col: node.col,
                 severity: 'error',
@@ -389,14 +328,10 @@ export class ValidatorCore {
         }
 
         if (node.children) {
-            this.validateNodes(
-                node.children, vars, scopeStack, errors, ctx, filePath, blockLocals
-            );
+            this.validateNodes(node.children, vars, scopeStack, errors, ctx, filePath, blockLocals);
         }
         if (node.elseChildren) {
-            this.validateNodes(
-                node.elseChildren, vars, scopeStack, errors, ctx, filePath, blockLocals
-            );
+            this.validateNodes(node.elseChildren, vars, scopeStack, errors, ctx, filePath, blockLocals);
         }
     }
 
@@ -420,20 +355,15 @@ export class ValidatorCore {
             );
         }
 
-        const elemScope = this.scope.buildRangeElemScope(
-            node, vars, scopeStack, blockLocals
-        );
+        const elemScope = this.scope.buildRangeElemScope(node, vars, scopeStack, blockLocals);
         if (elemScope && node.children) {
             this.validateNodes(
-                node.children, vars, [...scopeStack, elemScope],
-                errors, ctx, filePath, blockLocals
+                node.children, vars, [...scopeStack, elemScope], errors, ctx, filePath, blockLocals
             );
         }
 
         if (node.elseChildren) {
-            this.validateNodes(
-                node.elseChildren, vars, scopeStack, errors, ctx, filePath, blockLocals
-            );
+            this.validateNodes(node.elseChildren, vars, scopeStack, errors, ctx, filePath, blockLocals);
         }
     }
 
@@ -477,16 +407,13 @@ export class ValidatorCore {
             }
             if (node.children) {
                 this.validateNodes(
-                    node.children, vars, [...scopeStack, childScope],
-                    errors, ctx, filePath, blockLocals
+                    node.children, vars, [...scopeStack, childScope], errors, ctx, filePath, blockLocals
                 );
             }
         }
 
         if (node.elseChildren) {
-            this.validateNodes(
-                node.elseChildren, vars, scopeStack, errors, ctx, filePath, blockLocals
-            );
+            this.validateNodes(node.elseChildren, vars, scopeStack, errors, ctx, filePath, blockLocals);
         }
     }
 
@@ -522,14 +449,15 @@ export class ValidatorCore {
 
         if (childScope) {
             this.validateNodes(
-                node.children, childScope.childVars, childScope.childStack,
-                errors, ctx, filePath
-            );
-        } else {
-            this.validateNodes(
-                node.children, vars, scopeStack, errors, ctx, filePath
+                node.children, childScope.childVars, childScope.childStack, errors, ctx, filePath
             );
         }
+        // When the context cannot be determined we intentionally skip body
+        // validation here.  The body will be validated with the correct context
+        // when we encounter the call site during validateNamedBlockFromCurrentFile.
+        // Falling back to root vars (the old else branch) caused global template
+        // vars to appear as "available" inside partials that only have access to
+        // what was explicitly passed — which is not how Go template scoping works.
     }
 
     private resolveNamedBlockChildScope(
@@ -544,10 +472,6 @@ export class ValidatorCore {
         const graph = this.graphBuilder.getGraph();
         const blockCtx = graph.templates.get(name);
 
-        // Helper: synthesize fields from graph-accumulated vars when a
-        // call-site resolves but yields empty / missing field metadata.
-        // This mirrors the identical pattern in resolveNamedBlockCallCtxForPosition
-        // (scopeUtils.ts) so validation agrees with hover / completion / definition.
         const synthFields = (): FieldInfo[] =>
             blockCtx ? ([...blockCtx.vars.values()] as unknown as FieldInfo[]) : [];
 
@@ -578,7 +502,7 @@ export class ValidatorCore {
             };
         };
 
-        // 1. Context-file definition takes highest priority.
+        // 1. Context-file definition.
         if (blockCtx) {
             const cfCall = blockCtx.renderCalls.find(rc => rc.file === 'context-file');
             if (cfCall && cfCall.vars) {
@@ -615,7 +539,7 @@ export class ValidatorCore {
             currentFileNodes, name, vars, scopeStack, new Map(blockLocals)
         );
         if (localCallCtx) {
-            return wrapCallCtx(localCallCtx);  // ← was a bare return, now synthesizes
+            return wrapCallCtx(localCallCtx);
         }
 
         // 3. Scan other template files.
@@ -636,13 +560,13 @@ export class ValidatorCore {
                     fileNodes, name, templateCtx.vars, []
                 );
                 if (callCtx) {
-                    return wrapCallCtx(callCtx);  // ← was a bare return, now synthesizes
+                    return wrapCallCtx(callCtx);
                 }
             } catch { /* ignore */ }
         }
 
-        // 4. Fall back to the block's own path argument.
-        if (node.kind === 'block' || node.kind === "define" && node.path.length > 0) {
+        // 4. Block's own path argument.
+        if (node.kind === 'block' || (node.kind === 'define' && node.path.length > 0)) {
             const result = resolvePath(
                 node.path, vars, scopeStack, blockLocals,
                 this.scope.buildFieldResolver(vars, scopeStack)
@@ -653,30 +577,24 @@ export class ValidatorCore {
                     childVars: this.scope.fieldsToVarMap(result.fields ?? []),
                     childStack: [{
                         key: '.', typeStr: result.typeStr, fields: result.fields ?? [],
+                        isMap: result.isMap, keyType: result.keyType,
+                        elemType: result.elemType, isSlice: result.isSlice,
                     }],
                 };
             }
         }
 
-        // 5. Final fallback — use knowledge graph's accumulated (merged) vars.
-        // The graph merges vars from ALL render calls across ALL callers, so this
-        // handles the "called from multiple templates" case that causes false positives
-        // when steps 1-4 find no matching call-site or an incomplete one.
-        if (blockCtx && blockCtx.vars.size > 0) {
-            const fields = [...blockCtx.vars.values()] as unknown as FieldInfo[];
-            return {
-                childVars: blockCtx.vars,
-                childStack: [{
-                    key: '.',
-                    typeStr: blockCtx.rootTypeStr ?? 'context',
-                    fields,
-                    isMap: blockCtx.isMap,
-                    keyType: blockCtx.keyType,
-                    elemType: blockCtx.elemType,
-                    isSlice: blockCtx.isSlice,
-                }],
-            };
-        }
+
+        // Step 5 (previously: knowledge-graph accumulated vars) intentionally
+        // removed.  Using accumulated vars from the knowledge graph as a last-
+        // resort context causes global template vars (.hospital, .NOW, .DEBUG …)
+        // to appear inside named templates that only have access to what was
+        // explicitly passed to them.  In Go templates a partial receives ONLY the
+        // context argument it is called with; it has no implicit access to the
+        // caller's scope.  If we cannot determine the call context via steps 1-4,
+        // return null so that validateNamedBlockBody skips body validation rather
+        // than producing false-positive "variable not defined" errors against the
+        // wrong context.
 
         return null;
     }
@@ -739,8 +657,10 @@ export class ValidatorCore {
         if (!node.partialName) return;
 
         const contextArg = node.partialContext ?? '.';
-        if (contextArg !== '.' && contextArg !== '$' && !contextArg.startsWith('dict ')) {
-            const contextPath = this.parser.parseDotPath(contextArg);
+        const normalizedCtx = normalizeDictArg(contextArg);
+
+        if (normalizedCtx !== '.' && normalizedCtx !== '$' && !normalizedCtx.startsWith('dict ')) {
+            const contextPath = this.parser.parseDotPath(normalizedCtx);
             if (contextPath.length > 0 && contextPath[0] !== '.') {
                 const result = resolvePath(
                     contextPath, vars, scopeStack, blockLocals,
@@ -759,8 +679,9 @@ export class ValidatorCore {
                             errCol = node.col + ctxIdx + (pIdx !== -1 ? pIdx : 0);
                         }
                     }
+                    const available = this.scope.formatAvailableVars(vars, scopeStack, blockLocals);
                     errors.push({
-                        message: `Template variable "${contextArg}" is not defined in the render context`,
+                        message: `Template variable "${contextArg}" is not defined in the render context. Available: ${available}`,
                         line: node.line,
                         col: errCol,
                         severity: 'error',
@@ -794,9 +715,7 @@ export class ValidatorCore {
 
         if (!fs.existsSync(partialCtx.absolutePath)) return;
 
-        const resolved = this.resolvePartialVars(
-            contextArg, vars, scopeStack, blockLocals
-        );
+        const resolved = this.resolvePartialVars(contextArg, vars, scopeStack, blockLocals);
         try {
             const openDoc = vscode.workspace.textDocuments.find(
                 d => d.uri.fsPath === partialCtx.absolutePath
@@ -825,7 +744,6 @@ export class ValidatorCore {
             }
         } catch { /* ignore read errors */ }
     }
-
 
     private validateNamedBlockFromCurrentFile(
         callNode: TemplateNode,
@@ -871,12 +789,15 @@ export class ValidatorCore {
             }
             if (!blockNode.children) return;
 
+            const normalizedCtx = normalizeDictArg(contextArg);
             let childStack: ScopeFrame[];
-            if (contextArg === '.' || contextArg === '$') {
+
+            if (normalizedCtx === '.' || normalizedCtx === '$') {
                 childStack = scopeStack;
-            } else if (contextArg.startsWith('dict ')) {
+            } else if (normalizedCtx.startsWith('dict ')) {
+                // FIX: use normalized (paren-stripped) arg for dict inference
                 const dictType = inferExpressionType(
-                    contextArg, vars, scopeStack, blockLocals,
+                    normalizedCtx, vars, scopeStack, blockLocals,
                     this.graphBuilder.getGraph().funcMaps,
                     this.scope.buildFieldResolver(vars, scopeStack)
                 );
@@ -893,7 +814,7 @@ export class ValidatorCore {
                     : scopeStack;
             } else {
                 const result = resolvePath(
-                    this.parser.parseDotPath(contextArg),
+                    this.parser.parseDotPath(normalizedCtx),
                     vars, scopeStack, blockLocals,
                     this.scope.buildFieldResolver(vars, scopeStack)
                 );
@@ -930,8 +851,10 @@ export class ValidatorCore {
     // ── Partial variable resolution ───────────────────────────────────────────
 
     /**
-     * Resolves the variable map and type metadata that should be used as the
-     * render context when validating a partial or named-block invocation.
+     * Resolves the variable map and type metadata for a partial/named-block invocation.
+     *
+     * FIX: normalise the contextArg before the dict check so that (dict ...) forms
+     * (parenthesised by the template parser) are correctly handled.
      */
     resolvePartialVars(
         contextArg: string,
@@ -946,7 +869,9 @@ export class ValidatorCore {
         isSlice?: boolean;
         rootTypeStr?: string;
     } {
-        if (contextArg === '.' || contextArg === '$') {
+        const normalizedCtx = normalizeDictArg(contextArg);
+
+        if (normalizedCtx === '.' || normalizedCtx === '$') {
             const dotFrame = scopeStack.slice().reverse().find(f => f.key === '.');
             if (dotFrame) {
                 const result = new Map<string, TemplateVar>();
@@ -965,9 +890,10 @@ export class ValidatorCore {
             return { vars: new Map(vars) };
         }
 
-        if (contextArg.startsWith('dict ')) {
+        // FIX: use normalized (paren-stripped) contextArg for dict detection
+        if (normalizedCtx.startsWith('dict ')) {
             const dictType = inferExpressionType(
-                contextArg, vars, scopeStack, blockLocals,
+                normalizedCtx, vars, scopeStack, blockLocals,
                 this.graphBuilder.getGraph().funcMaps,
                 this.scope.buildFieldResolver(vars, scopeStack)
             );
@@ -986,7 +912,7 @@ export class ValidatorCore {
         }
 
         const result = resolvePath(
-            this.parser.parseDotPath(contextArg),
+            this.parser.parseDotPath(normalizedCtx),
             vars, scopeStack, blockLocals,
             this.scope.buildFieldResolver(vars, scopeStack)
         );
