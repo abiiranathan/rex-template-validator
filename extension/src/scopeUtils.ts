@@ -986,21 +986,44 @@ export class ScopeUtils {
         const typeIndex = new Map<string, FieldInfo[]>();
 
         const indexVar = (v: TemplateVar | FieldInfo) => {
-            const bare = extractBareType(v.type);
-            if (bare && v.fields && v.fields.length > 0) {
+            let bare = extractBareType(v.type);
+            let retFields: FieldInfo[] | undefined;
+
+            if (v.type === 'method' && (v as FieldInfo).returns?.length) {
+                bare = extractBareType((v as FieldInfo).returns![0].type);
+                retFields = (v as FieldInfo).returns![0].fields;
+            } else if (v.type.startsWith('func(')) {
+                const match = v.type.match(/func\([^)]*\)\s*(.+)/);
+                if (match && match[1]) {
+                    let retType = match[1].trim();
+                    if (retType.startsWith('(')) {
+                        const commaIdx = retType.indexOf(',');
+                        const endIdx = retType.indexOf(')');
+                        const cutIdx = commaIdx !== -1 ? commaIdx : endIdx;
+                        retType = retType.slice(1, cutIdx).trim();
+                    }
+                    bare = extractBareType(retType);
+                }
+            }
+
+            const fieldsToIndex = retFields || v.fields;
+
+            if (bare && bare !== 'method' && !bare.startsWith('func(') && fieldsToIndex && fieldsToIndex.length > 0) {
                 const existing = typeIndex.get(bare);
                 if (existing) {
                     const existingNames = new Set(existing.map(f => f.name));
-                    for (const f of v.fields) {
+                    for (const f of fieldsToIndex) {
                         if (!existingNames.has(f.name)) {
                             existing.push(f);
                             indexVar(f);
                         }
                     }
                 } else {
-                    typeIndex.set(bare, [...v.fields]);
-                    for (const f of v.fields) indexVar(f);
+                    typeIndex.set(bare, [...fieldsToIndex]);
+                    for (const f of fieldsToIndex) indexVar(f);
                 }
+            } else if (fieldsToIndex && fieldsToIndex.length > 0) {
+                for (const f of fieldsToIndex) indexVar(f);
             }
         };
 

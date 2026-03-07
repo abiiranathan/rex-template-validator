@@ -516,7 +516,7 @@ export class TypeInferencer {
         // If we got a type string but no fields, attempt to hydrate fields from
         // the type registry. This covers funcMap return types, index results,
         // pipeline stage results, and any other path that yields a bare type name.
-        if (!result.fields && result.typeStr && result.typeStr !== 'unknown'
+        if ((!result.fields || result.fields.length === 0) && result.typeStr && result.typeStr !== 'unknown'
             && result.typeStr !== 'bool' && result.typeStr !== 'string'
             && result.typeStr !== 'int' && result.typeStr !== 'float64'
             && result.typeStr !== 'context') {
@@ -703,12 +703,13 @@ export class TypeInferencer {
             if (field.type === 'method' && field.returns && field.returns.length > 0) {
                 let retType = field.returns[0].type;
                 const bare = extractBareType(retType);
+                const retFields = field.returns[0].fields; // Extract from return type
 
                 const resolvedFields = this.fieldResolver?.(bare);
                 resolvedField = {
                     ...field,
                     type: retType,
-                    fields: resolvedFields,
+                    fields: (resolvedFields && resolvedFields.length > 0) ? resolvedFields : (retFields || field.fields),
                     isSlice: retType.startsWith('[]'),
                     isMap: retType.startsWith('map['),
                 };
@@ -732,7 +733,7 @@ export class TypeInferencer {
                     resolvedField = {
                         ...field,
                         type: retType,
-                        fields: resolvedFields,
+                        fields: (resolvedFields && resolvedFields.length > 0) ? resolvedFields : field.fields,
                         isSlice: retType.startsWith('[]'),
                         isMap: retType.startsWith('map['),
                     };
@@ -767,9 +768,10 @@ export class TypeInferencer {
             if (fn.returns && fn.returns.length > 0) {
                 let retType = fn.returns[0].type;
                 const bare = extractBareType(retType);
+                const retFields = fn.returns[0].fields || fn.returnTypeFields;
 
                 const resolvedFields = this.fieldResolver?.(bare);
-                return { typeStr: retType, fields: resolvedFields };
+                return { typeStr: retType, fields: (resolvedFields && resolvedFields.length > 0) ? resolvedFields : retFields };
             }
         }
 
@@ -931,10 +933,11 @@ export class TypeInferencer {
                         }
 
                         const bare = extractBareType(retType);
+                        const resolvedFields = this.fieldResolver?.(bare);
 
                         return {
                             typeStr: retType,
-                            fields: this.fieldResolver?.(bare),
+                            fields: (resolvedFields && resolvedFields.length > 0) ? resolvedFields : target.fields,
                             isSlice: retType.startsWith('[]'),
                             isMap: retType.startsWith('map['),
                         };
@@ -999,11 +1002,12 @@ export class TypeInferencer {
         if (methodField.returns && methodField.returns.length > 0) {
             let retType = methodField.returns[0].type;
             const bare = extractBareType(retType);
+            const retFields = methodField.returns[0].fields; // Extract from return type
 
             const resolvedFields = this.fieldResolver?.(bare);
             return {
                 typeStr: retType,
-                fields: resolvedFields,
+                fields: (resolvedFields && resolvedFields.length > 0) ? resolvedFields : (retFields || methodField.fields),
                 // Propagate slice/map info if available from resolved fields or type string
                 isSlice: retType.startsWith('[]'),
                 isMap: retType.startsWith('map['),
