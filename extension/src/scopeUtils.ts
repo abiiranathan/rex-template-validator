@@ -44,6 +44,40 @@ export function isFileBasedPartial(name: string): boolean {
     );
 }
 
+/**
+ * Normalises a template context argument so that dict calls wrapped in
+ * parentheses — e.g. `(dict "key" .Value)` — are unwrapped to `dict "key" .Value`.
+ * This is necessary because the Go template parser allows (and the TemplateParser
+ * preserves) the parenthesised form of any pipeline expression, including dict calls.
+ */
+export function normalizeDictArg(contextArg: string): string {
+    let s = contextArg.trim();
+    // Iteratively strip balanced outer parentheses.
+    while (s.startsWith('(') && s.endsWith(')')) {
+        const inner = s.slice(1, -1).trim();
+        // Only strip if the parens are truly the outermost wrapper — verify by
+        // scanning that the opening '(' is balanced by the closing ')'.
+        let depth = 0;
+        let balanced = false;
+        for (let i = 0; i < s.length; i++) {
+            if (s[i] === '(') depth++;
+            else if (s[i] === ')') {
+                depth--;
+                if (depth === 0) {
+                    balanced = i === s.length - 1;
+                    break;
+                }
+            }
+        }
+        if (balanced) {
+            s = inner;
+        } else {
+            break;
+        }
+    }
+    return s;
+}
+
 // ── ScopeUtils class ──────────────────────────────────────────────────────────
 
 /**
@@ -163,6 +197,9 @@ export class ScopeUtils {
     /**
      * Builds the scope for the body of a {{ define }} / {{ block }} node by
      * resolving the call-site context, then falling back to the knowledge graph.
+     *
+     * FIX: propagate isMap/keyType/elemType/isSlice into the scope frame so that
+     * dict-based contexts (map[string]any with typed fields) resolve correctly.
      */
     buildNamedBlockScope(
         node: TemplateNode,
@@ -176,7 +213,16 @@ export class ScopeUtils {
         if (callCtx) {
             return {
                 childVars: vars,   // root vars preserved for $ resolution
-                childStack: [{ key: '.', typeStr: callCtx.typeStr, fields: callCtx.fields ?? [] }],
+                childStack: [{
+                    key: '.',
+                    typeStr: callCtx.typeStr,
+                    fields: callCtx.fields ?? [],
+                    // ↓ previously missing — caused dict contexts to lose map metadata
+                    isMap: callCtx.isMap,
+                    keyType: callCtx.keyType,
+                    elemType: callCtx.elemType,
+                    isSlice: callCtx.isSlice,
+                }],
             };
         }
 
@@ -205,7 +251,15 @@ export class ScopeUtils {
             if (result.found) {
                 return {
                     childVars: this.fieldsToVarMap(result.fields ?? []),
-                    childStack: [{ key: '.', typeStr: result.typeStr, fields: result.fields ?? [] }],
+                    childStack: [{
+                        key: '.',
+                        typeStr: result.typeStr,
+                        fields: result.fields ?? [],
+                        isMap: result.isMap,
+                        keyType: result.keyType,
+                        elemType: result.elemType,
+                        isSlice: result.isSlice,
+                    }],
                 };
             }
         }
@@ -228,9 +282,6 @@ export class ScopeUtils {
         const fieldResolver = this.buildFieldResolver(vars, scopeStack);
 
         // Primary: use expression inference when a full expression string is present.
-        // This correctly handles complex range targets like `(index $.paymentsMap $id)`
-        // where parseDotPath reduces the expression to just the collection path,
-        // losing the index call and returning the map type instead of its value type.
         if (node.assignExpr) {
             try {
                 const exprType = inferExpressionType(
@@ -249,7 +300,7 @@ export class ScopeUtils {
             } catch { /* fall through to path-based resolution */ }
         }
 
-        // Fallback: resolve via the pre-parsed dot-path (covers simple `.Field` ranges).
+        // Fallback: resolve via the pre-parsed dot-path.
         const result = resolvePath(node.path, vars, scopeStack, blockLocals, fieldResolver);
         if (!result.found) return null;
         return this.buildRangeElemScopeFromType(node, result, vars, scopeStack, fieldResolver);
@@ -257,8 +308,6 @@ export class ScopeUtils {
 
     /**
      * Constructs a ScopeFrame from an already-resolved collection type.
-     * Shared by both the expression-inference and path-resolution paths of
-     * buildRangeElemScope.
      */
     private buildRangeElemScopeFromType(
         node: TemplateNode,
@@ -281,12 +330,10 @@ export class ScopeUtils {
             if (field) sourceVar = fieldInfoToTemplateVar(field);
         }
 
-        // Strip a leading pointer sigil before inspecting the type shape.
         const rawTypeStr = result.typeStr.startsWith('*')
             ? result.typeStr.slice(1)
             : result.typeStr;
 
-        // Prefer the explicitly-computed elemType over re-deriving from the raw string.
         let elemTypeStr = result.elemType;
         let mapKeyType = result.keyType;
 
@@ -307,16 +354,13 @@ export class ScopeUtils {
                     mapKeyType = rawTypeStr.slice(4, splitIdx).trim();
                     elemTypeStr = rawTypeStr.slice(splitIdx + 1).trim();
                 } else {
-                    elemTypeStr = rawTypeStr; // fallback
+                    elemTypeStr = rawTypeStr;
                 }
             } else {
                 elemTypeStr = rawTypeStr;
             }
         }
 
-        // Strip pointer — Go templates auto-dereference.
-        // Without this, ranging over []*Payment gives typeStr '*Payment' in the scope
-        // frame, breaking all field lookups inside the loop body.
         while (elemTypeStr && elemTypeStr.startsWith('*')) {
             elemTypeStr = elemTypeStr.slice(1);
         }
@@ -329,7 +373,6 @@ export class ScopeUtils {
         if (elemTypeStr.startsWith('[]')) {
             isElemSlice = true;
             elemInnerType = elemTypeStr.slice(2);
-            // Strip pointer from the slice's own element type.
             while (elemInnerType.startsWith('*')) elemInnerType = elemInnerType.slice(1);
         } else if (elemTypeStr.startsWith('map[')) {
             isElemMap = true;
@@ -345,7 +388,6 @@ export class ScopeUtils {
             if (splitIdx !== -1) {
                 elemKeyType = elemTypeStr.slice(4, splitIdx).trim();
                 elemInnerType = elemTypeStr.slice(splitIdx + 1).trim();
-                // Strip pointer from map value type.
                 while (elemInnerType.startsWith('*')) elemInnerType = elemInnerType.slice(1);
             }
         }
@@ -404,7 +446,6 @@ export class ScopeUtils {
 
     /**
      * Records the inferred type of each assigned variable into blockLocals.
-     * Handles single-variable, map-destructure (k, v), and slice-destructure assignments.
      */
     applyAssignmentLocals(
         assignVars: string[],
@@ -445,8 +486,8 @@ export class ScopeUtils {
     }
 
     /**
-     * Processes an assignment node by inferring the RHS type (expression first,
-     * then path-resolution fallback) and recording the result into blockLocals.
+     * Processes an assignment node by inferring the RHS type and recording
+     * the result into blockLocals.
      */
     processAssignment(
         node: TemplateNode,
@@ -461,7 +502,6 @@ export class ScopeUtils {
             | import('./templateParser').ResolveResult
             | null = null;
 
-        // 1. Try expression inference.
         try {
             if (node.assignExpr) {
                 const exprType = inferExpressionType(
@@ -476,7 +516,6 @@ export class ScopeUtils {
             }
         } catch { }
 
-        // 2. Fallback to path resolution.
         if (!resolvedType) {
             const result = resolvePath(
                 node.path, vars, scopeStack, blockLocals,
@@ -488,9 +527,6 @@ export class ScopeUtils {
                     !(node.path.length === 1 && node.path[0] === '.' && !isExplicitContext)) ||
                 isExplicitContext;
 
-            // Do not apply the path-based fallback for 'index' or 'slice' calls: the
-            // extracted path refers to the *collection*, not the *element* the expression
-            // produces.  A wrong type here is worse than no type.
             const isCollectionOp = /^\s*(?:index|slice)\s+/.test(node.assignExpr ?? '');
             if (!isCollectionOp && result.found && isValidPath) {
                 resolvedType = result;
@@ -505,8 +541,7 @@ export class ScopeUtils {
     // ── AST queries ───────────────────────────────────────────────────────────
 
     /**
-     * Returns the innermost {{ define }} / {{ block }} node that contains position,
-     * or null when the cursor is not inside any named block.
+     * Returns the innermost {{ define }} / {{ block }} node that contains position.
      */
     findEnclosingBlockOrDefine(
         nodes: TemplateNode[],
@@ -538,14 +573,28 @@ export class ScopeUtils {
     /**
      * Finds the call-site context of a named block by scanning nodes for
      * {{ template "name" <ctx> }} or {{ block "name" <ctx> }} tags.
-     * Returns the resolved type/fields of the context argument, or null.
+     *
+     * FIX: normalise contextArg with normalizeDictArg so that (dict ...) expressions
+     * wrapped in parentheses are correctly detected and evaluated.
      */
     findCallSiteContext(
         nodes: TemplateNode[],
         blockName: string,
         vars: Map<string, TemplateVar>,
         scopeStack: ScopeFrame[],
-        blockLocals: Map<string, TemplateVar> = new Map()
+        blockLocals: Map<string, TemplateVar> = new Map(),
+        /**
+         * The root-level nodes of the file being scanned.  Kept constant across
+         * all recursive calls so that when we enter a {{ define }} body we can
+         * search the whole file for that define's call site.
+         * Defaults to `nodes` on the first (non-recursive) call.
+         */
+        _rootNodes?: TemplateNode[],
+        /**
+         * Names of {{ define }} blocks we are currently resolving, used to break
+         * cycles (A calls B calls A).
+         */
+        _visitedDefines?: Set<string>
     ): {
         typeStr: string;
         fields?: FieldInfo[];
@@ -554,6 +603,9 @@ export class ScopeUtils {
         elemType?: string;
         isSlice?: boolean;
     } | null {
+        const rootNodes = _rootNodes ?? nodes;
+        const visitedDefines = _visitedDefines ?? new Set<string>();
+
         for (const node of nodes) {
             this.processAssignment(node, vars, scopeStack, blockLocals);
 
@@ -573,7 +625,10 @@ export class ScopeUtils {
                                 : '.' + node.path.join('.');
                 }
 
-                if (contextArg === '.' || contextArg === '') {
+                // Strip outer parens — e.g. (dict "k" .V) → dict "k" .V
+                const normalizedCtx = normalizeDictArg(contextArg);
+
+                if (normalizedCtx === '.' || normalizedCtx === '') {
                     const frame = scopeStack.slice().reverse().find(f => f.key === '.');
                     if (frame) {
                         return {
@@ -588,9 +643,9 @@ export class ScopeUtils {
                     return { typeStr: 'context', fields: [...vars.values()] as unknown as FieldInfo[] };
                 }
 
-                if (contextArg.startsWith('dict ')) {
+                if (normalizedCtx.startsWith('dict ')) {
                     const dictType = inferExpressionType(
-                        contextArg, vars, scopeStack, blockLocals,
+                        normalizedCtx, vars, scopeStack, blockLocals,
                         this.graphBuilder.getGraph().funcMaps,
                         this.buildFieldResolver(vars, scopeStack)
                     );
@@ -607,7 +662,7 @@ export class ScopeUtils {
                 }
 
                 const result = resolvePath(
-                    this.parser.parseDotPath(contextArg), vars, scopeStack, blockLocals,
+                    this.parser.parseDotPath(normalizedCtx), vars, scopeStack, blockLocals,
                     this.buildFieldResolver(vars, scopeStack)
                 );
                 return result.found
@@ -624,6 +679,7 @@ export class ScopeUtils {
 
             if (node.children) {
                 let childStack = scopeStack;
+                let childVars = vars;
                 const childLocals = new Map(blockLocals);
 
                 if (node.kind === 'range') {
@@ -673,10 +729,43 @@ export class ScopeUtils {
                             ];
                         }
                     }
+                } else if (node.kind === 'define' && node.blockName && !visitedDefines.has(node.blockName)) {
+                    // ── BUG FIX: context chain propagation through {{ define }} ──────────────
+                    // When we enter a define body we must use the context that define is
+                    // CALLED with, not the outer root scope.  Without this, any template
+                    // call found *inside* the define body (e.g. {{ template "child" . }})
+                    // evaluates "." against the root scope and picks up global vars instead
+                    // of the dict/path that was passed to this define.
+                    //
+                    // We search `rootNodes` (the full file, constant across all recursive
+                    // calls) for the call site of this define, using `visitedDefines` to
+                    // prevent cycles.
+                    const newVisited = new Set(visitedDefines);
+                    newVisited.add(node.blockName);
+
+                    const defineCtx = this.findCallSiteContext(
+                        rootNodes, node.blockName, vars, scopeStack,
+                        new Map(), rootNodes, newVisited
+                    );
+
+                    if (defineCtx && (defineCtx.fields?.length ?? 0) > 0) {
+                        childStack = [{
+                            key: '.',
+                            typeStr: defineCtx.typeStr,
+                            fields: defineCtx.fields,
+                            isMap: defineCtx.isMap,
+                            keyType: defineCtx.keyType,
+                            elemType: defineCtx.elemType,
+                            isSlice: defineCtx.isSlice,
+                        }];
+                        // Inside the define, '$' refers to the passed context, not the root
+                        childVars = this.fieldsToVarMap(defineCtx.fields ?? []);
+                    }
                 }
 
                 const found = this.findCallSiteContext(
-                    node.children, blockName, vars, childStack, childLocals
+                    node.children, blockName, childVars, childStack, childLocals,
+                    rootNodes, visitedDefines
                 );
                 if (found) return found;
             }
@@ -685,8 +774,7 @@ export class ScopeUtils {
     }
 
     /**
-     * Walks the AST to find the first {{ define "name" }} / {{ block "name" }} node
-     * with the given name.  Returns null when not found.
+     * Walks the AST to find the first {{ define "name" }} / {{ block "name" }} node.
      */
     findDefineNodeInAST(
         nodes: TemplateNode[],
@@ -709,7 +797,6 @@ export class ScopeUtils {
     /**
      * Traverses nodes to find the leaf node that spans position, propagating
      * the correct scope stack and blockLocals through range/with/block containers.
-     * Returns null when no node covers position.
      */
     findNodeAtPosition(
         nodes: TemplateNode[],
@@ -793,7 +880,7 @@ export class ScopeUtils {
                         elemType: callCtx.elemType,
                         isSlice: callCtx.isSlice,
                     }];
-                    childLocals = new Map(); // Fresh context for named blocks.
+                    childLocals = new Map();
                 }
             } else {
                 const childScope = this.buildChildScope(
@@ -805,7 +892,6 @@ export class ScopeUtils {
                 }
             }
 
-            // Check if position is in the else branch
             const elseLine = node.elseLine;
             let inElse = false;
             if (elseLine !== undefined) {
@@ -837,8 +923,7 @@ export class ScopeUtils {
     }
 
     /**
-     * Determines the active scope (stack + locals) at a given document position
-     * by walking the AST and propagating scopes through container nodes.
+     * Determines the active scope (stack + locals) at a given document position.
      */
     findScopeAtPosition(
         nodes: TemplateNode[],
@@ -977,8 +1062,7 @@ export class ScopeUtils {
 
     /**
      * Builds a field-resolver closure that maps a bare Go type name (e.g. "User")
-     * to its FieldInfo array.  Used to hydrate funcMap return types that carry only
-     * a type string with no field metadata.
+     * to its FieldInfo array.
      */
     buildFieldResolver(
         vars: Map<string, TemplateVar>,
@@ -991,7 +1075,6 @@ export class ScopeUtils {
             if (bare && v.fields && v.fields.length > 0) {
                 const existing = typeIndex.get(bare);
                 if (existing) {
-                    // Merge fields to prevent collisions from hiding data in large projects
                     const existingNames = new Set(existing.map(f => f.name));
                     for (const f of v.fields) {
                         if (!existingNames.has(f.name)) {
@@ -1006,33 +1089,21 @@ export class ScopeUtils {
             }
         };
 
-        // Index current scope vars.
         for (const v of vars.values()) indexVar(v);
 
-        // Index all dot frames in the scope stack.
-        // This ensures types defined in the root context (or any parent context)
-        // are indexed even when we are inside a range block.
         for (const frame of scopeStack) {
             if (frame.key === '.' && frame.fields) {
                 for (const f of frame.fields) indexVar(f);
             }
         }
 
-        // Index ALL vars from ALL templates in the knowledge graph.
-        // This catches types (like MgtHints) that only appear as funcMap
-        // return types and never as top-level template vars in the current file.
         const graph = this.graphBuilder.getGraph();
         for (const [, ctx] of graph.templates) {
             for (const v of ctx.vars.values()) indexVar(v);
         }
 
-        // ── Key fix: index return-type fields from funcMap registry ──────────────
-        // FuncMaps like `ManagementHints` return `*[]MgtHints`. Without this block,
-        // `MgtHints` fields are entirely invisible to the type index unless they
-        // happen to appear as a template var somewhere else — which they often don't.
         for (const [, fn] of graph.funcMaps) {
             if (!fn.returnTypeFields || fn.returnTypeFields.length === 0) continue;
-
             const retType = fn.returns?.[0]?.type ?? '';
             const bare = extractBareType(retType);
             if (bare) {
@@ -1058,12 +1129,52 @@ export class ScopeUtils {
         };
     }
 
+    /**
+     * Collects the names of all variables/fields accessible in the current scope,
+     * formatted for inclusion in error messages.
+     *
+     * Returns a short, human-readable summary string, e.g.:
+     *   ".Name, .Age, .Email, $item, $idx"
+     */
+    formatAvailableVars(
+        vars: Map<string, TemplateVar>,
+        scopeStack: ScopeFrame[],
+        blockLocals: Map<string, TemplateVar>
+    ): string {
+        const names: string[] = [];
+
+        // Dollar-sign locals: $item, $idx, etc.
+        for (const k of blockLocals.keys()) names.push(k);
+        for (const frame of scopeStack) {
+            if (frame.locals) {
+                for (const k of frame.locals.keys()) {
+                    if (!names.includes(k)) names.push(k);
+                }
+            }
+        }
+
+        // Fields from the innermost dot frame (or root vars if no dot frame).
+        const dotFrame = scopeStack.slice().reverse().find(f => f.key === '.');
+        const contextFields: FieldInfo[] = dotFrame?.fields?.length
+            ? dotFrame.fields
+            : [...vars.values()].map(v => ({ name: v.name, type: v.type, isSlice: v.isSlice ?? false }));
+
+        const MAX_FIELDS = 10;
+        for (const f of contextFields.slice(0, MAX_FIELDS)) {
+            names.push('.' + f.name);
+        }
+        if (contextFields.length > MAX_FIELDS) {
+            names.push(`...and ${contextFields.length - MAX_FIELDS} more`);
+        }
+
+        return names.length > 0 ? names.join(', ') : 'none';
+    }
+
     // ── Private: named-block context resolution for position-based APIs ───────
 
     /**
      * Resolves the call-site context of a named block for hover/completion/definition
-     * consumers.  Checks the context-file registry first, then scans call sites in
-     * the current and other template files.
+     * consumers.
      */
     resolveNamedBlockCallCtxForPosition(
         blockName: string,

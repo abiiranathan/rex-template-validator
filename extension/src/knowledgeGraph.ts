@@ -15,6 +15,8 @@ import {
   RenderCall,
 } from './types';
 import { TemplateParser, resolvePath } from './templateParser';
+import { normalizeDictArg } from './scopeUtils';
+import { inferExpressionType } from './compiler/expressionParser';
 
 export class KnowledgeGraphBuilder {
   private graph: KnowledgeGraph = {
@@ -33,23 +35,12 @@ export class KnowledgeGraphBuilder {
     this.outputChannel = outputChannel;
   }
 
-  /**
-   * Resolves the base directory for templates by combining workspaceRoot,
-   * sourceDir, templateBaseDir, and templateRoot correctly.
-   *
-   * Both sourceDir and templateBaseDir may be absolute paths, so we always use
-   * path.resolve (which treats an absolute second argument as the new root) rather
-   * than path.join (which would concatenate blindly, producing garbage paths).
-   */
   private getTemplateBase(): string {
     const config = vscode.workspace.getConfiguration('rex-analyzer');
     const sourceDir: string = config.get('sourceDir') ?? '.';
     const templateBaseDir: string = config.get('templateBaseDir') ?? '';
     const templateRoot: string = config.get('templateRoot') ?? '';
 
-    // path.resolve handles absolute values of templateBaseDir / sourceDir correctly:
-    //   path.resolve('/workspace', '/abs/path') === '/abs/path'
-    //   path.resolve('/workspace', 'rel/path')  === '/workspace/rel/path'
     const baseDir = templateBaseDir
       ? path.resolve(this.workspaceRoot, templateBaseDir)
       : path.resolve(this.workspaceRoot, sourceDir);
@@ -89,15 +80,12 @@ export class KnowledgeGraphBuilder {
 
       mergeRenderCall(logicalPath, absPath, rc);
 
-      // If this render call targets a named block, ALSO inject its variables into the file where the block is defined
       if (analysisResult.namedBlocks && analysisResult.namedBlocks[logicalPath]) {
         const entries = analysisResult.namedBlocks[logicalPath];
         if (entries.length > 0) {
           const entry = entries[0];
           mergeRenderCall(entry.templatePath, entry.absolutePath, rc);
 
-          // ALSO register the named block itself as a template context
-          // so it can be looked up by block name (e.g., "role_item")
           let blockCtx = templates.get(logicalPath);
           if (!blockCtx) {
             blockCtx = {
@@ -125,7 +113,6 @@ export class KnowledgeGraphBuilder {
         const fullEntries: NamedBlockEntry[] = entries.map(e => ({
           ...e,
           get node() {
-            // Lazy-loading mechanism to read AST of the define block only on hover queries
             if (!(this as any)._node) {
               try {
                 const openDoc = vscode.workspace.textDocuments.find(d => d.uri.fsPath === e.absolutePath);
@@ -154,10 +141,6 @@ export class KnowledgeGraphBuilder {
       }
     }
 
-    // Supplement the analyzer's namedBlocks with a full directory scan so that
-    // {{ define "name" }} / {{ block "name" ... }} declarations that have no
-    // corresponding Go render call are still discoverable by hover, completion,
-    // and validation.
     this.scanTemplateDirectoryForNamedBlocks(templateBase, namedBlocks);
 
     const namedBlockErrors = analysisResult.namedBlockErrors ?? [];
@@ -195,26 +178,12 @@ export class KnowledgeGraphBuilder {
     return this.graph;
   }
 
-  /**
-   * Recursively scans the templates directory for {{ define "name" }} and
-   * {{ block "name" ... }} declarations and registers any that are not already
-   * present in the namedBlocks registry (i.e. those with no Go render calls).
-   *
-   * This ensures that blocks defined in template files but never explicitly
-   * rendered from Go code are still fully visible to hover, completion, and
-   * validation — the analyzer only reports blocks it can trace through render
-   * calls, so purely template-side composition would otherwise be invisible.
-   */
   private scanTemplateDirectoryForNamedBlocks(
     templateBase: string,
     namedBlocks: NamedBlockRegistry
   ): void {
     if (!fs.existsSync(templateBase)) return;
 
-    // Regex that matches both:
-    //   {{ define "blockName" }}
-    //   {{ block  "blockName" . }}
-    // with optional dash-trimming and arbitrary whitespace.
     const declarationRe = /\{\{-?\s*(?:define|block)\s+"([^"]+)"/g;
 
     const walk = (dir: string): void => {
@@ -246,16 +215,15 @@ export class KnowledgeGraphBuilder {
           let match: RegExpExecArray | null;
           while ((match = declarationRe.exec(content)) !== null) {
             const name = match[1];
-            if (namedBlocks.has(name)) continue; // already known — analyzer wins
+            if (namedBlocks.has(name)) continue;
 
-            // Calculate line/col of this declaration.
             const upTo = content.slice(0, match.index);
             const line = (upTo.match(/\n/g) ?? []).length + 1;
             const lastNl = upTo.lastIndexOf('\n');
             const col = match.index - (lastNl === -1 ? 0 : lastNl + 1);
 
             const absPath = fullPath;
-            const entry: NamedBlockEntry = {
+            const blockEntry: NamedBlockEntry = {
               name,
               templatePath,
               absolutePath: absPath,
@@ -291,7 +259,7 @@ export class KnowledgeGraphBuilder {
               },
             };
 
-            namedBlocks.set(name, [entry]);
+            namedBlocks.set(name, [blockEntry]);
             this.outputChannel.appendLine(
               `[KnowledgeGraph] Discovered unreferenced named block "${name}" in ${templatePath}`
             );
@@ -303,35 +271,20 @@ export class KnowledgeGraphBuilder {
     walk(templateBase);
   }
 
-  /**
-   * Look up a named block by name from the cross-file registry.
-   * Returns the single entry, or undefined if not found.
-   * If duplicates exist, returns the first entry (the caller will also see the
-   * duplicate error surfaced separately).
-   */
   lookupNamedBlock(name: string): NamedBlockEntry | undefined {
     const entries = this.graph.namedBlocks.get(name);
     if (!entries || entries.length === 0) return undefined;
     return entries[0];
   }
 
-  /**
-   * Get any duplicate-block errors for a specific block name.
-   */
   getDuplicateErrorsForBlock(name: string): NamedBlockDuplicateError[] {
     return this.graph.namedBlockErrors.filter(e => e.name === name);
   }
 
-  /**
-   * Get all duplicate block errors, for surfacing as diagnostics.
-   */
   getAllDuplicateErrors(): NamedBlockDuplicateError[] {
     return this.graph.namedBlockErrors;
   }
 
-  /**
-   * Find the TemplateContext for a given absolute file path.
-   */
   findContextForFile(absolutePath: string): TemplateContext | undefined {
     const templateBase = this.getTemplateBase();
     let rel = path.relative(templateBase, absolutePath).replace(/\\/g, '/');
@@ -360,9 +313,6 @@ export class KnowledgeGraphBuilder {
     return undefined;
   }
 
-  /**
-   * Find a partial template context by name.
-   */
   findPartialContext(partialName: string, currentFile: string): TemplateContext | undefined {
     for (const [tplPath, ctx] of this.graph.templates) {
       if (
@@ -375,6 +325,9 @@ export class KnowledgeGraphBuilder {
     }
 
     const templateBase = this.getTemplateBase();
+    const config = vscode.workspace.getConfiguration('rex-analyzer');
+    const sourceDir: string = config.get('sourceDir') ?? '.';
+
     const candidates = [
       path.join(path.dirname(currentFile), partialName),
       path.join(templateBase, partialName),
@@ -395,9 +348,6 @@ export class KnowledgeGraphBuilder {
     return undefined;
   }
 
-  /**
-   * Find the context for a file when it's being used as a partial.
-   */
   findContextForFileAsPartial(absolutePath: string): TemplateContext | undefined {
     const templateBase = this.getTemplateBase();
     let partialRelPath = path.relative(templateBase, absolutePath).replace(/\\/g, '/');
@@ -407,7 +357,7 @@ export class KnowledgeGraphBuilder {
       `[KnowledgeGraph] Looking for partial: ${partialRelPath} (basename: ${partialBasename})`
     );
 
-    // ── Priority 1: Check if this file contains a named block with context-file vars ──
+    // Priority 1: named block with context-file vars
     for (const [blockName, entries] of this.graph.namedBlocks) {
       for (const entry of entries) {
         if (path.normalize(entry.absolutePath).toLowerCase() === path.normalize(absolutePath).toLowerCase()) {
@@ -416,7 +366,6 @@ export class KnowledgeGraphBuilder {
             this.outputChannel.appendLine(
               `[KnowledgeGraph] Found named block "${blockName}" with context-file vars`
             );
-
             return {
               templatePath: partialRelPath,
               absolutePath: absolutePath,
@@ -430,7 +379,7 @@ export class KnowledgeGraphBuilder {
       }
     }
 
-    // ── Priority 2: Scan parent templates for {{ template }} calls and MERGE them ──
+    // Priority 2: Scan parent templates for {{ template }} calls and MERGE them
     const parser = new TemplateParser();
     const normalizedTargetAbsPath = path.normalize(absolutePath).toLowerCase();
 
@@ -474,7 +423,6 @@ export class KnowledgeGraphBuilder {
             parentCtx.vars
           );
 
-          // Merge variables from this parent into the aggregated pool
           for (const [k, v] of resolved.vars) {
             const existing = mergedVars.get(k);
             if (!existing || isMoreComplete(v, existing)) {
@@ -551,6 +499,14 @@ export class KnowledgeGraphBuilder {
     return undefined;
   }
 
+  /**
+   * Resolves the variable map for a partial call's context argument.
+   *
+   * FIX: normalise the context arg with normalizeDictArg so that (dict ...) forms
+   * — produced by the TemplateParser preserving parentheses — are handled correctly.
+   * Also added full dict inference using inferExpressionType so that typed dict
+   * fields flow into the partial's render context.
+   */
   private resolvePartialVars(
     contextArg: string,
     vars: Map<string, TemplateVar>
@@ -559,8 +515,53 @@ export class KnowledgeGraphBuilder {
       return { vars: new Map(vars) };
     }
 
+    // Normalise: strip outer parens — e.g. (dict "k" .V) → dict "k" .V
+    const normalizedCtx = normalizeDictArg(contextArg);
+
+    // Handle dict calls
+    if (normalizedCtx.startsWith('dict ')) {
+      // Build a minimal field-resolver from the available vars.
+      const typeIndex = new Map<string, FieldInfo[]>();
+      const indexVar = (v: TemplateVar | FieldInfo) => {
+        const bare = v.type.replace(/^\*/, '').replace(/^\[\]/, '').replace(/^map\[.*?\]/, '').trim();
+        if (bare && v.fields && v.fields.length > 0 && !typeIndex.has(bare)) {
+          typeIndex.set(bare, v.fields);
+          for (const f of v.fields) indexVar(f);
+        }
+      };
+      for (const v of vars.values()) indexVar(v);
+      const fieldResolver = (t: string) => {
+        const bare = t.replace(/^\*/, '').replace(/^\[\]/, '').replace(/^map\[.*?\]/, '').trim();
+        return typeIndex.get(bare);
+      };
+
+      const dictType = inferExpressionType(normalizedCtx, vars, [], undefined, undefined, fieldResolver);
+      if (dictType && dictType.fields) {
+        const partialVars = new Map<string, TemplateVar>();
+        for (const f of dictType.fields) {
+          partialVars.set(f.name, {
+            name: f.name,
+            type: f.type,
+            fields: f.fields,
+            isSlice: f.isSlice ?? false,
+            isMap: f.isMap,
+            elemType: f.elemType,
+            keyType: f.keyType,
+          });
+        }
+        return {
+          vars: partialVars,
+          isMap: dictType.isMap,
+          keyType: dictType.keyType,
+          elemType: dictType.elemType,
+          isSlice: dictType.isSlice,
+          rootTypeStr: dictType.typeStr,
+        };
+      }
+    }
+
     const parser = new TemplateParser();
-    const parsedPath = parser.parseDotPath(contextArg);
+    const parsedPath = parser.parseDotPath(normalizedCtx);
     const result = resolvePath(parsedPath, vars, []);
 
     if (!result.found) {
@@ -593,7 +594,7 @@ export class KnowledgeGraphBuilder {
     }
 
     const parser = new TemplateParser();
-    const parsedPath = parser.parseDotPath(contextArg);
+    const parsedPath = parser.parseDotPath(normalizeDictArg(contextArg));
     if (parsedPath.length === 0 || parsedPath[0] === '.') {
       return undefined;
     }
@@ -614,19 +615,9 @@ export class KnowledgeGraphBuilder {
     };
   }
 
-  /**
-   * Resolve a Go source file path relative to the configured sourceDir.
-   *
-   * Uses path.resolve so that an absolute sourceDir setting is honoured correctly —
-   * path.join would prepend workspaceRoot even when sourceDir is already absolute,
-   * producing a bogus path like /workspace/home/user/project/src/handler.go.
-   */
   resolveGoFilePath(relativeFile: string): string | null {
     const config = vscode.workspace.getConfiguration('rex-analyzer');
     const sourceDir: string = config.get('sourceDir') ?? '.';
-    // path.resolve handles both relative and absolute sourceDir values:
-    //   path.resolve('/workspace', '/abs/src') === '/abs/src'
-    //   path.resolve('/workspace', 'rel/src')  === '/workspace/rel/src'
     const sourceDirAbs = path.resolve(this.workspaceRoot, sourceDir);
     const abs = path.join(sourceDirAbs, relativeFile);
     return fs.existsSync(abs) ? abs : null;
