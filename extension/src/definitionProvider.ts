@@ -59,7 +59,7 @@ export class DefinitionProvider {
         if (partialLocation) return partialLocation;
 
         const hit = this.scope.findNodeAtPosition(
-            nodes, position, ctx.vars, [], nodes
+            nodes, position, ctx.vars, [], nodes, undefined, ctx.absolutePath
         );
         if (!hit) return null;
 
