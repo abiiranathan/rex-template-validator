@@ -63,11 +63,9 @@ func processTemplateFilesConcurrently(templateFiles []string, root string) map[s
 
 	var wg sync.WaitGroup
 	for range numWorkers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			processTemplateFileWorker(fileChan, root, &mu, registry)
-		}()
+		})
 	}
 	wg.Wait()
 

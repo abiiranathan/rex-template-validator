@@ -265,7 +265,7 @@ func runWorkers(total int, fn func([]int) []ValidationResult) []ValidationResult
 	resultChan := make(chan []ValidationResult, numWorkers)
 	var wg sync.WaitGroup
 
-	for w := 0; w < numWorkers; w++ {
+	for w := range numWorkers {
 		start := w * chunkSize
 		if start >= total {
 			break

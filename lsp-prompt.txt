@@ -1,0 +1,4 @@
+This is the final extension code (both analyzer and extension). Convert analyzer into an jsonrpc LSP daemon and update the extension to only get the information it needs on demand to avoid consuming too much memory, high latency, cache invalidation between calls and slow startup.
+I think you may only modify main.go since its the entrypoint to consume the lsp package you are going tocreate.
+The update other areas in the extension to consume the data from LSP instead of a gaint in-memory and expensive knowledge graph.
+Only generate the necessary new files but they have to be complete and compiling.

@@ -1,14 +1,38 @@
-// FILE: main.go
 /*
 Package main provides the command-line interface for the Rex template analyzer.
 
-It performs static analysis on Go source code to identify template rendering
-invocations, function map declarations, and validate templates against their
-corresponding render calls.
+It can operate in two modes:
 
-The analyzer can output various forms of JSON results, including detected
-render calls, function maps, validation errors, and named template blocks.
-It supports gzip compression for the output.
+# CLI mode (default)
+
+Performs a one-shot static analysis on a Go source directory and writes the
+results as JSON to stdout. Useful for scripting, CI, and editor integrations
+that prefer process-per-request over a long-lived daemon.
+
+# LSP daemon mode (--lsp)
+
+Starts a long-lived JSON-RPC 2.0 server on stdin/stdout that implements the
+LSP wire protocol (Content-Length framing). The extension communicates with
+this daemon to fetch analysis data on demand, avoiding the cost of a full
+upfront analysis and the memory pressure of keeping a giant knowledge graph
+alive in the extension process.
+
+Supported custom methods:
+
+	rex/getTemplateContext   — variable list for a single template (fast path)
+	rex/validate             — diagnostics for a single template file
+	rex/getFuncMaps          — all template.FuncMap entries in the workspace
+	rex/getNamedBlocks       — all {{define}} / {{block}} declarations
+	rex/getRenderCalls       — full render-call list (heavier; prefer getTemplateContext)
+	rex/invalidateCache      — evict cached analysis (send after Go file changes)
+
+Standard LSP methods handled:
+
+	initialize               — returns server capabilities
+	initialized              — no-op acknowledgement
+	shutdown / exit          — graceful termination
+	workspace/didChangeWatchedFiles — invalidates cache for modified directories
+	$/cancelRequest          — no-op (requests run to completion)
 */
 package main
 
@@ -21,6 +45,7 @@ import (
 	"strings"
 
 	"github.com/rex-template-analyzer/ast"
+	"github.com/rex-template-analyzer/lsp"
 	"github.com/rex-template-analyzer/validator"
 )
 
@@ -49,9 +74,13 @@ type ValidationOutput struct {
 	NamedBlockErrors []validator.NamedBlockDuplicateError `json:"namedBlockErrors"`
 }
 
-// main is the CLI entry point for the template analyzer.
+// main is the CLI / LSP daemon entry point.
 func main() {
-	// Command-line flags
+	// ── Flags ─────────────────────────────────────────────────────────────
+
+	lspMode := flag.Bool("lsp", false,
+		"Run as a JSON-RPC 2.0 LSP daemon on stdin/stdout instead of performing a one-shot analysis")
+
 	dir := flag.String("dir", ".", "Go source directory to analyze")
 	templateRoot := flag.String("template-root", "", "Root directory for templates")
 	templateBaseDir := flag.String("template-base-dir", "", "Base directory for template-root")
@@ -60,9 +89,19 @@ func main() {
 	compress := flag.Bool("compress", false, "Output gzip-compressed JSON")
 	showNamedTemplates := flag.Bool("named-templates", false, "Return all named template as JSON")
 	viewContext := flag.String("view-context", "", "Show context for a specific template")
+
 	flag.Parse()
 
-	// Resolve absolute paths
+	// ── LSP daemon mode ───────────────────────────────────────────────────
+
+	if *lspMode {
+		server := lsp.NewServer()
+		server.Serve()
+		return
+	}
+
+	// ── One-shot CLI mode ─────────────────────────────────────────────────
+
 	absDir := mustAbs(*dir)
 
 	templateBase := absDir
@@ -70,19 +109,15 @@ func main() {
 		templateBase = mustAbs(*templateBaseDir)
 	}
 
-	// Run static analysis on the source directory
 	result := ast.AnalyzeDir(absDir, *contextFile, ast.DefaultConfig)
 
-	// Handle view-context command
 	if *viewContext != "" {
 		handleViewContext(result, *viewContext, *compress)
 		return
 	}
 
-	// Filter out import-related noise
 	result.Errors = filterImportErrors(result.Errors)
 
-	// Prepare output payload
 	var output any
 
 	if *validate || *showNamedTemplates {
@@ -98,7 +133,6 @@ func main() {
 			}
 			output = keys
 		} else {
-			// Produce extended output with validation results
 			output = ValidationOutput{
 				RenderCalls:      result.RenderCalls,
 				FuncMaps:         result.FuncMaps,
@@ -109,17 +143,13 @@ func main() {
 			}
 		}
 	} else {
-		// Emit raw analysis result
 		output = result
 	}
 
-	// Encode and write JSON output
 	encodeJSON(output, *compress)
 }
 
 // encodeJSON serializes output as JSON and writes it to stdout.
-//
-// If compress is true, the output is gzip-compressed.
 func encodeJSON(output any, compress bool) {
 	if compress {
 		writeGzipJSON(output)
@@ -127,8 +157,7 @@ func encodeJSON(output any, compress bool) {
 	}
 
 	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "") // disable indent (reduces size by > 2x)
-
+	enc.SetIndent("", "")
 	if err := enc.Encode(output); err != nil {
 		panic("failed to encode JSON: " + err.Error())
 	}
@@ -140,21 +169,16 @@ func writeGzipJSON(output any) {
 	defer gzWriter.Close()
 
 	enc := json.NewEncoder(gzWriter)
-	enc.SetIndent("", "") // disable indent (reduces size by > 2x)
-
+	enc.SetIndent("", "")
 	if err := enc.Encode(output); err != nil {
 		panic("failed to encode JSON: " + err.Error())
 	}
-
 	if err := gzWriter.Close(); err != nil {
 		panic("failed to close gzip writer: " + err.Error())
 	}
 }
 
-// mustAbs resolves path to an absolute path.
-//
-// The program panics if resolution fails, since relative paths
-// would invalidate downstream analysis.
+// mustAbs resolves path to an absolute path, panicking on failure.
 func mustAbs(path string) string {
 	abs, err := filepath.Abs(path)
 	if err != nil {
@@ -163,11 +187,7 @@ func mustAbs(path string) string {
 	return abs
 }
 
-// filterImportErrors removes known import-related errors
-// from the analysis error list.
-//
-// These errors are typically environmental and not actionable
-// for template validation.
+// filterImportErrors removes known import-related errors from the list.
 func filterImportErrors(errs []string) []string {
 	filtered := make([]string, 0, len(errs))
 	for _, e := range errs {
@@ -178,11 +198,10 @@ func filterImportErrors(errs []string) []string {
 	return filtered
 }
 
-// isImportError determines whether an error message
-// corresponds to a dependency/import failure.
+// isImportError determines whether an error message corresponds to a
+// dependency or import resolution failure.
 func isImportError(e string) bool {
 	lower := strings.ToLower(e)
-
 	for _, phrase := range []string{
 		"could not import",
 		"can't find import",
@@ -197,7 +216,8 @@ func isImportError(e string) bool {
 	return false
 }
 
-// handleViewContext filters render calls for a specific template and outputs the context variables.
+// handleViewContext filters render calls for a specific template and outputs
+// the context variables.
 func handleViewContext(result ast.AnalysisResult, templateName string, compress bool) {
 	type ContextInfo struct {
 		File string            `json:"file"`
@@ -205,25 +225,25 @@ func handleViewContext(result ast.AnalysisResult, templateName string, compress 
 		Vars []ast.TemplateVar `json:"vars"`
 	}
 
-	foundContexts := []ContextInfo{}
+	var foundContexts []ContextInfo
 
 	for _, rc := range result.RenderCalls {
-		// Check for exact match or suffix match (to handle relative paths vs absolute/partial paths)
-		if rc.Template == templateName || strings.HasSuffix(rc.Template, "/"+templateName) || strings.HasSuffix(rc.Template, "\\"+templateName) {
-			// Avoid NULLS
-			if rc.Vars == nil {
-				rc.Vars = []ast.TemplateVar{}
+		if rc.Template == templateName ||
+			strings.HasSuffix(rc.Template, "/"+templateName) ||
+			strings.HasSuffix(rc.Template, "\\"+templateName) {
+			vars := rc.Vars
+			if vars == nil {
+				vars = []ast.TemplateVar{}
 			}
 			foundContexts = append(foundContexts, ContextInfo{
 				File: rc.File,
 				Line: rc.Line,
-				Vars: rc.Vars,
+				Vars: vars,
 			})
 		}
 	}
 
 	if len(foundContexts) == 0 {
-		// Output empty list to indicate no context found
 		encodeJSON([]ContextInfo{}, compress)
 		return
 	}
