@@ -84,7 +84,7 @@ export class HoverProvider {
         }
 
         const hit = this.scope.findNodeAtPosition(
-            nodes, position, ctx.vars, [], nodes
+            nodes, position, ctx.vars, [], nodes, undefined, ctx.absolutePath
         );
         if (!hit) {
             const enclosing = this.scope.findEnclosingBlockOrDefine(nodes, position);

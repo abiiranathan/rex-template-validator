@@ -184,87 +184,9 @@ export class ScopeUtils {
                 return null;
             }
 
-            case 'block':
-            case 'define': {
-                return this.buildNamedBlockScope(node, vars, rootNodes);
-            }
-
             default:
                 return null;
         }
-    }
-
-    /**
-     * Builds the scope for the body of a {{ define }} / {{ block }} node by
-     * resolving the call-site context, then falling back to the knowledge graph.
-     *
-     * FIX: propagate isMap/keyType/elemType/isSlice into the scope frame so that
-     * dict-based contexts (map[string]any with typed fields) resolve correctly.
-     */
-    buildNamedBlockScope(
-        node: TemplateNode,
-        vars: Map<string, TemplateVar>,
-        rootNodes: TemplateNode[]
-    ): { childVars: Map<string, TemplateVar>; childStack: ScopeFrame[] } | null {
-        const name = node.blockName;
-        if (!name) return null;
-
-        const callCtx = this.findCallSiteContext(rootNodes, name, vars, []);
-        if (callCtx) {
-            return {
-                childVars: vars,   // root vars preserved for $ resolution
-                childStack: [{
-                    key: '.',
-                    typeStr: callCtx.typeStr,
-                    fields: callCtx.fields ?? [],
-                    // ↓ previously missing — caused dict contexts to lose map metadata
-                    isMap: callCtx.isMap,
-                    keyType: callCtx.keyType,
-                    elemType: callCtx.elemType,
-                    isSlice: callCtx.isSlice,
-                }],
-            };
-        }
-
-        const graph = this.graphBuilder.getGraph();
-        const blockCtx = graph.templates.get(name);
-        if (blockCtx) {
-            return {
-                childVars: blockCtx.vars,
-                childStack: [{
-                    key: '.',
-                    typeStr: blockCtx.rootTypeStr ?? 'context',
-                    fields: [...blockCtx.vars.values()] as unknown as FieldInfo[],
-                    isMap: blockCtx.isMap,
-                    keyType: blockCtx.keyType,
-                    elemType: blockCtx.elemType,
-                    isSlice: blockCtx.isSlice,
-                }],
-            };
-        }
-
-        if (node.kind === 'block' && node.path.length > 0) {
-            const result = resolvePath(
-                node.path, vars, [], undefined,
-                this.buildFieldResolver(vars, [])
-            );
-            if (result.found) {
-                return {
-                    childVars: this.fieldsToVarMap(result.fields ?? []),
-                    childStack: [{
-                        key: '.',
-                        typeStr: result.typeStr,
-                        fields: result.fields ?? [],
-                        isMap: result.isMap,
-                        keyType: result.keyType,
-                        elemType: result.elemType,
-                        isSlice: result.isSlice,
-                    }],
-                };
-            }
-        }
-
-        return null;
     }
 
     /**
@@ -574,7 +496,7 @@ export class ScopeUtils {
      * Finds the call-site context of a named block by scanning nodes for
      * {{ template "name" <ctx> }} or {{ block "name" <ctx> }} tags.
      *
-     * FIX: normalise contextArg with normalizeDictArg so that (dict ...) expressions
+     * normalise contextArg with normalizeDictArg so that (dict ...) expressions
      * wrapped in parentheses are correctly detected and evaluated.
      */
     findCallSiteContext(
@@ -583,18 +505,9 @@ export class ScopeUtils {
         vars: Map<string, TemplateVar>,
         scopeStack: ScopeFrame[],
         blockLocals: Map<string, TemplateVar> = new Map(),
-        /**
-         * The root-level nodes of the file being scanned.  Kept constant across
-         * all recursive calls so that when we enter a {{ define }} body we can
-         * search the whole file for that define's call site.
-         * Defaults to `nodes` on the first (non-recursive) call.
-         */
         _rootNodes?: TemplateNode[],
-        /**
-         * Names of {{ define }} blocks we are currently resolving, used to break
-         * cycles (A calls B calls A).
-         */
-        _visitedDefines?: Set<string>
+        _visitedDefines?: Set<string>,
+        _rootVars?: Map<string, TemplateVar>
     ): {
         typeStr: string;
         fields?: FieldInfo[];
@@ -604,6 +517,7 @@ export class ScopeUtils {
         isSlice?: boolean;
     } | null {
         const rootNodes = _rootNodes ?? nodes;
+        const rootVars = _rootVars ?? vars;
         const visitedDefines = _visitedDefines ?? new Set<string>();
 
         for (const node of nodes) {
@@ -730,7 +644,7 @@ export class ScopeUtils {
                         }
                     }
                 } else if (node.kind === 'define' && node.blockName && !visitedDefines.has(node.blockName)) {
-                    // ── BUG FIX: context chain propagation through {{ define }} ──────────────
+                    // context chain propagation through {{ define }} ──────────────
                     // When we enter a define body we must use the context that define is
                     // CALLED with, not the outer root scope.  Without this, any template
                     // call found *inside* the define body (e.g. {{ template "child" . }})
@@ -744,8 +658,8 @@ export class ScopeUtils {
                     newVisited.add(node.blockName);
 
                     const defineCtx = this.findCallSiteContext(
-                        rootNodes, node.blockName, vars, scopeStack,
-                        new Map(), rootNodes, newVisited
+                        rootNodes, node.blockName, rootVars, [],
+                        new Map(), rootNodes, newVisited, rootVars
                     );
 
                     if (defineCtx && (defineCtx.fields?.length ?? 0) > 0) {
@@ -765,7 +679,7 @@ export class ScopeUtils {
 
                 const found = this.findCallSiteContext(
                     node.children, blockName, childVars, childStack, childLocals,
-                    rootNodes, visitedDefines
+                    rootNodes, visitedDefines, rootVars
                 );
                 if (found) return found;
             }
@@ -804,7 +718,8 @@ export class ScopeUtils {
         vars: Map<string, TemplateVar>,
         scopeStack: ScopeFrame[],
         rootNodes: TemplateNode[],
-        inheritedLocals?: Map<string, TemplateVar>
+        inheritedLocals?: Map<string, TemplateVar>,
+        currentFilePath?: string
     ): {
         node: TemplateNode;
         stack: ScopeFrame[];
@@ -867,7 +782,7 @@ export class ScopeUtils {
 
             if ((node.kind === 'define' || node.kind === 'block') && node.blockName) {
                 const callCtx = this.resolveNamedBlockCallCtxForPosition(
-                    node.blockName, vars, rootNodes
+                    node.blockName, vars, rootNodes, currentFilePath
                 );
                 if (callCtx) {
                     childVars = this.fieldsToVarMap(callCtx.fields ?? []);
@@ -905,14 +820,14 @@ export class ScopeUtils {
             if (inElse) {
                 if (node.elseChildren && node.elseChildren.length > 0) {
                     const found = this.findNodeAtPosition(
-                        node.elseChildren, position, vars, scopeStack, rootNodes, blockLocals
+                        node.elseChildren, position, vars, scopeStack, rootNodes, blockLocals, currentFilePath
                     );
                     if (found) return found;
                 }
             } else {
                 if (node.children) {
                     const found = this.findNodeAtPosition(
-                        node.children, position, childVars, childStack, rootNodes, childLocals
+                        node.children, position, childVars, childStack, rootNodes, childLocals, currentFilePath
                     );
                     if (found) return found;
                 }
@@ -974,7 +889,7 @@ export class ScopeUtils {
                     childLocals = new Map();
                 } else {
                     const callCtx = this.resolveNamedBlockCallCtxForPosition(
-                        node.blockName, vars, rootNodes
+                        node.blockName, vars, rootNodes, ctx.absolutePath
                     );
                     if (callCtx) {
                         childVars = this.fieldsToVarMap(callCtx.fields ?? []);
@@ -990,14 +905,14 @@ export class ScopeUtils {
                         childLocals = new Map();
                     }
                 }
-            }
-
-            const childScopeBuild = this.buildChildScope(
-                node, vars, scopeStack, childLocals, rootNodes
-            );
-            if (childScopeBuild) {
-                childVars = childScopeBuild.childVars;
-                childStack = childScopeBuild.childStack;
+            } else {
+                const childScopeBuild = this.buildChildScope(
+                    node, vars, scopeStack, childLocals, rootNodes
+                );
+                if (childScopeBuild) {
+                    childVars = childScopeBuild.childVars;
+                    childStack = childScopeBuild.childStack;
+                }
             }
 
             let isInside = false;
@@ -1203,7 +1118,18 @@ export class ScopeUtils {
             }
         }
 
-        const localCtx = this.findCallSiteContext(currentFileNodes, blockName, vars, []);
+        let currentFileVars = vars;
+        if (currentFilePath) {
+            const graph = this.graphBuilder.getGraph();
+            for (const [, templateCtx] of graph.templates) {
+                if (templateCtx.absolutePath === currentFilePath) {
+                    currentFileVars = templateCtx.vars;
+                    break;
+                }
+            }
+        }
+
+        const localCtx = this.findCallSiteContext(currentFileNodes, blockName, currentFileVars, []);
         if (localCtx) {
             if ((!localCtx.fields || localCtx.fields.length === 0) && blockCtx) {
                 const synthFields = [...blockCtx.vars.values()] as unknown as FieldInfo[];

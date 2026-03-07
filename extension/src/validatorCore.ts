@@ -535,8 +535,16 @@ export class ValidatorCore {
             if (content) currentFileNodes = this.parser.parse(content);
         } catch { /* ignore */ }
 
+        let currentFileVars = vars;
+        for (const [, templateCtx] of graph.templates) {
+            if (templateCtx.absolutePath === currentFilePath) {
+                currentFileVars = templateCtx.vars;
+                break;
+            }
+        }
+
         const localCallCtx = this.scope.findCallSiteContext(
-            currentFileNodes, name, vars, scopeStack, new Map(blockLocals)
+            currentFileNodes, name, currentFileVars, []
         );
         if (localCallCtx) {
             return wrapCallCtx(localCallCtx);
