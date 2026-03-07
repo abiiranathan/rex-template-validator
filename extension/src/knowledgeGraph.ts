@@ -668,6 +668,65 @@ export class KnowledgeGraphBuilder {
     }
     return obj;
   }
+
+  /**
+   * Incrementally updates the named block registry for a single file 
+   * without needing to re-run the Go analyzer.
+   */
+  updateTemplateFile(absolutePath: string, content: string) {
+    // 1. Remove all existing named blocks associated with this file
+    for (const [name, entries] of this.graph.namedBlocks.entries()) {
+      const filtered = entries.filter(e => e.absolutePath !== absolutePath);
+      if (filtered.length === 0) {
+        this.graph.namedBlocks.delete(name);
+      } else {
+        this.graph.namedBlocks.set(name, filtered);
+      }
+    }
+
+    // 2. Re-parse the new content for named blocks
+    const templateBase = this.getTemplateBase();
+    const templatePath = path.relative(templateBase, absolutePath).replace(/\\/g, '/');
+
+    const declarationRe = /\{\{-?\s*(?:define|block)\s+"([^"]+)"/g;
+    let match: RegExpExecArray | null;
+
+    while ((match = declarationRe.exec(content)) !== null) {
+      const name = match[1];
+      const upTo = content.slice(0, match.index);
+      const line = (upTo.match(/\n/g) ?? []).length + 1;
+      const lastNl = upTo.lastIndexOf('\n');
+      const col = match.index - (lastNl === -1 ? 0 : lastNl + 1);
+
+      const entry: NamedBlockEntry = {
+        name,
+        templatePath,
+        absolutePath,
+        line,
+        col,
+      };
+
+      const existing = this.graph.namedBlocks.get(name) || [];
+      existing.push(entry);
+      this.graph.namedBlocks.set(name, existing);
+    }
+
+    // 3. Recalculate duplicate errors
+    this.recalculateDuplicateErrors();
+  }
+
+  private recalculateDuplicateErrors() {
+    this.graph.namedBlockErrors = [];
+    for (const [name, entries] of this.graph.namedBlocks.entries()) {
+      if (entries.length > 1) {
+        this.graph.namedBlockErrors.push({
+          name,
+          entries,
+          message: `Duplicate named block "${name}" found`,
+        });
+      }
+    }
+  }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

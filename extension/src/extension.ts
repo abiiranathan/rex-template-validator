@@ -141,35 +141,27 @@ export async function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // ── File watchers ──────────────────────────────────────────────────────────
-
-  const goWatcher = vscode.workspace.createFileSystemWatcher('**/*.go');
-  context.subscriptions.push(
-    goWatcher,
-    goWatcher.onDidChange(() => scheduleRebuild(workspaceRoot)),
-    goWatcher.onDidCreate(() => scheduleRebuild(workspaceRoot)),
-    goWatcher.onDidDelete(() => scheduleRebuild(workspaceRoot))
-  );
-
-  const tplWatcher = vscode.workspace.createFileSystemWatcher('**/*.{html,tmpl,tpl,gohtml}');
-  context.subscriptions.push(
-    tplWatcher,
-    tplWatcher.onDidChange(() => scheduleRebuild(workspaceRoot)),
-    tplWatcher.onDidCreate(() => scheduleRebuild(workspaceRoot)),
-    tplWatcher.onDidDelete(() => scheduleRebuild(workspaceRoot))
-  );
 
   context.subscriptions.push(
     vscode.workspace.onDidOpenTextDocument((doc) => {
       if (isTemplate(doc)) scheduleValidateAllOpenTemplates();
     }),
 
+    // If a template changes, just update the TS graph instantly
     vscode.workspace.onDidChangeTextDocument((e) => {
-      if (isTemplate(e.document)) scheduleValidateAllOpenTemplates();
+      const doc = e.document;
+      if (isTemplate(doc)) {
+        if (graphBuilder) {
+          // Incrementally patch the graph in milliseconds
+          graphBuilder.updateTemplateFile(doc.uri.fsPath, doc.getText());
+          applyNamedBlockDiagnostics(); // Refresh duplicate block UI errors
+        }
+        scheduleValidateAllOpenTemplates(); // Re-validate the active tab
+      }
     }),
 
     vscode.workspace.onDidSaveTextDocument((doc) => {
-      if (doc.fileName.endsWith('.go') || doc.fileName.endsWith('go.mod') || doc.fileName.endsWith('.json') || isTemplate(doc)) {
+      if (doc.fileName.endsWith('.go') || doc.fileName.endsWith('go.mod') || doc.fileName.endsWith('.json')) {
         scheduleRebuild(workspaceRoot);
       }
     })
@@ -500,10 +492,9 @@ async function validateDocument(doc: vscode.TextDocument) {
 
 function scheduleRebuild(workspaceRoot: string) {
   const config = vscode.workspace.getConfiguration('rex-analyzer');
-  const debounceMs = config.get<number>('debounceMs') ?? 1500;
-
+  const debounceMs = config.get<number>('debounceMs') ?? 1000;
   if (rebuildTimer) clearTimeout(rebuildTimer);
-  rebuildTimer = setTimeout(() => rebuildIndex(workspaceRoot), debounceMs * 2);
+  rebuildTimer = setTimeout(() => rebuildIndex(workspaceRoot), debounceMs);
 }
 
 async function validateAllKnownTemplates() {
@@ -531,7 +522,7 @@ async function validateAllKnownTemplates() {
 
 function scheduleValidateAllOpenTemplates() {
   const config = vscode.workspace.getConfiguration('rex-analyzer');
-  const debounceMs = config.get<number>('debounceMs') ?? 1500;
+  const debounceMs = config.get<number>('debounceMs') ?? 1000;
 
   if (validateAllTimer) clearTimeout(validateAllTimer);
   validateAllTimer = setTimeout(async () => {
