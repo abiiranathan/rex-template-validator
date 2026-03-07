@@ -59,6 +59,7 @@ export interface GoValidationError {
 export interface ParamInfo {
   name?: string;   // empty when the parameter is unnamed
   type: string;
+  fields?: FieldInfo[];
 }
 
 export interface FuncMapInfo {

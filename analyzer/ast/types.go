@@ -120,6 +120,9 @@ type ParamInfo struct {
 	Name string `json:"name,omitempty"`
 	// TypeStr is the string representation of the parameter's or return value's type.
 	TypeStr string `json:"type"`
+
+	// Fields contains the nested exported fields if this return type is a struct.
+	Fields []FieldInfo `json:"fields,omitempty"`
 }
 
 // AnalysisConfig defines customizable function and type names used by the analyzer to identify template-related constructs.

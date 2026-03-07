@@ -459,8 +459,11 @@ function unwrapField(
     fieldResolver?: (typeStr: string) => FieldInfo[] | undefined
 ): FieldInfo {
     let retType = '';
+    let retFields: FieldInfo[] | undefined;
+
     if (field.type === 'method' && field.returns && field.returns.length > 0) {
         retType = field.returns[0].type;
+        retFields = field.returns[0].fields;
     } else if (field.type.startsWith('func(')) {
         const match = field.type.match(/func\([^)]*\)\s*(.+)/);
         if (match && match[1]) {
@@ -476,13 +479,14 @@ function unwrapField(
 
     if (retType) {
         const bare = extractBareType(retType);
+        const resolvedFields = fieldResolver ? fieldResolver(bare) : undefined;
 
         return {
             ...field,
             type: retType,
             isSlice: retType.startsWith('[]'),
             isMap: retType.startsWith('map['),
-            fields: fieldResolver ? fieldResolver(bare) || [] : []
+            fields: (resolvedFields && resolvedFields.length > 0) ? resolvedFields : (retFields || field.fields || [])
         };
     }
     return field;
@@ -493,6 +497,8 @@ function unwrapVar(
     fieldResolver?: (typeStr: string) => FieldInfo[] | undefined
 ): TemplateVar {
     let retType = '';
+    let retFields: FieldInfo[] | undefined;
+
     if (v.type.startsWith('func(')) {
         const match = v.type.match(/func\([^)]*\)\s*(.+)/);
         if (match && match[1]) {
@@ -504,17 +510,21 @@ function unwrapVar(
                 retType = retType.slice(1, cutIdx).trim();
             }
         }
+    } else if (v.type === 'method' && (v as any).returns?.length > 0) {
+        retType = (v as any).returns[0].type;
+        retFields = (v as any).returns[0].fields;
     }
 
     if (retType) {
         const bare = extractBareType(retType);
+        const resolvedFields = fieldResolver ? fieldResolver(bare) : undefined;
 
         return {
             ...v,
             type: retType,
             isSlice: retType.startsWith('[]'),
             isMap: retType.startsWith('map['),
-            fields: fieldResolver ? fieldResolver(bare) || [] : []
+            fields: (resolvedFields && resolvedFields.length > 0) ? resolvedFields : (retFields || v.fields || [])
         };
     }
     return v;

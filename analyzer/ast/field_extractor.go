@@ -105,7 +105,7 @@ func extractFieldsUncachedDepth(
 	strct, ok := named.Underlying().(*types.Struct)
 	if !ok {
 		// Interface or other named type: expose methods only
-		return extractMethodFields(named, fset), ""
+		return extractMethodFields(named, structIndex, fc, seen, fset, depth), ""
 	}
 
 	// Struct type: extract fields and methods
@@ -113,7 +113,7 @@ func extractFieldsUncachedDepth(
 	fields := extractStructFieldsDepth(strct, entry, structIndex, fc, seen, fset, depth)
 
 	// Append methods
-	fields = append(fields, extractMethodFields(named, fset)...)
+	fields = append(fields, extractMethodFields(named, structIndex, fc, seen, fset, depth)...)
 
 	// Add method docs from struct index
 	addMethodDocs(fields, entry)
@@ -213,7 +213,15 @@ func buildFieldInfoDepth(
 }
 
 // extractMethodFields extracts exported methods as FieldInfo entries.
-func extractMethodFields(named *types.Named, fset *token.FileSet) []FieldInfo {
+// extractMethodFields extracts exported methods as FieldInfo entries.
+func extractMethodFields(
+	named *types.Named,
+	structIndex map[string]structIndexEntry,
+	fc *fieldCache,
+	seen map[string]bool,
+	fset *token.FileSet,
+	depth int,
+) []FieldInfo {
 	fields := make([]FieldInfo, 0, named.NumMethods())
 
 	for method := range named.Methods() {
@@ -226,9 +234,9 @@ func extractMethodFields(named *types.Named, fset *token.FileSet) []FieldInfo {
 			TypeStr: "method",
 		}
 
-		// Extract method signature
+		// Extract method signature deeply to include return type fields
 		if sig, ok := method.Type().(*types.Signature); ok {
-			fi.Params, fi.Returns, _ = extractSignatureInfo(sig)
+			fi.Params, fi.Returns, _ = extractSignatureInfoWithFields(sig, structIndex, fc, seen, fset, depth+1)
 		}
 
 		// Set definition location
@@ -243,6 +251,33 @@ func extractMethodFields(named *types.Named, fset *token.FileSet) []FieldInfo {
 	}
 
 	return fields
+}
+
+// extractSignatureInfoWithFields extracts signature info and recursively extracts
+// the struct fields for any returned types (e.g. methods returning *CBCReport).
+func extractSignatureInfoWithFields(
+	sig *types.Signature,
+	structIndex map[string]structIndexEntry,
+	fc *fieldCache,
+	seen map[string]bool,
+	fset *token.FileSet,
+	depth int,
+) (params, returns []ParamInfo, args []string) {
+	// Get base signature info
+	params, returns, args = extractSignatureInfo(sig)
+
+	// Deeply extract struct fields for each return value
+	for i := 0; i < sig.Results().Len(); i++ {
+		rt := sig.Results().At(i).Type()
+
+		// Use a copied seen map to prevent cross-branch loop suppression
+		elemSeen := copySeenMap(seen)
+		fields, _ := extractFieldsWithDocsDepth(rt, structIndex, fc, elemSeen, fset, depth)
+
+		returns[i].Fields = fields
+	}
+
+	return
 }
 
 // addMethodDocs enriches method FieldInfo entries with documentation from the index.
