@@ -33,11 +33,12 @@ func BenchmarkColdStart(b *testing.B) {
 func BenchmarkWarmStart(b *testing.B) {
 	absDir := "/home/nabiizy/Code/go/eclinichmsgo"
 	templateBase := absDir
-	contextFile := absDir + "/rex-content.json"
+	contextFile := absDir + "/rex.json"
 	templateRoot := "templates"
 
 	// Run once before the timer starts to populate the cache
 	ast.AnalyzeDir(absDir, contextFile, ast.DefaultConfig)
+	b.ResetTimer()
 
 	for b.Loop() {
 		// We DO NOT clear the cache here.

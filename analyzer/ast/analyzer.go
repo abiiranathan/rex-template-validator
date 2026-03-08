@@ -67,9 +67,8 @@ func AnalyzeDir(dir string, contextFile string, config AnalysisConfig) AnalysisR
 
 		// Still need to load packages for type info (but we skip some processing)
 		cfg := &packages.Config{
-			Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
-				packages.NeedTypes | packages.NeedTypesInfo | packages.NeedTypesSizes |
-				packages.NeedImports,
+			Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
+				packages.NeedImports | packages.NeedTypes | packages.NeedTypesInfo | packages.NeedSyntax,
 			Dir:   dir,
 			Fset:  fset,
 			Tests: false,
