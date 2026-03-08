@@ -141,10 +141,6 @@ export class ValidatorCore {
         if (!expr) return;
         if (path && path.length === 1 && (path[0] === '.' || path[0] === '$')) return;
 
-        this.outputChannel.appendLine(
-            `Validating expression: "${expr}" at ${node.line}:${node.col}`
-        );
-
         const fieldResolver = this.scope.buildFieldResolver(vars, scopeStack);
 
         // ── Step 1: Type-inference pass ─────────────────────────────────────────
@@ -596,19 +592,8 @@ export class ValidatorCore {
             }
         }
 
-
-        // Step 5 (previously: knowledge-graph accumulated vars) intentionally
-        // removed.  Using accumulated vars from the knowledge graph as a last-
-        // resort context causes global template vars (.hospital, .NOW, .DEBUG …)
-        // to appear inside named templates that only have access to what was
-        // explicitly passed to them.  In Go templates a partial receives ONLY the
-        // context argument it is called with; it has no implicit access to the
-        // caller's scope.  If we cannot determine the call context via steps 1-4,
-        // return null so that validateNamedBlockBody skips body validation rather
-        // than producing false-positive "variable not defined" errors against the
-        // wrong context.
-
-        return null;
+        // 5. Ultimate fallback: empty context to catch obvious typos.
+        return wrapCallCtx({ typeStr: 'any', fields: [] });
     }
 
     private enrichScopeWithContextFile(
@@ -657,6 +642,8 @@ export class ValidatorCore {
 
     // ── Partial validation ────────────────────────────────────────────────────
 
+    // ── Partial validation ────────────────────────────────────────────────────
+
     private validatePartial(
         node: TemplateNode,
         vars: Map<string, TemplateVar>,
@@ -675,61 +662,38 @@ export class ValidatorCore {
             this.validateExpression(node, normalizedCtx, this.parser.parseDotPath(normalizedCtx), vars, scopeStack, blockLocals, errors);
         }
 
-        if (!isFileBasedPartial(node.partialName)) {
+        // 1. Try to find it as a Named Block first
+        const { entry } = this.scope.resolveNamedBlock(node.partialName);
+        if (entry) { // FIX: Don't check entry.node, it might be missing after incremental updates
+            this.validateNamedBlockCall(node, entry, vars, scopeStack, blockLocals, errors, ctx, filePath);
             return;
         }
 
+        // 2. If not a named block, try to find it as a file-based partial
         const partialCtx = this.graphBuilder.findPartialContext(node.partialName, filePath);
-        if (!partialCtx) {
-            let errCol = node.col;
-            if (node.rawText && node.partialName) {
-                const nameIdx = node.rawText.indexOf(`"${node.partialName}"`);
-                if (nameIdx !== -1) errCol = node.col + nameIdx + 1;
-            }
-            errors.push({
-                message: `Partial template "${node.partialName}" could not be found`,
-                line: node.line,
-                col: errCol,
-                severity: 'warning',
-                variable: node.partialName,
-            });
+        if (partialCtx && fs.existsSync(partialCtx.absolutePath)) {
+            this.validateFilePartialCall(node, partialCtx, contextArg, vars, scopeStack, blockLocals, errors, filePath);
             return;
         }
 
-        if (!fs.existsSync(partialCtx.absolutePath)) return;
-
-        const resolved = this.resolvePartialVars(contextArg, vars, scopeStack, blockLocals);
-        try {
-            const openDoc = vscode.workspace.textDocuments.find(
-                d => d.uri.fsPath === partialCtx.absolutePath
-            );
-            const content = openDoc
-                ? openDoc.getText()
-                : fs.readFileSync(partialCtx.absolutePath, 'utf8');
-            const partialErrors = this.validate(
-                content,
-                {
-                    ...partialCtx,
-                    vars: resolved.vars,
-                    isMap: resolved.isMap,
-                    keyType: resolved.keyType,
-                    elemType: resolved.elemType,
-                    isSlice: resolved.isSlice,
-                    rootTypeStr: resolved.rootTypeStr,
-                },
-                partialCtx.absolutePath
-            );
-            for (const e of partialErrors) {
-                errors.push({
-                    ...e,
-                    message: `[in partial "${node.partialName}"] ${e.message}`,
-                });
-            }
-        } catch { /* ignore read errors */ }
+        // 3. If neither can be found, report an error
+        let errCol = node.col;
+        if (node.rawText) {
+            const nameIdx = node.rawText.indexOf(`"${node.partialName}"`);
+            if (nameIdx !== -1) errCol = node.col + nameIdx + 1;
+        }
+        errors.push({
+            message: `Template or partial "${node.partialName}" could not be found`,
+            line: node.line,
+            col: errCol,
+            severity: 'warning',
+            variable: node.partialName,
+        });
     }
 
-    private validateNamedBlockFromCurrentFile(
+    private validateNamedBlockCall(
         callNode: TemplateNode,
+        entry: import('./types').NamedBlockEntry,
         vars: Map<string, TemplateVar>,
         scopeStack: ScopeFrame[],
         blockLocals: Map<string, TemplateVar>,
@@ -737,40 +701,25 @@ export class ValidatorCore {
         ctx: TemplateContext,
         filePath: string
     ) {
-        if (!callNode.partialName) return;
-
         const contextArg = callNode.partialContext ?? '.';
         const resolved = this.resolvePartialVars(contextArg, vars, scopeStack, blockLocals);
         const partialVars = resolved.vars;
 
         try {
+            // Robustly find the block node by parsing the file where it's defined
             const openDoc = vscode.workspace.textDocuments.find(
-                d => d.uri.fsPath === filePath
+                d => d.uri.fsPath === entry.absolutePath
             );
             let content = '';
             if (openDoc) content = openDoc.getText();
-            else if (fs.existsSync(filePath)) content = fs.readFileSync(filePath, 'utf8');
+            else if (fs.existsSync(entry.absolutePath)) content = fs.readFileSync(entry.absolutePath, 'utf8');
             else return;
 
             const blockNode = this.scope.findDefineNodeInAST(
-                this.parser.parse(content), callNode.partialName
+                this.parser.parse(content), callNode.partialName!
             );
-            if (!blockNode) {
-                let errCol = callNode.col;
-                if (callNode.rawText && callNode.partialName) {
-                    const nameIdx = callNode.rawText.indexOf(`"${callNode.partialName}"`);
-                    if (nameIdx !== -1) errCol = callNode.col + nameIdx + 1;
-                }
-                errors.push({
-                    message: `Template "${callNode.partialName}" not found`,
-                    line: callNode.line,
-                    col: errCol,
-                    severity: 'error',
-                    variable: callNode.partialName,
-                });
-                return;
-            }
-            if (!blockNode.children) return;
+
+            if (!blockNode || !blockNode.children) return;
 
             const normalizedCtx = normalizeDictArg(contextArg);
             let childStack: ScopeFrame[];
@@ -778,7 +727,6 @@ export class ValidatorCore {
             if (normalizedCtx === '.' || normalizedCtx === '$') {
                 childStack = scopeStack;
             } else if (normalizedCtx.startsWith('dict ')) {
-                // FIX: use normalized (paren-stripped) arg for dict inference
                 const dictType = inferExpressionType(
                     normalizedCtx, vars, scopeStack, blockLocals,
                     this.graphBuilder.getGraph().funcMaps,
@@ -815,20 +763,108 @@ export class ValidatorCore {
             }
 
             childStack = this.enrichScopeWithContextFile(
-                callNode.partialName, partialVars, childStack
+                callNode.partialName!, partialVars, childStack
             );
 
             const blockErrors: ValidationError[] = [];
             this.validateNodes(
-                blockNode.children, partialVars, childStack, blockErrors, ctx, filePath
+                blockNode.children, partialVars, childStack, blockErrors, ctx, entry.absolutePath
             );
+
+            // Path normalization for safe comparison
+            const isSameFile = require('path').normalize(entry.absolutePath).toLowerCase() === require('path').normalize(filePath).toLowerCase();
+
             for (const e of blockErrors) {
-                errors.push({
-                    ...e,
-                    message: `[in block "${callNode.partialName}"] ${e.message}`,
-                });
+                if (isSameFile) {
+                    // 1. Error on the exact variable inside the block definition
+                    errors.push({
+                        ...e,
+                        line: e.line,
+                        col: e.col,
+                    });
+                    // 2. Trace error at the call site
+                    errors.push({
+                        ...e,
+                        line: callNode.line,
+                        col: callNode.col,
+                        message: `[in block "${callNode.partialName}"] ${e.message}`,
+                    });
+                } else {
+                    // Block is in another file. We can only show the error at the call site in this document.
+                    errors.push({
+                        ...e,
+                        line: callNode.line,
+                        col: callNode.col,
+                        message: `[in block "${callNode.partialName}"] ${e.message}`,
+                    });
+                }
             }
-        } catch { /* ignore */ }
+        } catch (err) {
+            this.outputChannel.appendLine(`Error validating named block: ${err}`);
+        }
+    }
+
+    private validateFilePartialCall(
+        callNode: TemplateNode,
+        partialCtx: TemplateContext,
+        contextArg: string,
+        vars: Map<string, TemplateVar>,
+        scopeStack: ScopeFrame[],
+        blockLocals: Map<string, TemplateVar>,
+        errors: ValidationError[],
+        filePath: string
+    ) {
+        const resolved = this.resolvePartialVars(contextArg, vars, scopeStack, blockLocals);
+        try {
+            const openDoc = vscode.workspace.textDocuments.find(
+                d => d.uri.fsPath === partialCtx.absolutePath
+            );
+            const content = openDoc
+                ? openDoc.getText()
+                : fs.readFileSync(partialCtx.absolutePath, 'utf8');
+
+            const partialErrors = this.validate(
+                content,
+                {
+                    ...partialCtx,
+                    vars: resolved.vars,
+                    isMap: resolved.isMap,
+                    keyType: resolved.keyType,
+                    elemType: resolved.elemType,
+                    isSlice: resolved.isSlice,
+                    rootTypeStr: resolved.rootTypeStr,
+                },
+                partialCtx.absolutePath
+            );
+
+            const isSameFile = require('path').normalize(partialCtx.absolutePath).toLowerCase() === require('path').normalize(filePath).toLowerCase();
+
+            for (const e of partialErrors) {
+                if (isSameFile) {
+                    // 1. Error on the exact variable
+                    errors.push({
+                        ...e,
+                        line: e.line,
+                        col: e.col,
+                    });
+                    // 2. Trace error at the call site
+                    errors.push({
+                        ...e,
+                        line: callNode.line,
+                        col: callNode.col,
+                        message: `[in partial "${callNode.partialName}"] ${e.message}`,
+                    });
+                } else {
+                    // Partial is in another file
+                    errors.push({
+                        ...e,
+                        line: callNode.line,
+                        col: callNode.col,
+                        message: `[in partial "${callNode.partialName}"] ${e.message}`,
+                    });
+                }
+            }
+        } catch { /* ignore read errors */ }
     }
 
     // ── Partial variable resolution ───────────────────────────────────────────
