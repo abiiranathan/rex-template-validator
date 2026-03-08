@@ -100,7 +100,7 @@ export class TemplateValidator {
         }
 
         const content = document.getText();
-        const errors = this.validate(content, ctx, document.uri.fsPath);
+        const errors = this.validate(content, ctx as TemplateContext, document.uri.fsPath);
 
         return errors.map((e) => {
             const line = Math.max(0, e.line - 1);
