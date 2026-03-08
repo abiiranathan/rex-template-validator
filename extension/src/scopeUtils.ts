@@ -47,16 +47,11 @@ export function isFileBasedPartial(name: string): boolean {
 /**
  * Normalises a template context argument so that dict calls wrapped in
  * parentheses — e.g. `(dict "key" .Value)` — are unwrapped to `dict "key" .Value`.
- * This is necessary because the Go template parser allows (and the TemplateParser
- * preserves) the parenthesised form of any pipeline expression, including dict calls.
  */
 export function normalizeDictArg(contextArg: string): string {
     let s = contextArg.trim();
-    // Iteratively strip balanced outer parentheses.
     while (s.startsWith('(') && s.endsWith(')')) {
         const inner = s.slice(1, -1).trim();
-        // Only strip if the parens are truly the outermost wrapper — verify by
-        // scanning that the opening '(' is balanced by the closing ')'.
         let depth = 0;
         let balanced = false;
         for (let i = 0; i < s.length; i++) {
@@ -80,13 +75,6 @@ export function normalizeDictArg(contextArg: string): string {
 
 // ── ScopeUtils class ──────────────────────────────────────────────────────────
 
-/**
- * ScopeUtils encapsulates all shared scope-resolution and AST-traversal logic
- * that is consumed by ValidatorCore, HoverProvider, DefinitionProvider, and
- * CompletionProvider.
- *
- * Not safe for concurrent use from multiple goroutines (N/A — single-threaded JS).
- */
 export class ScopeUtils {
     readonly parser: TemplateParser;
     readonly graphBuilder: KnowledgeGraphBuilder;
@@ -98,11 +86,6 @@ export class ScopeUtils {
 
     // ── Named block registry ──────────────────────────────────────────────────
 
-    /**
-     * Looks up a named block entry from the cross-file registry.
-     * Returns the entry (or undefined), whether it is duplicated, and a human-readable
-     * duplicate message when applicable.
-     */
     resolveNamedBlock(name: string): {
         entry: import('./types').NamedBlockEntry | undefined;
         isDuplicate: boolean;
@@ -129,11 +112,6 @@ export class ScopeUtils {
 
     // ── Scope frame builders ──────────────────────────────────────────────────
 
-    /**
-     * Builds the child variable map and scope stack for a container node
-     * (range, with, block, define).  Returns null when the node type does not
-     * introduce a new scope.
-     */
     buildChildScope(
         node: TemplateNode,
         vars: Map<string, TemplateVar>,
@@ -189,12 +167,6 @@ export class ScopeUtils {
         }
     }
 
-    /**
-   * Builds a ScopeFrame representing the element type of a range target.
-   * Tries expression inference first (handles index/funcMap expressions),
-   * then falls back to path resolution for simple field ranges.
-   * Returns null when the range target cannot be resolved.
-   */
     buildRangeElemScope(
         node: TemplateNode,
         vars: Map<string, TemplateVar>,
@@ -203,7 +175,6 @@ export class ScopeUtils {
     ): ScopeFrame | null {
         const fieldResolver = this.buildFieldResolver(vars, scopeStack);
 
-        // Primary: use expression inference when a full expression string is present.
         if (node.assignExpr) {
             try {
                 const exprType = inferExpressionType(
@@ -222,15 +193,11 @@ export class ScopeUtils {
             } catch { /* fall through to path-based resolution */ }
         }
 
-        // Fallback: resolve via the pre-parsed dot-path.
         const result = resolvePath(node.path, vars, scopeStack, blockLocals, fieldResolver);
         if (!result.found) return null;
         return this.buildRangeElemScopeFromType(node, result, vars, scopeStack, fieldResolver);
     }
 
-    /**
-     * Constructs a ScopeFrame from an already-resolved collection type.
-     */
     private buildRangeElemScopeFromType(
         node: TemplateNode,
         result: {
@@ -366,9 +333,6 @@ export class ScopeUtils {
 
     // ── Assignment helpers ────────────────────────────────────────────────────
 
-    /**
-     * Records the inferred type of each assigned variable into blockLocals.
-     */
     applyAssignmentLocals(
         assignVars: string[],
         result: import('./compiler/expressionParser').TypeResult | import('./templateParser').ResolveResult,
@@ -407,10 +371,6 @@ export class ScopeUtils {
         }
     }
 
-    /**
-     * Processes an assignment node by inferring the RHS type and recording
-     * the result into blockLocals.
-     */
     processAssignment(
         node: TemplateNode,
         vars: Map<string, TemplateVar>,
@@ -462,9 +422,6 @@ export class ScopeUtils {
 
     // ── AST queries ───────────────────────────────────────────────────────────
 
-    /**
-     * Returns the innermost {{ define }} / {{ block }} node that contains position.
-     */
     findEnclosingBlockOrDefine(
         nodes: TemplateNode[],
         position: vscode.Position
@@ -492,13 +449,6 @@ export class ScopeUtils {
         return null;
     }
 
-    /**
-     * Finds the call-site context of a named block by scanning nodes for
-     * {{ template "name" <ctx> }} or {{ block "name" <ctx> }} tags.
-     *
-     * normalise contextArg with normalizeDictArg so that (dict ...) expressions
-     * wrapped in parentheses are correctly detected and evaluated.
-     */
     findCallSiteContext(
         nodes: TemplateNode[],
         blockName: string,
@@ -539,7 +489,6 @@ export class ScopeUtils {
                                 : '.' + node.path.join('.');
                 }
 
-                // Strip outer parens — e.g. (dict "k" .V) → dict "k" .V
                 const normalizedCtx = normalizeDictArg(contextArg);
 
                 if (normalizedCtx === '.' || normalizedCtx === '') {
@@ -644,16 +593,6 @@ export class ScopeUtils {
                         }
                     }
                 } else if (node.kind === 'define' && node.blockName && !visitedDefines.has(node.blockName)) {
-                    // context chain propagation through {{ define }} ──────────────
-                    // When we enter a define body we must use the context that define is
-                    // CALLED with, not the outer root scope.  Without this, any template
-                    // call found *inside* the define body (e.g. {{ template "child" . }})
-                    // evaluates "." against the root scope and picks up global vars instead
-                    // of the dict/path that was passed to this define.
-                    //
-                    // We search `rootNodes` (the full file, constant across all recursive
-                    // calls) for the call site of this define, using `visitedDefines` to
-                    // prevent cycles.
                     const newVisited = new Set(visitedDefines);
                     newVisited.add(node.blockName);
 
@@ -672,7 +611,6 @@ export class ScopeUtils {
                             elemType: defineCtx.elemType,
                             isSlice: defineCtx.isSlice,
                         }];
-                        // Inside the define, '$' refers to the passed context, not the root
                         childVars = this.fieldsToVarMap(defineCtx.fields ?? []);
                     }
                 }
@@ -687,9 +625,6 @@ export class ScopeUtils {
         return null;
     }
 
-    /**
-     * Walks the AST to find the first {{ define "name" }} / {{ block "name" }} node.
-     */
     findDefineNodeInAST(
         nodes: TemplateNode[],
         name: string
@@ -708,10 +643,6 @@ export class ScopeUtils {
         return null;
     }
 
-    /**
-     * Traverses nodes to find the leaf node that spans position, propagating
-     * the correct scope stack and blockLocals through range/with/block containers.
-     */
     findNodeAtPosition(
         nodes: TemplateNode[],
         position: vscode.Position,
@@ -837,9 +768,6 @@ export class ScopeUtils {
         return null;
     }
 
-    /**
-     * Determines the active scope (stack + locals) at a given document position.
-     */
     findScopeAtPosition(
         nodes: TemplateNode[],
         position: vscode.Position,
@@ -968,7 +896,6 @@ export class ScopeUtils {
 
     // ── Utilities ─────────────────────────────────────────────────────────────
 
-    /** Converts a FieldInfo array into a TemplateVar map keyed by field name. */
     fieldsToVarMap(fields: FieldInfo[]): Map<string, TemplateVar> {
         const m = new Map<string, TemplateVar>();
         for (const f of fields) m.set(f.name, fieldInfoToTemplateVar(f));
@@ -978,6 +905,11 @@ export class ScopeUtils {
     /**
      * Builds a field-resolver closure that maps a bare Go type name (e.g. "User")
      * to its FieldInfo array.
+     *
+     * Resolution order:
+     *  1. Fields indexed inline from vars + scope frames (fast, local)
+     *  2. Global type registry from the Go analyzer (covers types whose fields
+     *     were stripped from the serialized TemplateVar to reduce payload size)
      */
     buildFieldResolver(
         vars: Map<string, TemplateVar>,
@@ -1063,17 +995,12 @@ export class ScopeUtils {
 
         return (typeStr: string) => {
             const bare = extractBareType(typeStr);
-            return typeIndex.get(bare);
+            // Check locally-indexed fields first (built from vars + scope frames),
+            // then fall back to the global type registry from the Go analyzer.
+            return typeIndex.get(bare) ?? graph.typeRegistry.get(bare);
         };
     }
 
-    /**
-     * Collects the names of all variables/fields accessible in the current scope,
-     * formatted for inclusion in error messages.
-     *
-     * Returns a short, human-readable summary string, e.g.:
-     *   ".Name, .Age, .Email, $item, $idx"
-     */
     formatAvailableVars(
         vars: Map<string, TemplateVar>,
         scopeStack: ScopeFrame[],
@@ -1081,7 +1008,6 @@ export class ScopeUtils {
     ): string {
         const names: string[] = [];
 
-        // Dollar-sign locals: $item, $idx, etc.
         for (const k of blockLocals.keys()) names.push(k);
         for (const frame of scopeStack) {
             if (frame.locals) {
@@ -1091,7 +1017,6 @@ export class ScopeUtils {
             }
         }
 
-        // Fields from the innermost dot frame (or root vars if no dot frame).
         const dotFrame = scopeStack.slice().reverse().find(f => f.key === '.');
         const contextFields: FieldInfo[] = dotFrame?.fields?.length
             ? dotFrame.fields
@@ -1110,10 +1035,6 @@ export class ScopeUtils {
 
     // ── Private: named-block context resolution for position-based APIs ───────
 
-    /**
-     * Resolves the call-site context of a named block for hover/completion/definition
-     * consumers.
-     */
     resolveNamedBlockCallCtxForPosition(
         blockName: string,
         vars: Map<string, TemplateVar>,
@@ -1143,7 +1064,6 @@ export class ScopeUtils {
 
         let currentFileVars = vars;
         if (currentFilePath) {
-            const graph = this.graphBuilder.getGraph();
             for (const [, templateCtx] of graph.templates) {
                 if (templateCtx.absolutePath === currentFilePath) {
                     currentFileVars = templateCtx.vars;

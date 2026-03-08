@@ -9,7 +9,9 @@ type TemplateVar struct {
 	// TypeStr is the string representation of the variable's type (e.g., "string", "*MyStruct").
 	TypeStr string `json:"type"`
 	// Fields contains information about the variable's exported fields if it is a struct or an embedded struct.
+	// After Flatten is called this slice is nil; consumers resolve fields via the Types registry.
 	Fields []FieldInfo `json:"fields,omitempty"`
+
 	// IsSlice indicates if the variable is a slice type.
 	IsSlice bool `json:"isSlice"`
 	// IsMap indicates if the variable is a map type.
@@ -36,6 +38,7 @@ type FieldInfo struct {
 	// TypeStr is the string representation of the field's or method's type (e.g., "string", "func(int) string").
 	TypeStr string `json:"type"`
 	// Fields contains information about nested exported fields if this field is a struct or an embedded struct.
+	// After Flatten is called this slice is nil; consumers resolve sub-types via the Types registry.
 	Fields []FieldInfo `json:"fields,omitempty"`
 	// IsSlice indicates if the field is a slice type.
 	IsSlice bool `json:"isSlice"`
@@ -85,6 +88,13 @@ type AnalysisResult struct {
 	FuncMaps []FuncMapInfo `json:"funcMaps"`
 	// Errors contains any non-fatal errors encountered during the analysis process.
 	Errors []string `json:"errors"`
+
+	// Types is the global type registry mapping each named type to its direct
+	// (one-level-deep) fields. Populated by BuildTypeRegistry; consumers
+	// reconstruct the full type hierarchy by recursively looking up each
+	// field's TypeStr in this map, avoiding repeated serialization of identical
+	// struct definitions across render calls.
+	Types map[string][]FieldInfo `json:"types,omitempty"`
 }
 
 // FuncMapInfo represents a template function registered in a `template.FuncMap`.
@@ -122,6 +132,7 @@ type ParamInfo struct {
 	TypeStr string `json:"type"`
 
 	// Fields contains the nested exported fields if this return type is a struct.
+	// After Flatten is called this slice is nil; consumers look up via the Types registry.
 	Fields []FieldInfo `json:"fields,omitempty"`
 }
 
@@ -183,4 +194,147 @@ type fieldInfo struct {
 	line int    // Line number in source
 	col  int    // Column number in source
 	doc  string // Associated documentation comment
+}
+
+// BuildTypeRegistry collects every named type encountered across all render
+// calls and function maps into the Types map. Each entry stores only the
+// type's direct (one-level-deep) fields; sub-type fields are omitted because
+// the consumer resolves the full hierarchy by recursively looking up each
+// field's TypeStr in the same registry.
+//
+// This eliminates the dominant source of JSON bloat: identical struct
+// definitions being serialized once per render call rather than once globally.
+// A codebase with 200 render calls that all pass a User struct previously
+// serialized User's entire field tree 200 times; after this call it is
+// serialized exactly once.
+//
+// BuildTypeRegistry must be called before Flatten so that the full inline
+// field trees are still available for traversal. Flatten calls this
+// automatically, so direct callers normally do not need to invoke it.
+func (r *AnalysisResult) BuildTypeRegistry() {
+	if r.Types == nil {
+		r.Types = make(map[string][]FieldInfo)
+	}
+
+	// registerFieldTree records typeName → shallow fields in the registry and
+	// recurses into each field to register referenced sub-types. Registering
+	// the type BEFORE recursing ensures cycles (e.g. TreeNode.Children
+	// []*TreeNode) are broken on the second visit.
+	var registerFieldTree func(typeName string, fields []FieldInfo)
+	registerFieldTree = func(typeName string, fields []FieldInfo) {
+		if typeName == "" || isPrimitiveType(typeName) {
+			return
+		}
+		if _, exists := r.Types[typeName]; exists {
+			return // already registered; also terminates cycles
+		}
+
+		// Build a one-level shallow copy: strip nested field trees from each
+		// direct field but keep all other metadata (TypeStr, IsSlice, Doc…).
+		shallow := make([]FieldInfo, len(fields))
+		for i, f := range fields {
+			shallow[i] = f
+			shallow[i].Fields = nil
+
+			// For method fields, also strip field trees from return ParamInfos
+			// now that those types will be registered separately.
+			if f.TypeStr == "method" && len(f.Returns) > 0 {
+				flatReturns := make([]ParamInfo, len(f.Returns))
+				for j, ret := range f.Returns {
+					flatReturns[j] = ret
+					flatReturns[j].Fields = nil
+				}
+				shallow[i].Returns = flatReturns
+			}
+		}
+		r.Types[typeName] = shallow
+
+		// Recurse into each direct field to register referenced sub-types.
+		for _, f := range fields {
+			switch {
+			case f.TypeStr == "method":
+				// Register the return types of methods.
+				for _, ret := range f.Returns {
+					registerFieldTree(registryTypeKey(ret.TypeStr), ret.Fields)
+				}
+
+			case f.IsSlice || f.IsMap:
+				// The inline Fields belong to the element type, not the
+				// collection wrapper. Use ElemType when available; fall back
+				// to stripping prefixes from TypeStr.
+				elemKey := f.ElemType
+				if elemKey == "" {
+					elemKey = registryTypeKey(f.TypeStr)
+				}
+				registerFieldTree(registryTypeKey(elemKey), f.Fields)
+
+			default:
+				registerFieldTree(registryTypeKey(f.TypeStr), f.Fields)
+			}
+		}
+	}
+
+	// Walk all render call variables.
+	for _, rc := range r.RenderCalls {
+		for _, v := range rc.Vars {
+			var key string
+			switch {
+			case v.IsSlice || v.IsMap:
+				key = v.ElemType
+				if key == "" {
+					key = registryTypeKey(v.TypeStr)
+				}
+				key = registryTypeKey(key)
+			default:
+				key = registryTypeKey(v.TypeStr)
+			}
+			registerFieldTree(key, v.Fields)
+		}
+	}
+
+	// Walk FuncMap return types.
+	for _, fm := range r.FuncMaps {
+		for _, ret := range fm.Returns {
+			registerFieldTree(registryTypeKey(ret.TypeStr), ret.Fields)
+		}
+		// ReturnTypeFields are the unwrapped primary-return-type fields
+		// (e.g. func() *[]MgtHints → fields of MgtHints). Register them
+		// under the primary return type's key when available.
+		if len(fm.Returns) > 0 && len(fm.ReturnTypeFields) > 0 {
+			registerFieldTree(registryTypeKey(fm.Returns[0].TypeStr), fm.ReturnTypeFields)
+		}
+	}
+}
+
+// Flatten builds the global type registry (via BuildTypeRegistry) and then
+// strips all inline field trees from render call variables, FuncMap entries,
+// and the registry entries themselves. The result is a compact JSON payload
+// where each named type is serialized exactly once in the Types map rather
+// than once per render call.
+//
+// Flatten must be called after any validation step that relies on inline
+// field trees (e.g. validator.ValidateTemplates) and before JSON serialization.
+func (r *AnalysisResult) Flatten() {
+	// Populate the registry before stripping the inline trees it is built from.
+	r.BuildTypeRegistry()
+
+	// Strip inline field trees from render call variables.
+	for i := range r.RenderCalls {
+		for j := range r.RenderCalls[i].Vars {
+			r.RenderCalls[i].Vars[j].Fields = nil
+		}
+	}
+
+	// Strip inline field trees from FuncMap entries.
+	for i := range r.FuncMaps {
+		r.FuncMaps[i].ReturnTypeFields = nil
+		for j := range r.FuncMaps[i].Params {
+			r.FuncMaps[i].Params[j].Fields = nil
+		}
+		for j := range r.FuncMaps[i].Returns {
+			r.FuncMaps[i].Returns[j].Fields = nil
+		}
+	}
+	// Note: registry entries are already one-level shallow (set by
+	// BuildTypeRegistry), so no further stripping is required here.
 }

@@ -17,6 +17,7 @@ import {
 import { TemplateParser, resolvePath } from './templateParser';
 import { normalizeDictArg } from './scopeUtils';
 import { inferExpressionType } from './compiler/expressionParser';
+import { extractBareType } from './types';
 
 export class KnowledgeGraphBuilder {
   private graph: KnowledgeGraph = {
@@ -25,6 +26,7 @@ export class KnowledgeGraphBuilder {
     namedBlockErrors: [],
     analyzedAt: new Date(),
     funcMaps: new Map(),
+    typeRegistry: new Map(),
   };
 
   private workspaceRoot: string;
@@ -52,6 +54,21 @@ export class KnowledgeGraphBuilder {
     const templates = new Map<string, TemplateContext>();
     const templateBase = this.getTemplateBase();
 
+    // ── Build type registry from the global types map ──────────────────────
+    // The Go analyzer now serializes each named type exactly once in
+    // analysisResult.types (bare name → one-level fields).  TemplateVar
+    // instances no longer carry inline field trees; consumers resolve them
+    // by calling fieldResolver which falls back to this registry.
+    const typeRegistry = new Map<string, FieldInfo[]>();
+    if (analysisResult.types) {
+      for (const [typeName, fields] of Object.entries(analysisResult.types)) {
+        typeRegistry.set(typeName, fields);
+      }
+      this.outputChannel.appendLine(
+        `[KnowledgeGraph] Loaded ${typeRegistry.size} type(s) from global registry`
+      );
+    }
+
     const mergeRenderCall = (logicalPath: string, absPath: string, rc: RenderCall) => {
       let ctx = templates.get(logicalPath);
       if (!ctx) {
@@ -68,8 +85,9 @@ export class KnowledgeGraphBuilder {
 
       for (const v of rc.vars ?? []) {
         const existing = ctx.vars.get(v.name);
-        if (!existing || isMoreComplete(v, existing)) {
-          ctx.vars.set(v.name, v);
+        if (!existing || isMoreComplete(v, existing, typeRegistry)) {
+          // Hydrate fields from the type registry if not already present.
+          ctx.vars.set(v.name, hydrateVar(v, typeRegistry));
         }
       }
     };
@@ -99,8 +117,8 @@ export class KnowledgeGraphBuilder {
           blockCtx.renderCalls.push(rc);
           for (const v of rc.vars ?? []) {
             const existing = blockCtx.vars.get(v.name);
-            if (!existing || isMoreComplete(v, existing)) {
-              blockCtx.vars.set(v.name, v);
+            if (!existing || isMoreComplete(v, existing, typeRegistry)) {
+              blockCtx.vars.set(v.name, hydrateVar(v, typeRegistry));
             }
           }
         }
@@ -150,12 +168,13 @@ export class KnowledgeGraphBuilder {
       funcMaps.set(fm.name, fm);
     }
 
-    this.graph = { templates, namedBlocks, namedBlockErrors, analyzedAt: new Date(), funcMaps };
+    this.graph = { templates, namedBlocks, namedBlockErrors, analyzedAt: new Date(), funcMaps, typeRegistry };
 
     this.outputChannel.appendLine(
       `[KnowledgeGraph] Built graph with ${templates.size} templates, ` +
       `${namedBlocks.size} named block(s), ` +
-      `${funcMaps.size} template functions`
+      `${funcMaps.size} template functions, ` +
+      `${typeRegistry.size} registered type(s)`
     );
 
     if (namedBlockErrors.length > 0) {
@@ -425,7 +444,7 @@ export class KnowledgeGraphBuilder {
 
           for (const [k, v] of resolved.vars) {
             const existing = mergedVars.get(k);
-            if (!existing || isMoreComplete(v, existing)) {
+            if (!existing || isMoreComplete(v, existing, this.graph.typeRegistry)) {
               mergedVars.set(k, v);
             }
           }
@@ -502,10 +521,7 @@ export class KnowledgeGraphBuilder {
   /**
    * Resolves the variable map for a partial call's context argument.
    *
-   * FIX: normalise the context arg with normalizeDictArg so that (dict ...) forms
-   * — produced by the TemplateParser preserving parentheses — are handled correctly.
-   * Also added full dict inference using inferExpressionType so that typed dict
-   * fields flow into the partial's render context.
+   * Uses the global typeRegistry as a fallback when vars have no inline fields.
    */
   private resolvePartialVars(
     contextArg: string,
@@ -520,20 +536,8 @@ export class KnowledgeGraphBuilder {
 
     // Handle dict calls
     if (normalizedCtx.startsWith('dict ')) {
-      // Build a minimal field-resolver from the available vars.
-      const typeIndex = new Map<string, FieldInfo[]>();
-      const indexVar = (v: TemplateVar | FieldInfo) => {
-        const bare = v.type.replace(/^\*/, '').replace(/^\[\]/, '').replace(/^map\[.*?\]/, '').trim();
-        if (bare && v.fields && v.fields.length > 0 && !typeIndex.has(bare)) {
-          typeIndex.set(bare, v.fields);
-          for (const f of v.fields) indexVar(f);
-        }
-      };
-      for (const v of vars.values()) indexVar(v);
-      const fieldResolver = (t: string) => {
-        const bare = t.replace(/^\*/, '').replace(/^\[\]/, '').replace(/^map\[.*?\]/, '').trim();
-        return typeIndex.get(bare);
-      };
+      // Build a field-resolver that consults the global type registry.
+      const fieldResolver = this.buildLocalFieldResolver(vars);
 
       const dictType = inferExpressionType(normalizedCtx, vars, [], undefined, undefined, fieldResolver);
       if (dictType && dictType.fields) {
@@ -562,7 +566,7 @@ export class KnowledgeGraphBuilder {
 
     const parser = new TemplateParser();
     const parsedPath = parser.parseDotPath(normalizedCtx);
-    const result = resolvePath(parsedPath, vars, []);
+    const result = resolvePath(parsedPath, vars, [], undefined, this.buildLocalFieldResolver(vars));
 
     if (!result.found) {
       return { vars: new Map() };
@@ -585,6 +589,31 @@ export class KnowledgeGraphBuilder {
     };
   }
 
+  /**
+   * Builds a lightweight field resolver that consults the global type registry.
+   * Used in contexts where ScopeUtils is not available (e.g. graph build time).
+   */
+  private buildLocalFieldResolver(
+    vars: Map<string, TemplateVar>
+  ): (typeStr: string) => FieldInfo[] | undefined {
+    const typeIndex = new Map<string, FieldInfo[]>();
+
+    const indexVar = (v: TemplateVar | FieldInfo) => {
+      const bare = extractBareType(v.type);
+      if (bare && v.fields && v.fields.length > 0 && !typeIndex.has(bare)) {
+        typeIndex.set(bare, v.fields);
+        for (const f of v.fields) indexVar(f);
+      }
+    };
+    for (const v of vars.values()) indexVar(v);
+
+    return (t: string) => {
+      const bare = extractBareType(t);
+      // Check inline-indexed fields first, then fall back to global type registry.
+      return typeIndex.get(bare) ?? this.graph.typeRegistry.get(bare);
+    };
+  }
+
   private findPartialSourceVar(
     contextArg: string,
     vars: Map<string, TemplateVar>
@@ -599,7 +628,7 @@ export class KnowledgeGraphBuilder {
       return undefined;
     }
 
-    const result = resolvePath(parsedPath, vars, []);
+    const result = resolvePath(parsedPath, vars, [], undefined, this.buildLocalFieldResolver(vars));
     if (!result.found) return undefined;
 
     const topVar = vars.get(parsedPath[0]);
@@ -670,7 +699,7 @@ export class KnowledgeGraphBuilder {
   }
 
   /**
-   * Incrementally updates the named block registry for a single file 
+   * Incrementally updates the named block registry for a single file
    * without needing to re-run the Go analyzer.
    */
   updateTemplateFile(absolutePath: string, content: string) {
@@ -744,17 +773,44 @@ function fieldInfoToTemplateVar(f: FieldInfo): TemplateVar {
   };
 }
 
-function isMoreComplete(a: TemplateVar, b: TemplateVar): boolean {
-  const depthA = maxFieldDepth(a.fields ?? []);
-  const depthB = maxFieldDepth(b.fields ?? []);
+/**
+ * Hydrates a TemplateVar's fields from the global type registry if they are
+ * absent.  Only one level is resolved here — nested lookups happen lazily
+ * via fieldResolver at analysis time.
+ */
+function hydrateVar(v: TemplateVar, typeRegistry: Map<string, FieldInfo[]>): TemplateVar {
+  if (v.fields && v.fields.length > 0) return v;
+  const bare = extractBareType(v.type);
+  const fields = typeRegistry.get(bare);
+  if (fields && fields.length > 0) {
+    return { ...v, fields };
+  }
+  return v;
+}
+
+/**
+ * Returns true when `a` is a more complete definition of a TemplateVar than `b`.
+ * Now also considers whether the type registry can supply fields for the type.
+ */
+function isMoreComplete(
+  a: TemplateVar,
+  b: TemplateVar,
+  typeRegistry: Map<string, FieldInfo[]>
+): boolean {
+  const depthA = maxFieldDepth(a.fields ?? [], typeRegistry);
+  const depthB = maxFieldDepth(b.fields ?? [], typeRegistry);
   return depthA > depthB;
 }
 
-function maxFieldDepth(fields: FieldInfo[]): number {
+function maxFieldDepth(fields: FieldInfo[], typeRegistry?: Map<string, FieldInfo[]>): number {
   if (fields.length === 0) return 0;
   let max = 0;
   for (const f of fields) {
-    const d = 1 + maxFieldDepth(f.fields ?? []);
+    // For fields with no inline children try the registry (one extra level).
+    const childFields = f.fields && f.fields.length > 0
+      ? f.fields
+      : typeRegistry?.get(extractBareType(f.type)) ?? [];
+    const d = 1 + maxFieldDepth(childFields);
     if (d > max) max = d;
   }
   return max;

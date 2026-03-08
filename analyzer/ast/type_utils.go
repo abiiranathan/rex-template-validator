@@ -97,6 +97,72 @@ func parseTypeString(typeStr string) (string, bool) {
 	return base, isSlice
 }
 
+// registryTypeKey derives the canonical registry key from a type string by
+// stripping pointer (*) and slice ([]) prefixes, and for map types returning
+// the key for the value type. Generic type parameters are preserved so that
+// Page[User] and Page[Order] remain distinct registry entries.
+//
+// Examples:
+//
+//	"User"              → "User"
+//	"*User"             → "User"
+//	"[]User"            → "User"
+//	"[]*User"           → "User"
+//	"Page[User]"        → "Page[User]"
+//	"[]Page[User]"      → "Page[User]"
+//	"map[string]User"   → "User"
+//	"map[uint]*Drug"    → "Drug"
+//	"string"            → "string"   (filtered by isPrimitiveType)
+func registryTypeKey(typeStr string) string {
+	s := strings.TrimSpace(typeStr)
+
+	// Strip leading pointer and slice qualifiers.
+	for strings.HasPrefix(s, "*") || strings.HasPrefix(s, "[]") {
+		if strings.HasPrefix(s, "*") {
+			s = s[1:]
+		} else {
+			s = s[2:]
+		}
+	}
+
+	// For map types use the value type, handling nested brackets correctly.
+	if strings.HasPrefix(s, "map[") {
+		depth := 0
+		// Scan from index 4 (past "map[") to find the matching ']'.
+		for i := 4; i < len(s); i++ {
+			switch s[i] {
+			case '[':
+				depth++
+			case ']':
+				if depth == 0 {
+					// Everything after the closing ] is the value type.
+					return registryTypeKey(s[i+1:])
+				}
+				depth--
+			}
+		}
+	}
+
+	return s
+}
+
+// isPrimitiveType reports whether a type string names a built-in Go type,
+// an empty value, or the synthetic "method" marker used by the field extractor.
+// Such types are not recorded in the global type registry.
+func isPrimitiveType(t string) bool {
+	switch t {
+	case "string", "bool", "byte", "rune", "error", "any", "interface{}", "method", "":
+		return true
+	case "int", "int8", "int16", "int32", "int64":
+		return true
+	case "uint", "uint8", "uint16", "uint32", "uint64", "uintptr":
+		return true
+	case "float32", "float64", "complex64", "complex128":
+		return true
+	}
+	return false
+}
+
 // findDefinitionLocation resolves the source location where an expression's
 // value is defined. Prioritizes declarations over usages.
 func findDefinitionLocation(expr goast.Expr, info *types.Info, fset *token.FileSet) (string, int, int) {

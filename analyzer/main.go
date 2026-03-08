@@ -1,4 +1,3 @@
-// FILE: main.go
 /*
 Package main provides the command-line interface for the Rex template analyzer.
 
@@ -31,6 +30,7 @@ import (
 // diagnostics.
 type ValidationOutput struct {
 	// RenderCalls contains all detected template render invocations.
+	// Variable field trees are stripped; consumers resolve types via Types.
 	RenderCalls []ast.RenderCall `json:"renderCalls"`
 
 	// FuncMaps contains discovered template function maps.
@@ -47,6 +47,11 @@ type ValidationOutput struct {
 
 	// NamedBlockErrors contains duplicate block declarations.
 	NamedBlockErrors []validator.NamedBlockDuplicateError `json:"namedBlockErrors"`
+
+	// Types is the global type registry: each named type is stored once with
+	// its direct fields. Consumers reconstruct the full type hierarchy by
+	// recursively looking up each field's TypeStr in this map.
+	Types map[string][]ast.FieldInfo `json:"types,omitempty"`
 }
 
 // main is the CLI entry point for the template analyzer.
@@ -70,10 +75,12 @@ func main() {
 		templateBase = mustAbs(*templateBaseDir)
 	}
 
-	// Run static analysis on the source directory
+	// Run static analysis on the source directory.
 	result := ast.AnalyzeDir(absDir, *contextFile, ast.DefaultConfig)
 
-	// Handle view-context command
+	// view-context outputs the full variable context (including inline field
+	// trees) for a single template so the editor extension can render hover
+	// and autocomplete information. Do NOT flatten before this call.
 	if *viewContext != "" {
 		handleViewContext(result, *viewContext, *compress)
 		return
@@ -86,11 +93,19 @@ func main() {
 	var output any
 
 	if *validate || *showNamedTemplates {
+		// Validation reads inline field trees from render call variables to
+		// build per-template variable maps. Flatten AFTER validation completes
+		// so those trees are available throughout the validation pass.
 		ve, namedBlocks, namedBlockErrors := validator.ValidateTemplates(
 			result.RenderCalls,
 			templateBase,
 			*templateRoot,
 		)
+
+		// Build the type registry and strip inline field trees before
+		// serialization to keep the JSON payload small.
+		result.Flatten()
+
 		if *showNamedTemplates {
 			keys := make([]string, 0, len(namedBlocks))
 			for k := range namedBlocks {
@@ -98,7 +113,7 @@ func main() {
 			}
 			output = keys
 		} else {
-			// Produce extended output with validation results
+			// Produce extended output with validation results.
 			output = ValidationOutput{
 				RenderCalls:      result.RenderCalls,
 				FuncMaps:         result.FuncMaps,
@@ -106,10 +121,12 @@ func main() {
 				Errors:           result.Errors,
 				NamedBlocks:      namedBlocks,
 				NamedBlockErrors: namedBlockErrors,
+				Types:            result.Types,
 			}
 		}
 	} else {
-		// Emit raw analysis result
+		// Raw analysis output: build the registry and flatten before encoding.
+		result.Flatten()
 		output = result
 	}
 
@@ -197,7 +214,10 @@ func isImportError(e string) bool {
 	return false
 }
 
-// handleViewContext filters render calls for a specific template and outputs the context variables.
+// handleViewContext filters render calls for a specific template and outputs
+// the full variable context including inline field trees. This endpoint is
+// intentionally not flattened so the caller receives complete type information
+// for hover and autocomplete features.
 func handleViewContext(result ast.AnalysisResult, templateName string, compress bool) {
 	type ContextInfo struct {
 		File string            `json:"file"`
@@ -210,7 +230,7 @@ func handleViewContext(result ast.AnalysisResult, templateName string, compress 
 	for _, rc := range result.RenderCalls {
 		// Check for exact match or suffix match (to handle relative paths vs absolute/partial paths)
 		if rc.Template == templateName || strings.HasSuffix(rc.Template, "/"+templateName) || strings.HasSuffix(rc.Template, "\\"+templateName) {
-			// Avoid NULLS
+			// Avoid NULLs
 			if rc.Vars == nil {
 				rc.Vars = []ast.TemplateVar{}
 			}

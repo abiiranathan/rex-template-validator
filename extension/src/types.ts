@@ -86,6 +86,10 @@ export interface AnalysisResult {
   validationErrors?: GoValidationError[];
   namedBlocks?: Record<string, NamedBlockEntry[]>;
   namedBlockErrors?: NamedBlockDuplicateError[];
+  /** Global type registry: maps bare type name → direct (one-level) fields.
+   *  Consumers resolve nested fields by recursively looking up each field's
+   *  type in this map. Replaces inline field trees on TemplateVar. */
+  types?: Record<string, FieldInfo[]>;
 }
 
 // ─── Named Block Registry ──────────────────────────────────────────────────────
@@ -144,6 +148,9 @@ export interface KnowledgeGraph {
   analyzedAt: Date;
   /** Discovered template functions */
   funcMaps: Map<string, FuncMapInfo>;
+  /** Global type registry from the Go analyzer: bare type name → one-level fields.
+   *  Use buildFieldResolver (which falls back here) to navigate nested type hierarchies. */
+  typeRegistry: Map<string, FieldInfo[]>;
 }
 
 /**
