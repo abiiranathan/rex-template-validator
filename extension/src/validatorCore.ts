@@ -1,7 +1,3 @@
-/**
- * Package validatorCore provides the core template validation logic for the Rex Template Validator.
- */
-
 import * as fs from 'fs';
 import * as vscode from 'vscode';
 import {
@@ -131,6 +127,100 @@ export class ValidatorCore {
         }
     }
 
+    // ── Shared Expression Validation ──────────────────────────────────────────
+
+    private validateExpression(
+        node: TemplateNode,
+        expr: string,
+        path: string[],
+        vars: Map<string, TemplateVar>,
+        scopeStack: ScopeFrame[],
+        blockLocals: Map<string, TemplateVar>,
+        errors: ValidationError[]
+    ) {
+        if (!expr) return;
+        if (path && path.length === 1 && (path[0] === '.' || path[0] === '$')) return;
+
+        this.outputChannel.appendLine(
+            `Validating expression: "${expr}" at ${node.line}:${node.col}`
+        );
+
+        const fieldResolver = this.scope.buildFieldResolver(vars, scopeStack);
+
+        // ── Step 1: Type-inference pass ─────────────────────────────────────────
+        try {
+            const exprType = inferExpressionType(
+                expr, vars, scopeStack, blockLocals,
+                this.graphBuilder.getGraph().funcMaps,
+                fieldResolver
+            );
+            if (exprType) return;
+        } catch (e) {
+            this.outputChannel.appendLine(`  inferExpressionType threw error: ${e}`);
+        }
+
+        // ── Step 2: Sub-variable resolution pass ────────────────────────────────
+        const varRefPattern =
+            /(\(index\s+(?:\$|\.)[\w\d_.]+\s+[^)]+\)(?:\.[\w\d_.]+)*|(?:\$|\.)[\w\d_.[\]]*)/g;
+        const refs = expr.match(varRefPattern);
+
+        if (refs) {
+            let foundMissingRef = false;
+
+            for (const ref of refs) {
+                if (/^\.\d+$/.test(ref) || ref === '...') continue;
+                if (ref === '.' || ref === '$') continue;
+
+                const subPath = this.parser.parseDotPath(ref);
+
+                const isRootOnlyPath =
+                    subPath.length === 0 ||
+                    (subPath.length === 1 && (subPath[0] === '.' || subPath[0] === '$'));
+                if (isRootOnlyPath) continue;
+
+                const { found } = resolvePath(subPath, vars, scopeStack, blockLocals, fieldResolver);
+                if (found) continue;
+
+                const refOffset = node.rawText.indexOf(ref);
+                const errCol = refOffset !== -1 ? node.col + refOffset : node.col;
+
+                const displayPath = this.formatDisplayPath(subPath);
+                const available = this.scope.formatAvailableVars(vars, scopeStack, blockLocals);
+
+                errors.push({
+                    message: `Template variable "${displayPath}" is not defined in the render context. Available: ${available}`,
+                    line: node.line,
+                    col: errCol,
+                    severity: 'error',
+                    variable: ref,
+                });
+                foundMissingRef = true;
+            }
+
+            if (foundMissingRef) return;
+        }
+
+        // ── Step 3: Bare-path fallback ───────────────────────────────────────────
+        const isComplexExpr = /[\s|()]/.test(expr);
+        if (isComplexExpr) return;
+
+        const { found: pathResolved } = resolvePath(
+            path, vars, scopeStack, blockLocals, fieldResolver
+        );
+
+        if (!pathResolved) {
+            const displayPath = this.formatDisplayPath(path);
+            const available = this.scope.formatAvailableVars(vars, scopeStack, blockLocals);
+            errors.push({
+                message: `Template variable "${displayPath}" is not defined in the render context. Available: ${available}`,
+                line: node.line,
+                col: node.col,
+                severity: 'error',
+                variable: expr,
+            });
+        }
+    }
+
     // ── Assignment validation ─────────────────────────────────────────────────
 
     private validateAssignment(
@@ -211,95 +301,10 @@ export class ValidatorCore {
         blockLocals: Map<string, TemplateVar>,
         errors: ValidationError[]
     ) {
-        if (node.path.length === 0) return;
-        if (node.path[0] === '.') return;
-        if (node.path[0] === '$' && node.path.length === 1) return;
-
         const cleanExpr = node.rawText
-            ? node.rawText.replace(/^\{\{-?\s*/, '').replace(/\s*-?\}\}$/, '')
+            ? node.rawText.replace(/^\{\{-?\s*/, '').replace(/\s*-?\}\}$/, '').trim()
             : '';
-
-        this.outputChannel.appendLine(
-            `Validating variable/expression: "${cleanExpr}" at ${node.line}:${node.col}`
-        );
-
-        const fieldResolver = this.scope.buildFieldResolver(vars, scopeStack);
-
-        // ── Step 1: Type-inference pass ─────────────────────────────────────────
-        if (cleanExpr) {
-            try {
-                const exprType = inferExpressionType(
-                    cleanExpr, vars, scopeStack, blockLocals,
-                    this.graphBuilder.getGraph().funcMaps,
-                    fieldResolver
-                );
-                if (exprType) return;
-            } catch (e) {
-                this.outputChannel.appendLine(`  inferExpressionType threw error: ${e}`);
-            }
-        }
-
-        // ── Step 2: Sub-variable resolution pass ────────────────────────────────
-        if (cleanExpr) {
-            const varRefPattern =
-                /(\(index\s+(?:\$|\.)[\w\d_.]+\s+[^)]+\)(?:\.[\w\d_.]+)*|(?:\$|\.)[\w\d_.[\]]*)/g;
-            const refs = cleanExpr.match(varRefPattern);
-
-            if (refs) {
-                let foundMissingRef = false;
-
-                for (const ref of refs) {
-                    if (/^\.\d+$/.test(ref) || ref === '...') continue;
-
-                    const subPath = this.parser.parseDotPath(ref);
-
-                    const isRootOnlyPath =
-                        subPath.length === 0 ||
-                        (subPath.length === 1 && (subPath[0] === '.' || subPath[0] === '$'));
-                    if (isRootOnlyPath) continue;
-
-                    const { found } = resolvePath(subPath, vars, scopeStack, blockLocals, fieldResolver);
-                    if (found) continue;
-
-                    const refOffset = node.rawText.indexOf(ref);
-                    const errCol = refOffset !== -1 ? node.col + refOffset : node.col;
-
-                    const displayPath = this.formatDisplayPath(subPath);
-                    const available = this.scope.formatAvailableVars(vars, scopeStack, blockLocals);
-
-                    errors.push({
-                        message: `Template variable "${displayPath}" is not defined in the render context. Available: ${available}`,
-                        line: node.line,
-                        col: errCol,
-                        severity: 'error',
-                        variable: ref,
-                    });
-                    foundMissingRef = true;
-                }
-
-                if (foundMissingRef) return;
-            }
-        }
-
-        // ── Step 3: Bare-path fallback ───────────────────────────────────────────
-        const isComplexExpr = cleanExpr ? /[\s|()]/.test(cleanExpr) : false;
-        if (isComplexExpr) return;
-
-        const { found: pathResolved } = resolvePath(
-            node.path, vars, scopeStack, blockLocals, fieldResolver
-        );
-
-        if (!pathResolved) {
-            const displayPath = this.formatDisplayPath(node.path);
-            const available = this.scope.formatAvailableVars(vars, scopeStack, blockLocals);
-            errors.push({
-                message: `Template variable "${displayPath}" is not defined in the render context. Available: ${available}`,
-                line: node.line,
-                col: node.col,
-                severity: 'error',
-                variable: node.rawText,
-            });
-        }
+        this.validateExpression(node, cleanExpr, node.path, vars, scopeStack, blockLocals, errors);
     }
 
     /** Formats a parsed path array into a human-readable `$.x.y` or `.x.y` string. */
@@ -320,11 +325,13 @@ export class ValidatorCore {
         ctx: TemplateContext,
         filePath: string
     ) {
-        if (node.path.length > 0) {
-            resolvePath(
-                node.path, vars, scopeStack, blockLocals,
-                this.scope.buildFieldResolver(vars, scopeStack)
-            );
+        const inner = node.rawText.replace(/^\{\{-?\s*/, '').replace(/\s*-?\}\}$/, '').trim();
+        let expr = '';
+        if (inner.startsWith('if ')) expr = inner.slice(3).trim();
+        else if (inner.startsWith('else if ')) expr = inner.slice(8).trim();
+
+        if (expr) {
+            this.validateExpression(node, expr, node.path, vars, scopeStack, blockLocals, errors);
         }
 
         if (node.children) {
@@ -344,15 +351,8 @@ export class ValidatorCore {
         ctx: TemplateContext,
         filePath: string
     ) {
-        const isBareDotsRange =
-            node.path.length === 0 ||
-            (node.path.length === 1 && node.path[0] === '.');
-
-        if (!isBareDotsRange) {
-            resolvePath(
-                node.path, vars, scopeStack, blockLocals,
-                this.scope.buildFieldResolver(vars, scopeStack)
-            );
+        if (node.assignExpr) {
+            this.validateExpression(node, node.assignExpr, node.path, vars, scopeStack, blockLocals, errors);
         }
 
         const elemScope = this.scope.buildRangeElemScope(node, vars, scopeStack, blockLocals);
@@ -376,39 +376,43 @@ export class ValidatorCore {
         ctx: TemplateContext,
         filePath: string
     ) {
-        if (node.path.length === 0) return;
+        if (node.assignExpr) {
+            this.validateExpression(node, node.assignExpr, node.path, vars, scopeStack, blockLocals, errors);
+        }
 
-        const result = resolvePath(
-            node.path, vars, scopeStack, blockLocals,
-            this.scope.buildFieldResolver(vars, scopeStack)
-        );
+        if (node.path.length > 0) {
+            const result = resolvePath(
+                node.path, vars, scopeStack, blockLocals,
+                this.scope.buildFieldResolver(vars, scopeStack)
+            );
 
-        if (result.found && result.fields !== undefined) {
-            const childScope: ScopeFrame = {
-                key: '.',
-                typeStr: result.typeStr,
-                fields: result.fields,
-                isMap: result.isMap,
-                keyType: result.keyType,
-                elemType: result.elemType,
-                isSlice: result.isSlice,
-            };
-            if (node.valVar) {
-                childScope.locals = new Map();
-                childScope.locals.set(node.valVar, {
-                    name: node.valVar,
-                    type: result.typeStr,
+            if (result.found && result.fields !== undefined) {
+                const childScope: ScopeFrame = {
+                    key: '.',
+                    typeStr: result.typeStr,
                     fields: result.fields,
-                    isSlice: result.isSlice ?? false,
                     isMap: result.isMap,
-                    elemType: result.elemType,
                     keyType: result.keyType,
-                });
-            }
-            if (node.children) {
-                this.validateNodes(
-                    node.children, vars, [...scopeStack, childScope], errors, ctx, filePath, blockLocals
-                );
+                    elemType: result.elemType,
+                    isSlice: result.isSlice,
+                };
+                if (node.valVar) {
+                    childScope.locals = new Map();
+                    childScope.locals.set(node.valVar, {
+                        name: node.valVar,
+                        type: result.typeStr,
+                        fields: result.fields,
+                        isSlice: result.isSlice ?? false,
+                        isMap: result.isMap,
+                        elemType: result.elemType,
+                        keyType: result.keyType,
+                    });
+                }
+                if (node.children) {
+                    this.validateNodes(
+                        node.children, vars, [...scopeStack, childScope], errors, ctx, filePath, blockLocals
+                    );
+                }
             }
         }
 
@@ -667,37 +671,8 @@ export class ValidatorCore {
         const contextArg = node.partialContext ?? '.';
         const normalizedCtx = normalizeDictArg(contextArg);
 
-        if (normalizedCtx !== '.' && normalizedCtx !== '$' && !normalizedCtx.startsWith('dict ')) {
-            const contextPath = this.parser.parseDotPath(normalizedCtx);
-            if (contextPath.length > 0 && contextPath[0] !== '.') {
-                const result = resolvePath(
-                    contextPath, vars, scopeStack, blockLocals,
-                    this.scope.buildFieldResolver(vars, scopeStack)
-                );
-                if (!result.found) {
-                    let errCol = node.col;
-                    if (node.rawText) {
-                        const nameIdx = node.rawText.indexOf(`"${node.partialName}"`);
-                        const searchStart =
-                            nameIdx !== -1 ? nameIdx + node.partialName!.length + 2 : 0;
-                        const ctxIdx = node.rawText.indexOf(contextArg, searchStart);
-                        if (ctxIdx !== -1) {
-                            const p = '.' + contextPath.join('.');
-                            const pIdx = contextArg.indexOf(p);
-                            errCol = node.col + ctxIdx + (pIdx !== -1 ? pIdx : 0);
-                        }
-                    }
-                    const available = this.scope.formatAvailableVars(vars, scopeStack, blockLocals);
-                    errors.push({
-                        message: `Template variable "${contextArg}" is not defined in the render context. Available: ${available}`,
-                        line: node.line,
-                        col: errCol,
-                        severity: 'error',
-                        variable: contextArg,
-                    });
-                    return;
-                }
-            }
+        if (normalizedCtx !== '.' && normalizedCtx !== '$') {
+            this.validateExpression(node, normalizedCtx, this.parser.parseDotPath(normalizedCtx), vars, scopeStack, blockLocals, errors);
         }
 
         if (!isFileBasedPartial(node.partialName)) {
