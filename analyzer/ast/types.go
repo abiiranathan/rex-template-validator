@@ -153,7 +153,7 @@ type AnalysisConfig struct {
 // DefaultConfig provides the default configuration for the Rex template analyzer, tailored for common Rex framework conventions.
 var DefaultConfig = AnalysisConfig{
 	RenderFunctionName:          "Render",
-	ExecuteTemplateFunctionName: "",
+	ExecuteTemplateFunctionName: "ExecuteTemplate",
 	SetFunctionName:             "Set",
 	ContextTypeName:             "Context",
 	GlobalTemplateName:          "global",
@@ -335,6 +335,4 @@ func (r *AnalysisResult) Flatten() {
 			r.FuncMaps[i].Returns[j].Fields = nil
 		}
 	}
-	// Note: registry entries are already one-level shallow (set by
-	// BuildTypeRegistry), so no further stripping is required here.
 }

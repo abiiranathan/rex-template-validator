@@ -177,3 +177,11 @@ func (h *Handler) RenderDashboard(inpatient bool) rex.HandlerFunc {
 		})
 	}
 }
+
+func (h *Handler) RenderProfile() rex.HandlerFunc {
+	return func(c *rex.Context) error {
+		return c.ExecuteTemplate("partial", rex.Map{
+			"visits": Visit{},
+		})
+	}
+}
