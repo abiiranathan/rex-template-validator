@@ -164,6 +164,16 @@ func WriteDiskCache(dir, contextFile string, result AnalysisResult) {
 	}
 
 	os.Rename(tmpPath, path) // atomic on POSIX
+	// Remove all other cache entries in the directory so only one is kept.
+	cacheDir := filepath.Dir(path)
+	if entries, err := os.ReadDir(cacheDir); err == nil {
+		for _, e := range entries {
+			if e.Name() == filepath.Base(path) || e.IsDir() {
+				continue
+			}
+			os.Remove(filepath.Join(cacheDir, e.Name()))
+		}
+	}
 }
 
 // ClearDiskCache removes the on-disk cache entry for the given directory.

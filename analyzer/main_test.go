@@ -19,8 +19,6 @@ func BenchmarkColdStart(b *testing.B) {
 
 	for b.Loop() {
 		// Clear the cache to force a full re-parse of the Go AST
-		ast.ClearCache()
-
 		result := ast.AnalyzeDir(absDir, contextFile, ast.DefaultConfig)
 		_, _, _ = validator.ValidateTemplates(result.RenderCalls, templateBase, templateRoot)
 	}

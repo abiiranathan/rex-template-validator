@@ -8,24 +8,9 @@ import (
 	"fmt"
 	goast "go/ast"
 	"go/token"
-	"sync"
 
 	"golang.org/x/tools/go/packages"
 )
-
-// Package-level in-process cache.  Saves the expensive struct-index rebuild on
-// repeated calls within the same process (e.g. benchmark warm-up, LSP daemon).
-var (
-	packageCacheMu sync.RWMutex
-	packageCache   = make(map[string]*cacheEntry)
-)
-
-// cacheEntry holds the pre-built indexes that are safe to reuse across calls to
-// AnalyzeDir for the same directory within one process lifetime.
-type cacheEntry struct {
-	filesMap    map[string]*goast.File
-	structIndex map[string]structIndexEntry
-}
 
 // AnalyzeDir performs comprehensive static analysis on Go source code and returns
 // an AnalysisResult containing all discovered template-related information.
@@ -66,28 +51,11 @@ func AnalyzeDir(dir string, contextFile string, config AnalysisConfig) AnalysisR
 
 	info, allFiles := mergeTypeInfo(pkgs, &result)
 
-	// ── 3. Build (or reuse) structural indexes ────────────────────────────────
-	packageCacheMu.RLock()
-	inMem, hasCached := packageCache[dir]
-	packageCacheMu.RUnlock()
-
 	var filesMap map[string]*goast.File
 	var structIndex map[string]structIndexEntry
 
-	if hasCached {
-		filesMap = inMem.filesMap
-		structIndex = inMem.structIndex
-	} else {
-		filesMap = buildFileMap(allFiles, fset)
-		structIndex = buildStructIndex(fset, filesMap)
-
-		packageCacheMu.Lock()
-		packageCache[dir] = &cacheEntry{
-			filesMap:    filesMap,
-			structIndex: structIndex,
-		}
-		packageCacheMu.Unlock()
-	}
+	filesMap = buildFileMap(allFiles, fset)
+	structIndex = buildStructIndex(fset, filesMap)
 
 	// ── 4. Shared analysis infrastructure ────────────────────────────────────
 	fc := newFieldCache()
@@ -120,14 +88,7 @@ func AnalyzeDir(dir string, contextFile string, config AnalysisConfig) AnalysisR
 	return result
 }
 
-// ClearCache evicts the in-process struct-index cache for all directories.
-// Call this in tests or benchmarks to force a full re-analysis.
-// It does NOT clear the on-disk cache; use ClearDiskCache for that.
-func ClearCache() {
-	packageCacheMu.Lock()
-	packageCache = make(map[string]*cacheEntry)
-	packageCacheMu.Unlock()
-}
+
 
 // extractGlobalImplicitVars identifies template variables that are set outside
 // any render call context (e.g. in middleware functions).  These are available

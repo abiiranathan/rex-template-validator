@@ -49,6 +49,8 @@
     {{ $.newuser.Name }}
     {{ $.currentUser }}
 
+    {{ .user.Permission.String }}
+
     {{/* Pass a Map to a cross-file template */}}
     {{ template "roles" .roles }}
 

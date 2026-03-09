@@ -11,6 +11,18 @@ import (
 	"github.com/abiiranathan/rex"
 )
 
+type Permission uint
+
+const Admin Permission = iota
+
+// String implemts fmt.Stringer
+func (p Permission) String() string {
+	if p == Admin {
+		return "Admin"
+	}
+	return ""
+}
+
 // Breadcrumb represents a navigation breadcrumb
 type Breadcrumb struct {
 	Label  string
@@ -51,7 +63,8 @@ type Drug struct {
 
 // User represents a user
 type User struct {
-	Name string
+	Name       string     // Full name of the user
+	Permission Permission // User permission bits
 }
 
 // PrintName prints the name of the user.

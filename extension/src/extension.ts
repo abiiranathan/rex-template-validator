@@ -294,7 +294,7 @@ async function rebuildIndex(workspaceRoot: string) {
     outputChannel.appendLine(`[Rex] Rebuild failed: ${err}`);
     statusBarItem.text = '$(error) Rex: Analysis failed';
   } finally {
-    setTimeout(() => statusBarItem.hide(), 5000);
+    statusBarItem.hide();
   }
 }
 
