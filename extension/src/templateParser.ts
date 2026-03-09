@@ -460,10 +460,11 @@ function unwrapField(
 ): FieldInfo {
     let retType = '';
     let retFields: FieldInfo[] | undefined;
-
+    let retDoc = '';
     if (field.type === 'method' && field.returns && field.returns.length > 0) {
         retType = field.returns[0].type;
         retFields = field.returns[0].fields;
+        retDoc = field.returns[0].doc || "";
     } else if (field.type.startsWith('func(')) {
         const match = field.type.match(/func\([^)]*\)\s*(.+)/);
         if (match && match[1]) {
@@ -486,7 +487,8 @@ function unwrapField(
             type: retType,
             isSlice: retType.startsWith('[]'),
             isMap: retType.startsWith('map['),
-            fields: (resolvedFields && resolvedFields.length > 0) ? resolvedFields : (retFields || field.fields || [])
+            fields: (resolvedFields && resolvedFields.length > 0) ? resolvedFields : (retFields || field.fields || []),
+            doc: field.doc || retDoc,
         };
     }
 

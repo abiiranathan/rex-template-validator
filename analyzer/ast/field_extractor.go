@@ -105,7 +105,11 @@ func extractFieldsUncachedDepth(
 	strct, ok := named.Underlying().(*types.Struct)
 	if !ok {
 		// Interface or other named type: expose methods only
-		return extractMethodFields(named, structIndex, fc, seen, fset, depth), ""
+		doc := ""
+		if entry, exists := structIndex[astKey]; exists {
+			doc = entry.doc
+		}
+		return extractMethodFields(named, structIndex, fc, seen, fset, depth), doc
 	}
 
 	// Struct type: extract fields and methods
@@ -213,7 +217,6 @@ func buildFieldInfoDepth(
 }
 
 // extractMethodFields extracts exported methods as FieldInfo entries.
-// extractMethodFields extracts exported methods as FieldInfo entries.
 func extractMethodFields(
 	named *types.Named,
 	structIndex map[string]structIndexEntry,
@@ -222,10 +225,26 @@ func extractMethodFields(
 	fset *token.FileSet,
 	depth int,
 ) []FieldInfo {
-	fields := make([]FieldInfo, 0, named.NumMethods())
+	var methodSet *types.MethodSet
 
-	for method := range named.Methods() {
-		if !method.Exported() {
+	if _, isInterface := named.Underlying().(*types.Interface); isInterface {
+		methodSet = types.NewMethodSet(named)
+	} else {
+		// Use NewMethodSet on a pointer to the named type to include BOTH value
+		// and pointer receiver methods, as well as promoted methods from embedded fields.
+		methodSet = types.NewMethodSet(types.NewPointer(named))
+	}
+
+	fields := make([]FieldInfo, 0, methodSet.Len())
+
+	for i := 0; i < methodSet.Len(); i++ {
+		sel := methodSet.At(i)
+		if !sel.Obj().Exported() {
+			continue
+		}
+
+		method, ok := sel.Obj().(*types.Func)
+		if !ok {
 			continue
 		}
 
@@ -237,6 +256,24 @@ func extractMethodFields(
 		// Extract method signature deeply to include return type fields
 		if sig, ok := method.Type().(*types.Signature); ok {
 			fi.Params, fi.Returns, _ = extractSignatureInfoWithFields(sig, structIndex, fc, seen, fset, depth+1)
+
+			// Resolve method docstring using its actual receiver type (handles promoted methods)
+			if recv := sig.Recv(); recv != nil {
+				recvType := unwrapType(recv.Type())
+				if rt, ok := recvType.(*types.Named); ok {
+					astKey := getASTKey(rt)
+					if entry, exists := structIndex[astKey]; exists {
+						if pos, ok := entry.fields[method.Name()]; ok {
+							fi.Doc = pos.doc
+							if fi.DefFile == "" {
+								fi.DefFile = pos.file
+								fi.DefLine = pos.line
+								fi.DefCol = pos.col
+							}
+						}
+					}
+				}
+			}
 		}
 
 		// Set definition location
@@ -272,9 +309,10 @@ func extractSignatureInfoWithFields(
 
 		// Use a copied seen map to prevent cross-branch loop suppression
 		elemSeen := copySeenMap(seen)
-		fields, _ := extractFieldsWithDocsDepth(rt, structIndex, fc, elemSeen, fset, depth)
+		fields, doc := extractFieldsWithDocsDepth(rt, structIndex, fc, elemSeen, fset, depth)
 
 		returns[i].Fields = fields
+		returns[i].Doc = doc
 	}
 
 	return
@@ -294,7 +332,10 @@ func addMethodDocs(fields []FieldInfo, entry structIndexEntry) {
 				fi.DefLine = pos.line
 				fi.DefCol = pos.col
 			}
-			fi.Doc = pos.doc
+			// Avoid overriding docstring resolved natively from the embedded struct resolution logic
+			if fi.Doc == "" {
+				fi.Doc = pos.doc
+			}
 		}
 	}
 }

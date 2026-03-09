@@ -704,6 +704,7 @@ export class TypeInferencer {
                 let retType = field.returns[0].type;
                 const bare = extractBareType(retType);
                 const retFields = field.returns[0].fields; // Extract from return type
+                const retDoc = field.returns[0].doc;       // Propagate doc from return ParamInfo
 
                 const resolvedFields = this.fieldResolver?.(bare);
                 resolvedField = {
@@ -712,6 +713,7 @@ export class TypeInferencer {
                     fields: (resolvedFields && resolvedFields.length > 0) ? resolvedFields : (retFields || field.fields),
                     isSlice: retType.startsWith('[]'),
                     isMap: retType.startsWith('map['),
+                    doc: retDoc || field.doc,
                 };
             }
             // Handle struct fields that are functions (e.g., Price func() float64)
@@ -736,6 +738,8 @@ export class TypeInferencer {
                         fields: (resolvedFields && resolvedFields.length > 0) ? resolvedFields : field.fields,
                         isSlice: retType.startsWith('[]'),
                         isMap: retType.startsWith('map['),
+                        // func() fields carry no return ParamInfo doc; preserve the field's own doc
+                        doc: field.doc,
                     };
                 }
             }

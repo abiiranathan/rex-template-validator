@@ -46,7 +46,7 @@ func buildStructIndex(fset *token.FileSet, files map[string]*goast.File) map[str
 }
 
 // extractStructFieldsWorker is a worker function that processes files to extract
-// struct type declarations and their field metadata.
+// type declarations and their field/method metadata.
 func extractStructFieldsWorker(
 	fileChan <-chan *goast.File,
 	fset *token.FileSet,
@@ -70,28 +70,44 @@ func extractStructFieldsWorker(
 					continue
 				}
 
-				structType, ok := typeSpec.Type.(*goast.StructType)
-				if !ok {
-					continue
-				}
-
-				// Build struct index entry
+				// Build index entry for ALL named types (structs, aliases, interfaces, etc.)
 				entry := structIndexEntry{
 					doc:    extractTypeDoc(genDecl, typeSpec),
-					fields: make(map[string]fieldInfo, len(structType.Fields.List)),
+					fields: make(map[string]fieldInfo),
 				}
 
-				// Extract field metadata
-				for _, field := range structType.Fields.List {
-					pos := fset.Position(field.Pos())
-					doc := extractFieldDoc(field)
+				// Extract fields for structs
+				if structType, ok := typeSpec.Type.(*goast.StructType); ok {
+					if structType.Fields != nil {
+						for _, field := range structType.Fields.List {
+							pos := fset.Position(field.Pos())
+							doc := extractFieldDoc(field)
 
-					for _, name := range field.Names {
-						entry.fields[name.Name] = fieldInfo{
-							file: pos.Filename,
-							line: pos.Line,
-							col:  pos.Column,
-							doc:  doc,
+							for _, name := range field.Names {
+								entry.fields[name.Name] = fieldInfo{
+									file: pos.Filename,
+									line: pos.Line,
+									col:  pos.Column,
+									doc:  doc,
+								}
+							}
+						}
+					}
+				} else if ifaceType, ok := typeSpec.Type.(*goast.InterfaceType); ok {
+					// Extract methods for interfaces
+					if ifaceType.Methods != nil {
+						for _, field := range ifaceType.Methods.List {
+							pos := fset.Position(field.Pos())
+							doc := extractFieldDoc(field)
+
+							for _, name := range field.Names {
+								entry.fields[name.Name] = fieldInfo{
+									file: pos.Filename,
+									line: pos.Line,
+									col:  pos.Column,
+									doc:  doc,
+								}
+							}
 						}
 					}
 				}

@@ -42,7 +42,9 @@ func processFuncMapIndexAssign(
 		fInfo.DefFile, fInfo.DefLine, fInfo.DefCol = resolveFuncDefLocation(rhs, info, fset)
 
 		if rtv, ok := info.Types[rhs]; ok && rtv.Type != nil {
-			fInfo.Params, fInfo.Returns, fInfo.Args = extractSignatureFromType(rtv.Type)
+			seen := seenPool.get()
+			fInfo.Params, fInfo.Returns, fInfo.Args = extractSignatureFromType(rtv.Type, structIndex, fc, seen, fset)
+			seenPool.put(seen)
 			fInfo.ReturnTypeFields = extractFuncReturnFields(rtv.Type, structIndex, fc, seenPool, fset)
 		}
 	}
@@ -83,7 +85,9 @@ func extractFuncMaps(
 
 		if info != nil {
 			if tv, ok := info.Types[kv.Value]; ok && tv.Type != nil {
-				fInfo.Params, fInfo.Returns, fInfo.Args = extractSignatureFromType(tv.Type)
+				seen := seenPool.get()
+				fInfo.Params, fInfo.Returns, fInfo.Args = extractSignatureFromType(tv.Type, structIndex, fc, seen, fset)
+				seenPool.put(seen)
 				fInfo.ReturnTypeFields = extractFuncReturnFields(tv.Type, structIndex, fc, seenPool, fset)
 			}
 		}
@@ -216,7 +220,7 @@ func resolveFuncDoc(expr goast.Expr, info *types.Info, filesMap map[string]*goas
 				continue
 			}
 
-			if fd.Name.Obj != nil && fd.Name.Obj.Pos() == obj.Pos() {
+			if fd.Name.Pos() == obj.Pos() {
 				if fd.Doc != nil {
 					return strings.TrimSpace(fd.Doc.Text())
 				}
@@ -230,7 +234,15 @@ func resolveFuncDoc(expr goast.Expr, info *types.Info, filesMap map[string]*goas
 
 // extractSignatureFromType extracts signature info from a type.
 // Handles both direct signatures and pointer-to-signature.
-func extractSignatureFromType(t types.Type) (params, returns []ParamInfo, args []string) {
+// extractSignatureFromType extracts signature info from a type.
+// Handles both direct signatures and pointer-to-signature.
+func extractSignatureFromType(
+	t types.Type,
+	structIndex map[string]structIndexEntry,
+	fc *fieldCache,
+	seen map[string]bool,
+	fset *token.FileSet,
+) (params, returns []ParamInfo, args []string) {
 	// Unwrap pointer
 	if ptr, ok := t.(*types.Pointer); ok {
 		t = ptr.Elem()
@@ -241,7 +253,7 @@ func extractSignatureFromType(t types.Type) (params, returns []ParamInfo, args [
 		return nil, nil, nil
 	}
 
-	return extractSignatureInfo(sig)
+	return extractSignatureInfoWithFields(sig, structIndex, fc, seen, fset, 0)
 }
 
 // extractSignatureInfo extracts detailed parameter and return type information

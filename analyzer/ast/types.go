@@ -134,6 +134,9 @@ type ParamInfo struct {
 	// Fields contains the nested exported fields if this return type is a struct.
 	// After Flatten is called this slice is nil; consumers look up via the Types registry.
 	Fields []FieldInfo `json:"fields,omitempty"`
+
+	// Doc is the documentation comment for the type.
+	Doc string `json:"doc,omitempty"`
 }
 
 // AnalysisConfig defines customizable function and type names used by the analyzer to identify template-related constructs.

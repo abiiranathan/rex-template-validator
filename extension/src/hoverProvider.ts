@@ -274,9 +274,13 @@ export class HoverProvider {
         }
 
         const varInfo = this.findVariableInfo(path, vars, stack, locals);
-        if (varInfo?.doc) {
+        // Prefer the doc carried directly on the resolved result (e.g. from a
+        // method return type's ParamInfo.doc), then fall back to the variable/field
+        // doc discovered by walking the var tree.
+        const docToShow = ((result as any).doc || varInfo?.doc) as string;
+        if (docToShow) {
             md.appendMarkdown('\n\n---\n\n');
-            md.appendMarkdown(varInfo.doc);
+            md.appendMarkdown(docToShow);
         }
 
         // Prefer result.fields; fall back to varInfo.fields for context-file vars where

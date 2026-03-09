@@ -60,6 +60,7 @@ export interface ParamInfo {
   name?: string;   // empty when the parameter is unnamed
   type: string;
   fields?: FieldInfo[];
+  doc?: string;
 }
 
 export interface FuncMapInfo {
