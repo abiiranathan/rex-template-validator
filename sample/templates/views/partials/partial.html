@@ -1,3 +1,4 @@
-{{ define "partial" }}
+{{ block "partial" }}
 {{ .visit.ID }}
+{{ .visit.CreatedAt.Format "2026-02-06" }}
 {{ end }}

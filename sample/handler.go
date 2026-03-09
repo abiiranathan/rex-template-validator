@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"html/template"
 	"strings"
+	"time"
 
 	"github.com/abiiranathan/rex"
 )
@@ -26,6 +27,7 @@ type Visit struct {
 	PatientID uint
 	Patient   Patient
 	Doctor    Doctor
+	CreatedAt time.Time
 }
 
 // Patient represents a patient

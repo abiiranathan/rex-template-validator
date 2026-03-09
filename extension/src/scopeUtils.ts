@@ -474,21 +474,9 @@ export class ScopeUtils {
             this.processAssignment(node, vars, scopeStack, blockLocals);
 
             const isTemplateCall = node.kind === 'partial' && node.partialName === blockName;
-            const isBlockDecl = node.kind === 'block' && node.blockName === blockName;
 
-            if (isTemplateCall || isBlockDecl) {
-                let contextArg: string;
-                if (isTemplateCall) {
-                    contextArg = node.partialContext ?? '.';
-                } else {
-                    contextArg =
-                        node.path.length === 0
-                            ? '.'
-                            : node.path[0] === '.'
-                                ? '.' + node.path.slice(1).join('.')
-                                : '.' + node.path.join('.');
-                }
-
+            if (isTemplateCall) {
+                const contextArg = node.partialContext ?? '.';
                 const normalizedCtx = normalizeDictArg(contextArg);
 
                 if (normalizedCtx === '.' || normalizedCtx === '') {
@@ -579,20 +567,7 @@ export class ScopeUtils {
                             childStack = [...scopeStack, childScope];
                         }
                     }
-                } else if (node.kind === 'block') {
-                    if (node.path.length > 0) {
-                        const result = resolvePath(
-                            node.path, vars, scopeStack, childLocals,
-                            this.buildFieldResolver(vars, scopeStack)
-                        );
-                        if (result.found && result.fields !== undefined) {
-                            childStack = [
-                                ...scopeStack,
-                                { key: '.', typeStr: result.typeStr, fields: result.fields },
-                            ];
-                        }
-                    }
-                } else if (node.kind === 'define' && node.blockName && !visitedDefines.has(node.blockName)) {
+                } else if ((node.kind === 'define' || node.kind === 'block') && node.blockName && !visitedDefines.has(node.blockName)) {
                     const newVisited = new Set(visitedDefines);
                     newVisited.add(node.blockName);
 
@@ -612,6 +587,22 @@ export class ScopeUtils {
                             isSlice: defineCtx.isSlice,
                         }];
                         childVars = this.fieldsToVarMap(defineCtx.fields ?? []);
+                    } else if (node.kind === 'block' && node.path.length > 0) {
+                        // Fallback to evaluating the block's own argument
+                        const result = resolvePath(
+                            node.path, vars, scopeStack, childLocals,
+                            this.buildFieldResolver(vars, scopeStack)
+                        );
+                        if (result.found) {
+                            let fields = result.fields ?? [];
+                            if (fields.length === 0 && result.typeStr === 'context') {
+                                fields = [...vars.values()] as unknown as FieldInfo[];
+                            }
+                            childStack = [
+                                ...scopeStack,
+                                { key: '.', typeStr: result.typeStr, fields: fields },
+                            ];
+                        }
                     }
                 }
 

@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as vscode from 'vscode';
 import {
     FieldInfo,
+    NamedBlockEntry,
     ScopeFrame,
     TemplateContext,
     TemplateNode,
@@ -581,10 +582,18 @@ export class ValidatorCore {
             );
 
             if (result.found) {
+                let fields = result.fields ?? [];
+                if (fields.length === 0 && result.typeStr === 'context') {
+                    fields = [...vars.values()] as unknown as FieldInfo[];
+                }
+                if (fields.length === 0) {
+                    const sf = synthFields();
+                    if (sf.length > 0) fields = sf;
+                }
                 return {
-                    childVars: this.scope.fieldsToVarMap(result.fields ?? []),
+                    childVars: this.scope.fieldsToVarMap(fields),
                     childStack: [{
-                        key: '.', typeStr: result.typeStr, fields: result.fields ?? [],
+                        key: '.', typeStr: result.typeStr, fields: fields,
                         isMap: result.isMap, keyType: result.keyType,
                         elemType: result.elemType, isSlice: result.isSlice,
                     }],
@@ -693,7 +702,7 @@ export class ValidatorCore {
 
     private validateNamedBlockCall(
         callNode: TemplateNode,
-        entry: import('./types').NamedBlockEntry,
+        entry: NamedBlockEntry,
         vars: Map<string, TemplateVar>,
         scopeStack: ScopeFrame[],
         blockLocals: Map<string, TemplateVar>,
