@@ -14,7 +14,7 @@ import (
 func BenchmarkColdStart(b *testing.B) {
 	absDir := "/home/nabiizy/Code/go/eclinichmsgo"
 	templateBase := absDir
-	contextFile := absDir + "/rex-content.json"
+	contextFile := absDir + "/rex.json"
 	templateRoot := "templates"
 
 	for b.Loop() {

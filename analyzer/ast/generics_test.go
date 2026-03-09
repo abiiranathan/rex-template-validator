@@ -102,14 +102,14 @@ go 1.21
 	}
 
 	// 1. Verify Type String Formatting
-	if usersVar.TypeStr != "Page[User]" {
-		t.Errorf("expected Users type to be 'Page[User]', got %q", usersVar.TypeStr)
+	if usersVar.TypeStr != "main.Page[main.User]" {
+		t.Errorf("expected Users type to be 'main.Page[main.User]', got %q", usersVar.TypeStr)
 	}
-	if ordersVar.TypeStr != "Page[Order]" {
-		t.Errorf("expected Orders type to be 'Page[Order]', got %q", ordersVar.TypeStr)
+	if ordersVar.TypeStr != "main.Page[main.Order]" {
+		t.Errorf("expected Orders type to be 'main.Page[main.Order]', got %q", ordersVar.TypeStr)
 	}
-	if nestedVar.TypeStr != "Response[Page[User]]" {
-		t.Errorf("expected Nested type to be 'Response[Page[User]]', got %q", nestedVar.TypeStr)
+	if nestedVar.TypeStr != "main.Response[main.Page[main.User]]" {
+		t.Errorf("expected Nested type to be 'main.Response[main.Page[main.User]]', got %q", nestedVar.TypeStr)
 	}
 
 	// 2. Verify Cache Collision Fix (Page[User] vs Page[Order])
@@ -117,8 +117,8 @@ go 1.21
 	if usersItems == nil {
 		t.Fatal("expected 'Items' field on Page[User]")
 	}
-	if usersItems.TypeStr != "[]User" {
-		t.Errorf("expected Page[User].Items type to be '[]User', got %q", usersItems.TypeStr)
+	if usersItems.TypeStr != "[]main.User" {
+		t.Errorf("expected Page[User].Items type to be '[]main.User', got %q", usersItems.TypeStr)
 	}
 	if findField(usersItems.Fields, "Name") == nil {
 		t.Error("expected Page[User].Items to contain 'Name' field from User struct")
@@ -128,8 +128,8 @@ go 1.21
 	if ordersItems == nil {
 		t.Fatal("expected 'Items' field on Page[Order]")
 	}
-	if ordersItems.TypeStr != "[]Order" {
-		t.Errorf("expected Page[Order].Items type to be '[]Order', got %q", ordersItems.TypeStr)
+	if ordersItems.TypeStr != "[]main.Order" {
+		t.Errorf("expected Page[Order].Items type to be '[]main.Order', got %q", ordersItems.TypeStr)
 	}
 	if findField(ordersItems.Fields, "ID") == nil {
 		t.Error("expected Page[Order].Items to contain 'ID' field from Order struct")
@@ -153,12 +153,12 @@ go 1.21
 	if nestedData == nil {
 		t.Fatal("expected 'Data' field on Response[Page[User]]")
 	}
-	if nestedData.TypeStr != "Page[User]" {
-		t.Errorf("expected nested Data type to be 'Page[User]', got %q", nestedData.TypeStr)
+	if nestedData.TypeStr != "main.Page[main.User]" {
+		t.Errorf("expected nested Data type to be 'main.Page[main.User]', got %q", nestedData.TypeStr)
 	}
 
 	nestedDataItems := findField(nestedData.Fields, "Items")
-	if nestedDataItems == nil || nestedDataItems.TypeStr != "[]User" {
-		t.Errorf("expected nested Data.Items to be '[]User'")
+	if nestedDataItems == nil || nestedDataItems.TypeStr != "[]main.User" {
+		t.Errorf("expected nested Data.Items to be '[]main.User'")
 	}
 }

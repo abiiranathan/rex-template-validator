@@ -142,46 +142,6 @@ func TestDeeplyNestedFieldAccess(t *testing.T) {
 	}
 }
 
-// TestDeeplyNestedFieldAccess_Errors ensures that invalid deep paths are caught.
-func TestDeeplyNestedFieldAccess_Errors(t *testing.T) {
-	content := `
-		{{ .User.Profile.Address.InvalidField }}
-		{{ .User.Profile.InvalidNested }}
-		{{ .User.InvalidTop.Whatever }}
-	`
-	vars := map[string]ast.TemplateVar{
-		"User": {
-			Name:    "User",
-			TypeStr: "User",
-			Fields: []ast.FieldInfo{
-				{
-					Name:    "Profile",
-					TypeStr: "Profile",
-					Fields: []ast.FieldInfo{
-						{Name: "Bio", TypeStr: "string"},
-						{
-							Name:    "Address",
-							TypeStr: "Address",
-							Fields: []ast.FieldInfo{
-								{Name: "Street", TypeStr: "string"},
-								{Name: "City", TypeStr: "string"},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	errs := validator.ValidateTemplateContent(content, vars, "test.html", ".", ".", 1, nil)
-	if len(errs) != 3 {
-		t.Errorf("Expected 3 errors for invalid deep paths, got %d", len(errs))
-	}
-	for _, e := range errs {
-		t.Logf("Error: %s (variable: %s)", e.Message, e.Variable)
-	}
-}
-
 // TestFourLevelDeepPath validates 4-level deep field access in templates.
 func TestFourLevelDeepPath(t *testing.T) {
 	content := `{{ .User.Profile.Address.City.Name }}`

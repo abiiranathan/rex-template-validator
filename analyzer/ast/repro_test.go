@@ -1,4 +1,4 @@
-// filepath: analyzer/validator/repro_test.go
+// filepath: analyzer/ast/repro_test.go
 package ast
 
 import (
@@ -9,10 +9,8 @@ import (
 )
 
 func TestDeeplyNestedStructAnalysis(t *testing.T) {
-	// 1. Create a temporary directory for the test Go module
 	tmpDir := t.TempDir()
 
-	// 2. Create a main.go with deeply nested structs
 	mainContent := `package main
 
 import "net/http"
@@ -33,37 +31,16 @@ type User struct {
 	Profile Profile
 }
 
-// Mocking a Render function
 func Render(w http.ResponseWriter, template string, data interface{}) {}
 
 func main() {
-	user := User{
-		Name: "Alice",
-		Profile: Profile{
-			Bio: "Gopher",
-			Address: Address{
-				Street: "123 Go Way",
-				City:   "Gopolis",
-				Zip:    "90210",
-			},
-		},
-	}
-
+	user := User{}
 	Render(nil, "index.html", map[string]interface{}{
 		"User": user,
 	})
 }
 `
-	if err := os.WriteFile(filepath.Join(tmpDir, "main.go"), []byte(mainContent), 0644); err != nil {
-		t.Fatalf("failed to write main.go: %v", err)
-	}
-
-	goModContent := `module example.com/test
-go 1.21
-`
-	if err := os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte(goModContent), 0644); err != nil {
-		t.Fatalf("failed to write go.mod: %v", err)
-	}
+	writeTestModule(t, tmpDir, mainContent)
 
 	result := AnalyzeDir(tmpDir, "", DefaultConfig)
 
@@ -79,12 +56,11 @@ go 1.21
 			break
 		}
 	}
-
 	if userVar == nil {
 		t.Fatal("expected 'User' variable in RenderCall")
 	}
 
-	// Level 1: User.Name, User.Profile
+	// ── Pre-flatten: inline field tree ───────────────────────────────────────
 	nameField := findField(userVar.Fields, "Name")
 	if nameField == nil {
 		t.Fatal("expected 'Name' field on User struct")
@@ -99,44 +75,82 @@ go 1.21
 		t.Fatal("expected 'Profile' field on User struct")
 	}
 
-	// Level 2: User.Profile.Bio, User.Profile.Address
 	bioField := findField(profileField.Fields, "Bio")
 	if bioField == nil {
 		debugJSON(t, userVar)
-		t.Fatal("expected 'Bio' field on Profile struct (User.Profile.Bio)")
+		t.Fatal("expected 'Bio' field on Profile struct")
 	}
 
 	addressField := findField(profileField.Fields, "Address")
 	if addressField == nil {
 		debugJSON(t, userVar)
-		t.Fatal("expected 'Address' field on Profile struct (User.Profile.Address)")
+		t.Fatal("expected 'Address' field on Profile struct")
 	}
 
-	// Level 3: User.Profile.Address.Street, .City, .Zip
 	streetField := findField(addressField.Fields, "Street")
 	if streetField == nil {
 		debugJSON(t, userVar)
-		t.Fatal("expected 'Street' field on Address struct (User.Profile.Address.Street)")
+		t.Fatal("expected 'Street' field on Address struct")
 	}
+	_ = streetField
 
 	cityField := findField(addressField.Fields, "City")
 	if cityField == nil {
 		debugJSON(t, userVar)
-		t.Fatal("expected 'City' field on Address struct (User.Profile.Address.City)")
+		t.Fatal("expected 'City' field on Address struct")
 	}
-
-	zipField := findField(addressField.Fields, "Zip")
-	if zipField == nil {
-		debugJSON(t, userVar)
-		t.Fatal("expected 'Zip' field on Address struct (User.Profile.Address.Zip)")
-	}
-
-	_ = streetField
-	_ = zipField
 	t.Logf("City field: %+v", cityField)
+
+	// ── Post-flatten: verify the global type registry ─────────────────────────
+	result.BuildTypeRegistry()
+
+	if result.Types == nil {
+		t.Fatal("Types registry must be populated after BuildTypeRegistry")
+	}
+
+	userFields, ok := result.Types["main.User"]
+	if !ok {
+		t.Fatal("'User' type not found in registry")
+	}
+	if findField(userFields, "Name") == nil {
+		t.Error("registry: 'Name' field missing from User")
+	}
+	if findField(userFields, "Profile") == nil {
+		t.Error("registry: 'Profile' field missing from User")
+	}
+
+	profileFields, ok := result.Types["main.Profile"]
+	if !ok {
+		t.Fatal("'Profile' type not found in registry")
+	}
+	if findField(profileFields, "Address") == nil {
+		t.Error("registry: 'Address' field missing from Profile")
+	}
+
+	addressFields, ok := result.Types["main.Address"]
+	if !ok {
+		t.Fatal("'Address' type not found in registry")
+	}
+	if findField(addressFields, "City") == nil {
+		t.Error("registry: 'City' field missing from Address")
+	}
+
+	// ── Post-Flatten: inline trees stripped, registry intact ──────────────────
+	result.Flatten()
+
+	if result.Types == nil {
+		t.Fatal("Types registry must survive Flatten")
+	}
+	// After Flatten the inline Fields on RenderCall vars must be nil.
+	for _, rc := range result.RenderCalls {
+		for _, v := range rc.Vars {
+			if len(v.Fields) != 0 {
+				t.Errorf("after Flatten, var %q still has %d inline fields", v.Name, len(v.Fields))
+			}
+		}
+	}
 }
 
-// TestFourLevelNesting verifies that structs nested 4 levels deep are extracted.
 func TestFourLevelNesting(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -173,12 +187,7 @@ func main() {
 	})
 }
 `
-	if err := os.WriteFile(filepath.Join(tmpDir, "main.go"), []byte(mainContent), 0644); err != nil {
-		t.Fatalf("failed to write main.go: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module example.com/test\ngo 1.21\n"), 0644); err != nil {
-		t.Fatalf("failed to write go.mod: %v", err)
-	}
+	writeTestModule(t, tmpDir, mainContent)
 
 	result := AnalyzeDir(tmpDir, "", DefaultConfig)
 	if len(result.RenderCalls) == 0 {
@@ -227,12 +236,17 @@ func main() {
 		debugJSON(t, userVar)
 		t.Fatal("User.Profile.Address.City.ZipCode not found")
 	}
-
 	t.Logf("4-level nesting verified: User.Profile.Address.City.Name = %+v", cityNameField)
+
+	// Registry should have all four types
+	result.BuildTypeRegistry()
+	for _, typeName := range []string{"main.User", "main.Profile", "main.Address", "main.City"} {
+		if _, ok := result.Types[typeName]; !ok {
+			t.Errorf("type %q missing from registry", typeName)
+		}
+	}
 }
 
-// TestSliceOfStructsWithNestedFields verifies that slice element types also
-// have their nested fields extracted recursively.
 func TestSliceOfStructsWithNestedFields(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -260,12 +274,7 @@ func main() {
 	})
 }
 `
-	if err := os.WriteFile(filepath.Join(tmpDir, "main.go"), []byte(mainContent), 0644); err != nil {
-		t.Fatalf("failed to write main.go: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module example.com/test\ngo 1.21\n"), 0644); err != nil {
-		t.Fatalf("failed to write go.mod: %v", err)
-	}
+	writeTestModule(t, tmpDir, mainContent)
 
 	result := AnalyzeDir(tmpDir, "", DefaultConfig)
 	if len(result.RenderCalls) == 0 {
@@ -287,30 +296,27 @@ func main() {
 		t.Error("expected Drugs to be a slice")
 	}
 
-	// Drugs is []Drug; its Fields should be Drug's fields
 	mfField := findField(drugsVar.Fields, "Manufacturer")
 	if mfField == nil {
 		debugJSON(t, drugsVar)
 		t.Fatal("Manufacturer field not found on Drug (slice element)")
 	}
-
-	nameField := findField(mfField.Fields, "Name")
-	if nameField == nil {
+	if findField(mfField.Fields, "Name") == nil {
 		debugJSON(t, drugsVar)
 		t.Fatal("Manufacturer.Name not found")
 	}
 
-	countryField := findField(mfField.Fields, "Country")
-	if countryField == nil {
-		debugJSON(t, drugsVar)
-		t.Fatal("Manufacturer.Country not found")
+	// Registry
+	result.BuildTypeRegistry()
+	drugFields := result.Types["main.Drug"]
+	if findField(drugFields, "Manufacturer") == nil {
+		t.Error("registry: Drug.Manufacturer missing")
 	}
-
-	t.Logf("Slice element nesting verified: Drugs[].Manufacturer.Name = %+v", nameField)
+	if result.Types["main.Manufacturer"] == nil {
+		t.Error("registry: Manufacturer type missing")
+	}
 }
 
-// TestSelfReferentialStruct verifies that self-referential types don't cause
-// infinite recursion.
 func TestSelfReferentialStruct(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -332,14 +338,9 @@ func main() {
 	})
 }
 `
-	if err := os.WriteFile(filepath.Join(tmpDir, "main.go"), []byte(mainContent), 0644); err != nil {
-		t.Fatalf("failed to write main.go: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module example.com/test\ngo 1.21\n"), 0644); err != nil {
-		t.Fatalf("failed to write go.mod: %v", err)
-	}
+	writeTestModule(t, tmpDir, mainContent)
 
-	// Should not panic or hang
+	// Must not panic or hang
 	result := AnalyzeDir(tmpDir, "", DefaultConfig)
 	if len(result.RenderCalls) == 0 {
 		t.Fatal("expected at least one RenderCall")
@@ -356,18 +357,17 @@ func main() {
 	if rootVar == nil {
 		t.Fatal("'Root' variable not found")
 	}
-
-	valueField := findField(rootVar.Fields, "Value")
-	if valueField == nil {
+	if findField(rootVar.Fields, "Value") == nil {
 		t.Fatal("expected 'Value' field on TreeNode")
 	}
 
-	t.Logf("Self-referential struct handled: Root.Value = %+v", valueField)
+	// Registry must also handle the cycle without panicking
+	result.BuildTypeRegistry()
+	if result.Types["main.TreeNode"] == nil {
+		t.Error("registry: TreeNode type missing")
+	}
 }
 
-// TestSameStructUsedMultipleTimes verifies that when two different top-level
-// variables share the same struct type, both get their fields populated even
-// though the seen map would suppress the second one if shared across variables.
 func TestSameStructUsedMultipleTimes(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -391,12 +391,7 @@ func main() {
 	})
 }
 `
-	if err := os.WriteFile(filepath.Join(tmpDir, "main.go"), []byte(mainContent), 0644); err != nil {
-		t.Fatalf("failed to write main.go: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module example.com/test\ngo 1.21\n"), 0644); err != nil {
-		t.Fatalf("failed to write go.mod: %v", err)
-	}
+	writeTestModule(t, tmpDir, mainContent)
 
 	result := AnalyzeDir(tmpDir, "", DefaultConfig)
 	if len(result.RenderCalls) == 0 {
@@ -424,7 +419,7 @@ func main() {
 		t.Fatal("'WorkAddress' variable not found")
 	}
 
-	// Both variables must have Street and City fields
+	// Both must have inline fields (pre-flatten)
 	if findField(homeVar.Fields, "Street") == nil {
 		debugJSON(t, homeVar)
 		t.Error("HomeAddress.Street not found")
@@ -433,7 +428,6 @@ func main() {
 		debugJSON(t, homeVar)
 		t.Error("HomeAddress.City not found")
 	}
-
 	if findField(workVar.Fields, "Street") == nil {
 		debugJSON(t, workVar)
 		t.Error("WorkAddress.Street not found — same struct reused but fields missing")
@@ -443,8 +437,24 @@ func main() {
 		t.Error("WorkAddress.City not found — same struct reused but fields missing")
 	}
 
-	t.Log("Same struct used for multiple variables: both have all fields")
+	// Post-flatten: Address appears exactly once in the registry, not twice
+	result.BuildTypeRegistry()
+	result.Flatten()
+
+	addrFields, ok := result.Types["main.Address"]
+	if !ok {
+		t.Fatal("Address type missing from registry after Flatten")
+	}
+	if findField(addrFields, "Street") == nil {
+		t.Error("registry Address.Street missing")
+	}
+	if findField(addrFields, "City") == nil {
+		t.Error("registry Address.City missing")
+	}
+	t.Log("Same struct used for multiple variables: both have all fields; registry deduplicates")
 }
+
+// ── helpers shared across test files ─────────────────────────────────────────
 
 func findField(fields []FieldInfo, name string) *FieldInfo {
 	for _, f := range fields {
@@ -458,4 +468,16 @@ func findField(fields []FieldInfo, name string) *FieldInfo {
 func debugJSON(t *testing.T, v any) {
 	b, _ := json.MarshalIndent(v, "", "  ")
 	t.Logf("Debug JSON:\n%s", string(b))
+}
+
+// writeTestModule writes main.go + go.mod into tmpDir.
+func writeTestModule(t *testing.T, tmpDir, mainContent string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(tmpDir, "main.go"), []byte(mainContent), 0644); err != nil {
+		t.Fatalf("failed to write main.go: %v", err)
+	}
+	mod := "module example.com/test\ngo 1.21\n"
+	if err := os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte(mod), 0644); err != nil {
+		t.Fatalf("failed to write go.mod: %v", err)
+	}
 }

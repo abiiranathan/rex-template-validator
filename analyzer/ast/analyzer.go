@@ -8,166 +8,133 @@ import (
 	"fmt"
 	goast "go/ast"
 	"go/token"
-	"go/types"
 	"sync"
 
 	"golang.org/x/tools/go/packages"
 )
 
-// Package-level cache for type information to speed up repeated analysis
+// Package-level in-process cache.  Saves the expensive struct-index rebuild on
+// repeated calls within the same process (e.g. benchmark warm-up, LSP daemon).
 var (
 	packageCacheMu sync.RWMutex
 	packageCache   = make(map[string]*cacheEntry)
 )
 
-// cacheEntry stores cached package analysis results
+// cacheEntry holds the pre-built indexes that are safe to reuse across calls to
+// AnalyzeDir for the same directory within one process lifetime.
 type cacheEntry struct {
 	filesMap    map[string]*goast.File
 	structIndex map[string]structIndexEntry
 }
 
-// AnalyzeDir performs comprehensive static analysis on Go source code to extract:
-// 1. Template render calls with their associated data variables
-// 2. Template function maps (custom functions available in templates)
-// 3. Template variable definitions from context setters
+// AnalyzeDir performs comprehensive static analysis on Go source code and returns
+// an AnalysisResult containing all discovered template-related information.
 //
-// The analysis proceeds in phases:
-// - Load and parse Go packages
-// - Build struct field index (concurrent)
-// - Collect function scopes and template operations (concurrent)
-// - Aggregate and deduplicate results
-// - Enrich with external context if provided
+// Performance strategy (fastest first):
+//  1. Disk cache hit  → deserialise gzip-JSON (~150 ms), skip packages.Load entirely.
+//  2. In-process cache hit → skip struct-index rebuild, still calls packages.Load once.
+//  3. Cold path → single packages.Load, build indexes, write disk cache for next run.
 //
-// Parameters:
-//
-//	dir: Root directory to analyze
-//	contextFile: Optional JSON file with additional template context
-//	config: Analysis configuration (function names, type names)
-//
-// Returns: AnalysisResult containing all discovered template-related information
+// Previously the function called packages.Load 2–3 times per invocation (main
+// analysis + optional context-enrichment reload).  It now loads exactly once and
+// passes the pkgs slice to every downstream step, eliminating the redundant
+// packages.Load that previously happened inside the context-enrichment branch.
 func AnalyzeDir(dir string, contextFile string, config AnalysisConfig) AnalysisResult {
+	// ── 1. Disk cache ────────────────────────────────────────────────────────
+	if diskCached, ok := ReadDiskCache(dir, contextFile); ok {
+		return *diskCached
+	}
+
 	result := AnalysisResult{}
+
+	// ── 2. Load packages – exactly once ──────────────────────────────────────
 	fset := token.NewFileSet()
 
-	// Check cache first for performance
-	cacheKey := dir
+	cfg := &packages.Config{
+		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
+			packages.NeedTypes | packages.NeedTypesInfo | packages.NeedImports,
+		Dir:   dir,
+		Fset:  fset,
+		Tests: false,
+	}
+
+	pkgs, err := packages.Load(cfg, "./...")
+	if err != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf("load error: %v", err))
+		return result
+	}
+
+	info, allFiles := mergeTypeInfo(pkgs, &result)
+
+	// ── 3. Build (or reuse) structural indexes ────────────────────────────────
 	packageCacheMu.RLock()
-	cached, hasCached := packageCache[cacheKey]
+	inMem, hasCached := packageCache[dir]
 	packageCacheMu.RUnlock()
 
 	var filesMap map[string]*goast.File
 	var structIndex map[string]structIndexEntry
-	var info *types.Info
-	var allFiles []*goast.File
 
 	if hasCached {
-		// Use cached data (filesMap and structIndex are immutable after creation)
-		filesMap = cached.filesMap
-		structIndex = cached.structIndex
-
-		// Still need to load packages for type info (but we skip some processing)
-		cfg := &packages.Config{
-			Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
-				packages.NeedImports | packages.NeedTypes | packages.NeedTypesInfo | packages.NeedSyntax,
-			Dir:   dir,
-			Fset:  fset,
-			Tests: false,
-		}
-
-		pkgs, err := packages.Load(cfg, "./...")
-		if err != nil {
-			result.Errors = append(result.Errors, fmt.Sprintf("load error: %v", err))
-			return result
-		}
-
-		info, allFiles = mergeTypeInfo(pkgs, &result)
+		filesMap = inMem.filesMap
+		structIndex = inMem.structIndex
 	} else {
-		// Full analysis path
-		cfg := &packages.Config{
-			Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
-				packages.NeedTypes | packages.NeedTypesInfo | packages.NeedTypesSizes |
-				packages.NeedImports,
-			Dir:   dir,
-			Fset:  fset,
-			Tests: false,
-		}
-
-		pkgs, err := packages.Load(cfg, "./...")
-		if err != nil {
-			result.Errors = append(result.Errors, fmt.Sprintf("load error: %v", err))
-			return result
-		}
-
-		info, allFiles = mergeTypeInfo(pkgs, &result)
 		filesMap = buildFileMap(allFiles, fset)
 		structIndex = buildStructIndex(fset, filesMap)
 
-		// Cache the immutable data structures
 		packageCacheMu.Lock()
-		packageCache[cacheKey] = &cacheEntry{
+		packageCache[dir] = &cacheEntry{
 			filesMap:    filesMap,
 			structIndex: structIndex,
 		}
 		packageCacheMu.Unlock()
 	}
 
-	// Initialize shared infrastructure
+	// ── 4. Shared analysis infrastructure ────────────────────────────────────
 	fc := newFieldCache()
 	seenPool := newSeenMapPool()
 
-	// Phase 2: Collect function scopes (concurrent)
+	// ── 5. Collect function scopes (concurrent) ───────────────────────────────
 	scopes := collectFuncScopesOptimized(allFiles, info, fset, structIndex, fc, config, filesMap, seenPool)
 
-	// Phase 3: Identify global implicit variables
+	// ── 6. Extract global implicit variables ──────────────────────────────────
 	globalImplicitVars := extractGlobalImplicitVars(scopes)
 
-	// Phase 4: Generate render calls from collected scopes
+	// ── 7. Generate render calls ──────────────────────────────────────────────
 	result.RenderCalls = generateRenderCalls(scopes, globalImplicitVars, info, fset, dir, structIndex, fc, seenPool)
 
-	// Phase 5: Aggregate and deduplicate function maps
+	// ── 8. Aggregate function maps ────────────────────────────────────────────
 	result.FuncMaps = aggregateFuncMaps(scopes)
 
-	// Phase 6: Enrich with external context if provided
+	// ── 9. Context enrichment – reuse already-loaded pkgs, no second Load! ───
 	if contextFile != "" {
-		// Need to reload packages for context enrichment
-		cfg := &packages.Config{
-			Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
-				packages.NeedTypes | packages.NeedTypesInfo | packages.NeedTypesSizes |
-				packages.NeedImports,
-			Dir:   dir,
-			Fset:  fset,
-			Tests: false,
-		}
-
-		pkgs, err := packages.Load(cfg, "./...")
-		if err != nil {
-			result.Errors = append(result.Errors, fmt.Sprintf("context load error: %v", err))
-			return result
-		}
-
 		result.RenderCalls = enrichRenderCallsWithContext(
 			result.RenderCalls, contextFile, pkgs, structIndex, fc, fset, config, seenPool,
 		)
 	}
 
+	// ── 10. Persist to disk cache for future cold starts ─────────────────────
+	// Synchronous write (inside AnalyzeDir before return) prevents data races
+	// with callers that modify the returned result (e.g. Flatten).
+	WriteDiskCache(dir, contextFile, result)
+
 	return result
 }
 
-// ClearCache clears the package cache. Useful for testing or when analyzing
-// the same directory multiple times with different configurations.
+// ClearCache evicts the in-process struct-index cache for all directories.
+// Call this in tests or benchmarks to force a full re-analysis.
+// It does NOT clear the on-disk cache; use ClearDiskCache for that.
 func ClearCache() {
 	packageCacheMu.Lock()
 	packageCache = make(map[string]*cacheEntry)
 	packageCacheMu.Unlock()
 }
 
-// extractGlobalImplicitVars identifies template variables that are set
-// outside any render call context. These represent global template state
-// available to all templates.
+// extractGlobalImplicitVars identifies template variables that are set outside
+// any render call context (e.g. in middleware functions).  These are available
+// to every template.
 func extractGlobalImplicitVars(scopes []FuncScope) []TemplateVar {
 	var globalVars []TemplateVar
 	for _, scope := range scopes {
-		// If scope has variables but no render calls, they're global
 		if len(scope.RenderNodes) == 0 && len(scope.SetVars) > 0 {
 			globalVars = append(globalVars, scope.SetVars...)
 		}
@@ -175,31 +142,26 @@ func extractGlobalImplicitVars(scopes []FuncScope) []TemplateVar {
 	return globalVars
 }
 
-// aggregateFuncMaps collects all function map definitions from scopes
-// and deduplicates them by name. This provides a complete catalog of
-// template functions available across the codebase.
+// aggregateFuncMaps collects all function-map definitions from scopes and
+// deduplicates by name.
 func aggregateFuncMaps(scopes []FuncScope) []FuncMapInfo {
-	// Pre-count for efficient allocation
-	totalFuncMaps := 0
+	total := 0
 	for _, scope := range scopes {
-		totalFuncMaps += len(scope.FuncMaps)
+		total += len(scope.FuncMaps)
 	}
 
-	allFuncMaps := make([]FuncMapInfo, 0, totalFuncMaps)
+	all := make([]FuncMapInfo, 0, total)
 	for _, scope := range scopes {
-		allFuncMaps = append(allFuncMaps, scope.FuncMaps...)
+		all = append(all, scope.FuncMaps...)
 	}
 
-	// Deduplicate by name
-	seen := make(map[string]bool, len(allFuncMaps))
-	unique := make([]FuncMapInfo, 0, len(allFuncMaps))
-
-	for _, fm := range allFuncMaps {
+	seen := make(map[string]bool, len(all))
+	unique := make([]FuncMapInfo, 0, len(all))
+	for _, fm := range all {
 		if !seen[fm.Name] {
 			seen[fm.Name] = true
 			unique = append(unique, fm)
 		}
 	}
-
 	return unique
 }
