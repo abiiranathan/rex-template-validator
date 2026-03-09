@@ -489,6 +489,14 @@ function unwrapField(
             fields: (resolvedFields && resolvedFields.length > 0) ? resolvedFields : (retFields || field.fields || [])
         };
     }
+
+    if (fieldResolver && (!field.fields || field.fields.length === 0)) {
+        const bare = extractBareType(field.type);
+        const resolvedFields = fieldResolver(bare);
+        if (resolvedFields && resolvedFields.length > 0) {
+            return { ...field, fields: resolvedFields };
+        }
+    }
     return field;
 }
 
@@ -526,6 +534,14 @@ function unwrapVar(
             isMap: retType.startsWith('map['),
             fields: (resolvedFields && resolvedFields.length > 0) ? resolvedFields : (retFields || v.fields || [])
         };
+    }
+
+    if (fieldResolver && (!v.fields || v.fields.length === 0)) {
+        const bare = extractBareType(v.type);
+        const resolvedFields = fieldResolver(bare);
+        if (resolvedFields && resolvedFields.length > 0) {
+            return { ...v, fields: resolvedFields };
+        }
     }
     return v;
 }
