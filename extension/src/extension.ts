@@ -1,11 +1,11 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
+import * as fs from 'fs';
 import { GoAnalyzer } from './analyzer';
-import { KnowledgeGraphBuilder } from './knowledgeGraph';
+import { KnowledgeGraphBuilder, setKnowledgeGraphBuilder } from './knowledgeGraph';
 import { TemplateValidator } from './validator';
 import { KnowledgeGraphPanel } from './graphPanel';
-import { KnowledgeGraph, GoValidationError, NamedBlockDuplicateError } from './types';
-import * as fs from 'fs';
+import { KnowledgeGraph, GoValidationError, NamedBlockDuplicateError, ValidationError } from './types';
 
 const TEMPLATE_SELECTOR: vscode.DocumentSelector = [
   { language: 'html', scheme: 'file' },
@@ -26,14 +26,27 @@ let graphBuilder: KnowledgeGraphBuilder | undefined;
 let validator: TemplateValidator | undefined;
 let currentGraph: KnowledgeGraph | undefined;
 let analyzer: GoAnalyzer | undefined;
+
+/**
+ * Single status bar item shared across the extension and KnowledgeGraphBuilder.
+ * extension.ts owns its lifetime (created here, disposed in deactivate).
+ * KnowledgeGraphBuilder receives it by reference and only mutates .text / .show() / .hide().
+ */
 let statusBarItem: vscode.StatusBarItem;
 
 let rebuildTimer: NodeJS.Timeout | undefined;
 let validateAllTimer: NodeJS.Timeout | undefined;
 
+// ── Validation cancellation ────────────────────────────────────────────────────
+// A new token is minted each time validateAllKnownTemplates starts.
+// The previous token is cancelled so stale passes exit early.
+let validationCancelSource: vscode.CancellationTokenSource | undefined;
+
 export async function activate(context: vscode.ExtensionContext) {
+  // Create the single shared status bar item.
   statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
   context.subscriptions.push(statusBarItem);
+
   outputChannel = vscode.window.createOutputChannel('Rex Template Validator');
   analyzerCollection = vscode.languages.createDiagnosticCollection('rex-analyzer');
   editorCollection = vscode.languages.createDiagnosticCollection('rex-editor');
@@ -49,7 +62,11 @@ export async function activate(context: vscode.ExtensionContext) {
   }
 
   analyzer = new GoAnalyzer(context, outputChannel);
-  graphBuilder = new KnowledgeGraphBuilder(workspaceRoot, outputChannel);
+
+  // Pass the shared statusBarItem into the builder so it can show progress
+  // messages without creating a second item.
+  graphBuilder = new KnowledgeGraphBuilder(workspaceRoot, outputChannel, statusBarItem);
+  setKnowledgeGraphBuilder(graphBuilder);
   validator = new TemplateValidator(outputChannel, graphBuilder);
 
   // ── Commands ───────────────────────────────────────────────────────────────
@@ -81,15 +98,39 @@ export async function activate(context: vscode.ExtensionContext) {
 
   context.subscriptions.push(
     vscode.languages.registerHoverProvider(TEMPLATE_SELECTOR, {
-      async provideHover(document, position) {
+      async provideHover(document, position, token) {
         if (!validator || !graphBuilder) return;
+
+        // Resolve context (cheap — uses the in-memory cache on graphBuilder)
         let ctx = graphBuilder.findContextForFile(document.uri.fsPath);
         if (!ctx || ctx.renderCalls.length === 0) {
-          const partialCtx = graphBuilder.findContextForFileAsPartial(document.uri.fsPath);
+          const partialCtx = await graphBuilder.findContextForFileAsPartialAsync(document.uri.fsPath);
           if (partialCtx) ctx = partialCtx;
         }
         if (!ctx) return;
-        return await validator.getHoverInfo(document, position, ctx);
+
+        // Race the hover computation against:
+        //   • the VS Code cancellation token (user moved cursor away), and
+        //   • a hard 1 s wall-clock timeout (prevents the "Loading…" spinner
+        //     from sticking when file I/O inside the hover provider is slow).
+        const hoverPromise = validator.getHoverInfo(document, position, ctx).catch(() => undefined);
+
+        const abortPromise = new Promise<undefined>(resolve => {
+          const cancelDisposable = token.onCancellationRequested(() => {
+            cancelDisposable.dispose();
+            resolve(undefined);
+          });
+          const tid = setTimeout(() => {
+            cancelDisposable.dispose();
+            resolve(undefined);
+          }, 1000);
+          hoverPromise.finally(() => {
+            clearTimeout(tid);
+            cancelDisposable.dispose();
+          });
+        });
+
+        return Promise.race([hoverPromise, abortPromise]);
       },
     })
   );
@@ -98,14 +139,11 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.languages.registerCompletionItemProvider(
       TEMPLATE_SELECTOR,
       {
-        // provideCompletionItems must be async so VSCode receives the resolved
-        // CompletionItem[] rather than a discarded Promise object. The original
-        // omission of async caused VSCode to silently discard all completions.
         async provideCompletionItems(document, position) {
           if (!validator || !graphBuilder) return;
           let ctx = graphBuilder.findContextForFile(document.uri.fsPath);
           if (!ctx || ctx.renderCalls.length === 0) {
-            const partialCtx = graphBuilder.findContextForFileAsPartial(document.uri.fsPath);
+            const partialCtx = await graphBuilder.findContextForFileAsPartialAsync(document.uri.fsPath);
             if (partialCtx) ctx = partialCtx;
           }
           if (!ctx) return [];
@@ -122,7 +160,7 @@ export async function activate(context: vscode.ExtensionContext) {
         if (!validator || !graphBuilder) return;
         let ctx = graphBuilder.findContextForFile(document.uri.fsPath);
         if (!ctx || ctx.renderCalls.length === 0) {
-          const partialCtx = graphBuilder.findContextForFileAsPartial(document.uri.fsPath);
+          const partialCtx = await graphBuilder.findContextForFileAsPartialAsync(document.uri.fsPath);
           if (partialCtx) ctx = partialCtx;
         }
         if (!ctx) return;
@@ -141,22 +179,19 @@ export async function activate(context: vscode.ExtensionContext) {
     })
   );
 
-
   context.subscriptions.push(
     vscode.workspace.onDidOpenTextDocument((doc) => {
-      if (isTemplate(doc)) scheduleValidateAllOpenTemplates();
+      if (isTemplate(doc)) validateDocument(doc);
     }),
 
-    // If a template changes, just update the TS graph instantly
     vscode.workspace.onDidChangeTextDocument((e) => {
       const doc = e.document;
       if (isTemplate(doc)) {
         if (graphBuilder) {
-          // Incrementally patch the graph in milliseconds
           graphBuilder.updateTemplateFile(doc.uri.fsPath, doc.getText());
-          applyNamedBlockDiagnostics(); // Refresh duplicate block UI errors
+          applyNamedBlockDiagnostics();
         }
-        scheduleValidateAllOpenTemplates(); // Re-validate the active tab
+        scheduleValidateAllOpenTemplates();
       }
     }),
 
@@ -180,7 +215,6 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.languages.registerReferenceProvider(TEMPLATE_SELECTOR, {
       async provideReferences(document, position, refCtx) {
         if (!validator) return [];
-
         const locs = await validator.getReferences(
           document,
           position,
@@ -211,7 +245,7 @@ function isTemplate(doc: vscode.TextDocument): boolean {
 async function rebuildIndex(workspaceRoot: string) {
   if (!analyzer || !graphBuilder) return;
 
-  statusBarItem.text = '$(sync~spin) Rex: Analyzing...';
+  statusBarItem.text = '$(sync~spin) Rex: Analyzing Go sources...';
   statusBarItem.show();
 
   const config = vscode.workspace.getConfiguration('rex-analyzer');
@@ -235,8 +269,6 @@ async function rebuildIndex(workspaceRoot: string) {
         outputChannel.appendLine('[Rex] No render calls found. Check your Go code calls c.Render().');
       }
     }
-
-    statusBarItem.text = `$(check) Rex: ${count} template${count === 1 ? '' : 's'} indexed`;
 
     // Apply diagnostics from Go analyzer
     const initialValidationErrors = result.validationErrors ?? [];
@@ -265,45 +297,35 @@ async function rebuildIndex(workspaceRoot: string) {
     }
 
     const finalValidationErrors: GoValidationError[] = [];
-
     for (const analyzerErr of initialValidationErrors) {
       const isNotFoundMsg = analyzerErr.message.includes('Could not read template file:') ||
         analyzerErr.message.includes('Template or named block not found');
       if (isNotFoundMsg && extensionMissingTemplateLogicalPaths.has(analyzerErr.template)) {
         continue;
       }
-
-      // Filter out known Go analyzer false positives for method chaining
-      if (analyzerErr.message.includes('does not exist on type method') ||
-        analyzerErr.message.includes('does not exist on type func')) {
-        continue;
-      }
-
       finalValidationErrors.push(analyzerErr);
     }
     finalValidationErrors.push(...extensionGeneratedErrors);
 
     await applyAnalyzerDiagnostics(finalValidationErrors, workspaceRoot, sourceDir, templateRoot, templateBaseDir);
-
-    // Surface named-block duplicate errors
     applyNamedBlockDiagnostics();
 
-    // Validate all workspace templates.
+    // Hand off to the validation phase — it owns the status bar from here.
+    statusBarItem.text = `$(sync~spin) Rex: Validating ${count} template${count === 1 ? '' : 's'}...`;
+    statusBarItem.show();
+
     await validateAllKnownTemplates();
+
+    statusBarItem.text = `$(check) Rex: ${count} template${count === 1 ? '' : 's'} indexed`;
+    statusBarItem.show();
+    setTimeout(() => statusBarItem.hide(), 5000);
   } catch (err) {
     outputChannel.appendLine(`[Rex] Rebuild failed: ${err}`);
     statusBarItem.text = '$(error) Rex: Analysis failed';
-  } finally {
-    statusBarItem.hide();
+    statusBarItem.show();
   }
 }
 
-/**
- * Apply duplicate named-block errors to the namedBlockCollection.
- *
- * Each duplicate is reported as an error on every file that contains a
- * conflicting declaration, pointing at the line of the define/block tag.
- */
 function applyNamedBlockDiagnostics() {
   if (!graphBuilder) return;
   namedBlockCollection.clear();
@@ -328,14 +350,13 @@ function applyNamedBlockDiagnostics() {
         Math.max(0, entry.line - 1),
         Math.max(0, entry.col - 1),
         Math.max(0, entry.line - 1),
-        Math.max(0, entry.col - 1) + entry.name.length + 2 // +2 for the quotes
+        Math.max(0, entry.col - 1) + entry.name.length + 2
       );
 
       const diag = new vscode.Diagnostic(range, msg, vscode.DiagnosticSeverity.Error);
       diag.source = 'Rex';
       diag.code = 'duplicate-named-block';
 
-      // Add related information pointing to all declarations
       diag.relatedInformation = err.entries
         .filter(e => e !== entry)
         .map(
@@ -475,7 +496,7 @@ async function validateDocument(doc: vscode.TextDocument) {
   let ctx = graphBuilder.findContextForFile(doc.uri.fsPath);
 
   if (!ctx || ctx.renderCalls.length === 0) {
-    const partialCtx = graphBuilder.findContextForFileAsPartial(doc.uri.fsPath);
+    const partialCtx = await graphBuilder.findContextForFileAsPartialAsync(doc.uri.fsPath);
     if (partialCtx) ctx = partialCtx;
   }
 
@@ -488,6 +509,71 @@ async function validateDocument(doc: vscode.TextDocument) {
   editorCollection.set(doc.uri, diagnostics);
 }
 
+/**
+ * Validates a template file that is NOT currently open in a VS Code editor.
+ *
+ * Uses fs.readFileSync directly so we never call vscode.workspace.openTextDocument,
+ * which would fire onDidOpenTextDocument and cascade into another full revalidation.
+ */
+async function validateFileDirect(filePath: string): Promise<void> {
+  if (!validator || !graphBuilder) return;
+
+  const config = vscode.workspace.getConfiguration('rex-analyzer');
+  const validationEnabled: boolean = config.get('validate') ?? true;
+  if (!validationEnabled) return;
+
+  let ctx = graphBuilder.findContextForFile(filePath);
+  if (!ctx || ctx.renderCalls.length === 0) {
+    const partialCtx = await graphBuilder.findContextForFileAsPartialAsync(filePath);
+    if (partialCtx) ctx = partialCtx;
+  }
+
+  if (!ctx) {
+    editorCollection.delete(vscode.Uri.file(filePath));
+    return;
+  }
+
+  let content: string;
+  try {
+    content = fs.readFileSync(filePath, 'utf8');
+  } catch {
+    return; // file deleted between index build and now
+  }
+
+  const errors: ValidationError[] = validator.validate(content, ctx, filePath);
+
+  const diagnostics = errors.map(e => {
+    const line = Math.max(0, e.line - 1);
+    const col = Math.max(0, e.col - 1);
+    const range = new vscode.Range(line, col, line, col + (e.variable?.length ?? 10));
+    const diag = new vscode.Diagnostic(
+      range,
+      e.message,
+      e.severity === 'error'
+        ? vscode.DiagnosticSeverity.Error
+        : e.severity === 'warning'
+          ? vscode.DiagnosticSeverity.Warning
+          : vscode.DiagnosticSeverity.Information
+    );
+    diag.source = 'Rex';
+    return diag;
+  });
+
+  editorCollection.set(vscode.Uri.file(filePath), diagnostics);
+}
+
+// ── UI yield helper ────────────────────────────────────────────────────────────
+
+/**
+ * Yields to the Node/VS Code event loop for one tick so that any pending
+ * status-bar or UI repaints are flushed before the next synchronous chunk runs.
+ * Without this, a tight loop of sync work (e.g. validator.validate()) starves
+ * the renderer and only the first status-bar text ever appears on screen.
+ */
+function yieldToUI(): Promise<void> {
+  return new Promise(resolve => setImmediate(resolve));
+}
+
 // ── Debounce helpers ───────────────────────────────────────────────────────────
 
 function scheduleRebuild(workspaceRoot: string) {
@@ -497,25 +583,64 @@ function scheduleRebuild(workspaceRoot: string) {
   rebuildTimer = setTimeout(() => rebuildIndex(workspaceRoot), debounceMs);
 }
 
+/**
+ * Validates every template known to the graph, showing per-template progress
+ * in the shared status bar item.
+ *
+ * Key correctness guarantees:
+ *  1. Cancellation — a new call cancels any in-flight pass via the generation
+ *     counter, so fast-typing or rapid rebuilds never pile up concurrent passes
+ *     writing to the same DiagnosticCollection.
+ *  2. No openTextDocument — closed files are validated via fs.readFileSync so
+ *     the onDidOpenTextDocument event is never fired, breaking the cascade.
+ */
 async function validateAllKnownTemplates() {
   if (!currentGraph || !validator || !graphBuilder) return;
 
-  const allPaths = new Set<string>();
-  for (const [, ctx] of currentGraph.templates) {
-    if (ctx.absolutePath) allPaths.add(ctx.absolutePath);
-  }
+  // Cancel any currently running validation pass.
+  validationCancelSource?.cancel();
+  validationCancelSource?.dispose();
+  validationCancelSource = new vscode.CancellationTokenSource();
+  const token = validationCancelSource.token;
 
-  outputChannel.appendLine(`[Rex] Validating ${allPaths.size} template(s)...`);
+  const allPaths = [...new Set(
+    [...currentGraph.templates.values()]
+      .map(ctx => ctx.absolutePath)
+      .filter((p): p is string => !!p)
+  )];
 
-  for (const filePath of allPaths) {
+  const total = allPaths.length;
+  outputChannel.appendLine(`[Rex] Validating ${total} template(s)...`);
+
+  for (let i = 0; i < allPaths.length; i++) {
+    const filePath = allPaths[i];
+
+    // If a newer pass has started, bail out immediately.
+    if (token.isCancellationRequested) {
+      outputChannel.appendLine('[Rex] Validation pass cancelled (superseded by newer pass)');
+      return;
+    }
+
+    const templateName = path.basename(filePath);
+    statusBarItem.text = `$(sync~spin) Rex: Parsing template ${templateName} (${i + 1}/${total})`;
+    statusBarItem.show();
+    outputChannel.appendLine(`[Rex] Validating template ${i + 1}/${total}: ${templateName}`);
+
+    // Yield to the event loop so the status-bar repaint is flushed before
+    // the (potentially synchronous) validation work begins. Without this,
+    // a tight loop of sync validators starves the renderer and only the
+    // initial "Analyzing..." text ever appears on screen.
+    await yieldToUI();
+
     try {
-      const doc =
-        vscode.workspace.textDocuments.find(d => d.uri.fsPath === filePath) ??
-        (await vscode.workspace.openTextDocument(filePath));
-
-      await validateDocument(doc);
+      const openDoc = vscode.workspace.textDocuments.find(d => d.uri.fsPath === filePath);
+      if (openDoc) {
+        await validateDocument(openDoc);
+      } else {
+        await validateFileDirect(filePath);
+      }
     } catch {
-      // file deleted between index build and now
+      // File deleted between index build and now — ignore.
     }
   }
 }
@@ -526,7 +651,7 @@ function scheduleValidateAllOpenTemplates() {
 
   if (validateAllTimer) clearTimeout(validateAllTimer);
   validateAllTimer = setTimeout(async () => {
-    await validateAllKnownTemplates()
+    await validateAllKnownTemplates();
   }, debounceMs);
 }
 
@@ -535,8 +660,11 @@ function scheduleValidateAllOpenTemplates() {
 export function deactivate() {
   if (rebuildTimer) clearTimeout(rebuildTimer);
   if (validateAllTimer) clearTimeout(validateAllTimer);
+  validationCancelSource?.cancel();
+  validationCancelSource?.dispose();
   analyzerCollection?.dispose();
   editorCollection?.dispose();
   namedBlockCollection?.dispose();
   outputChannel?.dispose();
+  statusBarItem?.dispose();
 }
