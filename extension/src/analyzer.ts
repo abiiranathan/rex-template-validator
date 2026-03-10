@@ -122,6 +122,21 @@ export class GoAnalyzer {
     });
   }
 
+  async getHoverInfo(
+    workspaceRoot: string,
+    absolutePath: string,
+    line: number,
+    col: number,
+    content: string,
+  ): Promise<ExpressionTypeResult | null> {
+    return this.sendDaemonRequest<ExpressionTypeResult | null>(workspaceRoot, 'getHoverInfo', {
+      absolutePath,
+      line,
+      col,
+      content,
+    });
+  }
+
   dispose(): void {
     if (this.daemonProcess && !this.daemonProcess.killed) {
       const shutdownId = ++this.requestId;

@@ -111,7 +111,7 @@ export class HoverProvider {
                     return new vscode.Hover(md);
                 }
             }
-            return null;
+            return this.tryGoHoverFallback(document, position);
         }
 
         const { node, stack, vars: hitVars, locals: hitLocals } = hit;
@@ -188,7 +188,7 @@ export class HoverProvider {
             } catch { }
         }
 
-        if (!result.found) return null;
+        if (!result.found) return this.tryGoHoverFallback(document, position);
 
         const pathToUse = isExpressionFallback ? ['expression'] : node.path;
         return this.buildHoverForPath(
@@ -224,6 +224,53 @@ export class HoverProvider {
                 this.graphBuilder.getGraph().funcMaps,
                 this.scope.buildFieldResolver(vars, stack)
             );
+        } catch {
+            return null;
+        }
+    }
+
+    /**
+     * Fallback: ask the Go daemon to resolve hover info at the given position.
+     * The daemon walks the template scope from scratch and infers the type,
+     * which works reliably inside block/define bodies where the TS-side scope
+     * resolution may not have enough context.
+     */
+    private async tryGoHoverFallback(
+        document: vscode.TextDocument,
+        position: vscode.Position,
+    ): Promise<vscode.Hover | null> {
+        const workspaceRoot = vscode.workspace.getWorkspaceFolder(document.uri)?.uri.fsPath
+            ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        if (!workspaceRoot) return null;
+
+        try {
+            const result = await this.analyzer.getHoverInfo(
+                workspaceRoot,
+                document.uri.fsPath,
+                position.line + 1,   // Go side is 1-based
+                position.character + 1,
+                document.getText(),
+            );
+            if (!result || !result.typeStr) return null;
+
+            const md = new vscode.MarkdownString();
+            md.isTrusted = true;
+
+            const label = (result as any).expression ?? 'expression';
+            md.appendCodeblock(`${label}: ${result.typeStr}`, 'go');
+
+            if (result.fields?.length) {
+                md.appendMarkdown('\n\n---\n\n**Fields:**\n\n');
+                for (const f of result.fields.slice(0, 30)) {
+                    md.appendMarkdown(
+                        `**${f.name}** \`${f.isSlice ? `[]${f.type}` : f.type}\`\n`
+                    );
+                    if (f.doc) md.appendMarkdown(`\n${f.doc}\n`);
+                    md.appendMarkdown('\n');
+                }
+            }
+
+            return new vscode.Hover(md);
         } catch {
             return null;
         }

@@ -61,6 +61,13 @@ type daemonInferExpressionParams struct {
 	BlockLocals map[string]ast.TemplateVar `json:"blockLocals"`
 }
 
+type daemonGetHoverInfoParams struct {
+	AbsolutePath string `json:"absolutePath"`
+	Line         int    `json:"line"` // 1-based
+	Col          int    `json:"col"`  // 1-based
+	Content      string `json:"content"`
+}
+
 type daemonValidateTemplateResult struct {
 	ValidationErrors []validator.ValidationResult `json:"validationErrors"`
 	HasContext       bool                         `json:"hasContext"`
@@ -210,6 +217,21 @@ func (d *analyzerDaemon) handle(req rpcRequest) rpcResponse {
 		}
 
 		result, err := d.inferExpressionType(params)
+		if err != nil {
+			resp.Error = &rpcError{Code: -32000, Message: err.Error()}
+			return resp
+		}
+		resp.Result = result
+		return resp
+
+	case "getHoverInfo":
+		var params daemonGetHoverInfoParams
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			resp.Error = &rpcError{Code: -32602, Message: fmt.Sprintf("invalid getHoverInfo params: %v", err)}
+			return resp
+		}
+
+		result, err := d.getHoverInfo(params)
 		if err != nil {
 			resp.Error = &rpcError{Code: -32000, Message: err.Error()}
 			return resp
@@ -422,6 +444,65 @@ func (d *analyzerDaemon) inferExpressionType(params daemonInferExpressionParams)
 		funcMaps,
 		typeRegistry,
 	), nil
+}
+
+func (d *analyzerDaemon) getHoverInfo(params daemonGetHoverInfoParams) (*validator.HoverResult, error) {
+	d.mu.RLock()
+	if !d.initialized {
+		d.mu.RUnlock()
+		return nil, fmt.Errorf("daemon not initialized")
+	}
+	baseDir := d.baseDir
+	templateRoot := d.templateRoot
+	renderVarsByTemplate := cloneRenderVarIndex(d.renderVarsByTemplate)
+	funcMaps := mapsCloneFuncMaps(d.funcMaps)
+	typeRegistry := cloneTypeRegistry(d.typeRegistry)
+	registry := cloneRegistry(d.namedBlocks)
+	overlays := cloneTemplateOverlays(d.templateOverlays)
+	d.mu.RUnlock()
+
+	absPath, err := filepath.Abs(params.AbsolutePath)
+	if err != nil {
+		return nil, err
+	}
+
+	content := params.Content
+	if content == "" {
+		if overlay, ok := overlays[absPath]; ok {
+			content = overlay
+		}
+	}
+	if content == "" {
+		return nil, fmt.Errorf("no content for %s", absPath)
+	}
+
+	templateBase := filepath.Join(baseDir, templateRoot)
+	rel, err := filepath.Rel(templateBase, absPath)
+	if err != nil {
+		rel = absPath
+	}
+	rel = filepath.ToSlash(rel)
+
+	applyTemplateOverlays(registry, overlays, baseDir, templateRoot)
+
+	// Find the render vars for this template file.
+	_, vars, ok := findRenderVarsForTemplate(renderVarsByTemplate, absPath, baseDir, templateRoot)
+	if !ok {
+		return nil, nil
+	}
+
+	varMap := make(map[string]ast.TemplateVar, len(vars))
+	for _, v := range vars {
+		varMap[v.Name] = v
+	}
+
+	result := validator.GetHoverResult(
+		content, varMap, rel, baseDir, templateRoot,
+		0, // lineOffset — top-level file
+		params.Line, params.Col,
+		registry, funcMaps, typeRegistry,
+	)
+	return result, nil
 }
 
 func findRenderVarsForTemplate(

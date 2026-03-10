@@ -55,13 +55,17 @@ func (i expressionInferencer) infer(expr string) *ExpressionTypeResult {
 		return nil
 	}
 
-	tree, err := parseExpressionTree(expr, i.funcMaps)
+	// Collect all $var names from blockLocals and scopeStack so the parser accepts them
+	localVarNames := i.collectLocalVarNames()
+
+	tree, err := parseExpressionTree(expr, i.funcMaps, localVarNames)
 	if err != nil {
 		return nil
 	}
 
-	for _, node := range tree.Root.Nodes {
-		action, ok := node.(*templateparse.ActionNode)
+	// Skip the pre-declaration actions and only infer the last action (the real expression)
+	for idx := len(tree.Root.Nodes) - 1; idx >= 0; idx-- {
+		action, ok := tree.Root.Nodes[idx].(*templateparse.ActionNode)
 		if !ok {
 			continue
 		}
@@ -71,7 +75,29 @@ func (i expressionInferencer) infer(expr string) *ExpressionTypeResult {
 	return nil
 }
 
-func parseExpressionTree(expr string, funcMaps FuncMapRegistry) (*templateparse.Tree, error) {
+// collectLocalVarNames returns all $var names from blockLocals and scopeStack Locals.
+func (i expressionInferencer) collectLocalVarNames() []string {
+	seen := make(map[string]struct{})
+	for name := range i.blockLocals {
+		if strings.HasPrefix(name, "$") && name != "$" {
+			seen[name] = struct{}{}
+		}
+	}
+	for _, scope := range i.scopeStack {
+		for name := range scope.Locals {
+			if strings.HasPrefix(name, "$") && name != "$" {
+				seen[name] = struct{}{}
+			}
+		}
+	}
+	names := make([]string, 0, len(seen))
+	for name := range seen {
+		names = append(names, name)
+	}
+	return names
+}
+
+func parseExpressionTree(expr string, funcMaps FuncMapRegistry, localVarNames []string) (*templateparse.Tree, error) {
 	funcDefs := template.FuncMap{}
 	for _, name := range []string{"dict", "add", "sub", "mul", "div", "mod"} {
 		funcDefs[name] = func(...any) any { return nil }
@@ -80,7 +106,13 @@ func parseExpressionTree(expr string, funcMaps FuncMapRegistry) (*templateparse.
 		funcDefs[name] = func(...any) any { return nil }
 	}
 
-	tmpl, err := template.New("expr").Funcs(funcDefs).Parse("{{ " + expr + " }}")
+	// Pre-declare local $variables so Go's template parser accepts them
+	var prefix string
+	for _, name := range localVarNames {
+		prefix += "{{ " + name + " := . }}"
+	}
+
+	tmpl, err := template.New("expr").Funcs(funcDefs).Parse(prefix + "{{ " + expr + " }}")
 	if err != nil {
 		return nil, err
 	}

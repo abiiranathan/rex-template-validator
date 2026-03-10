@@ -70,12 +70,11 @@
     {{/* Tests: nested range>with>if>else, $-access, local vars, template */}}
     {{/* call inside range, and else-range fallback path. */}}
     {{/* ------------------------------------------------------------------ */}}
+    
     {{ block "prescription-summary" . }}
     <section class="prescription-summary">
         <h2>{{ $.Title }} — Prescription Summary</h2>
-
         {{ range .prescriptions }}
-        {{/* Outer range: dot is now a Prescription */}}
         {{ $rx := . }}
 
         {{ with .Drug }}
