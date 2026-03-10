@@ -30,6 +30,7 @@ func processFunc(
 	filesMap map[string]*goast.File,
 	seenPool *seenMapPool,
 	mutatorIndex map[string][]*goast.KeyValueExpr,
+	stringMapIndex map[string][]string,
 ) FuncScope {
 	scope := FuncScope{
 		MapAssignments: make(map[string]*goast.CompositeLit, 4),
@@ -37,7 +38,7 @@ func processFunc(
 	stringAssignments := make(map[string][]string, 8)
 	funcMapAssignments := make(map[string]*goast.CompositeLit, 4)
 
-	collectAssignments(n, info, fset, filesMap, &scope, stringAssignments, funcMapAssignments, structIndex, fc, seenPool, mutatorIndex)
+	collectAssignments(n, info, fset, filesMap, &scope, stringAssignments, funcMapAssignments, structIndex, fc, seenPool, mutatorIndex, stringMapIndex)
 	findTemplateOperations(n, info, fset, structIndex, fc, config, filesMap, seenPool, &scope, stringAssignments)
 
 	return scope
@@ -57,6 +58,7 @@ func collectAssignments(
 	fc *fieldCache,
 	seenPool *seenMapPool,
 	mutatorIndex map[string][]*goast.KeyValueExpr,
+	stringMapIndex map[string][]string,
 ) {
 	goast.Inspect(n, func(child goast.Node) bool {
 		if child != n {
@@ -66,7 +68,7 @@ func collectAssignments(
 		}
 		switch node := child.(type) {
 		case *goast.AssignStmt:
-			processAssignStmt(node, info, fset, filesMap, scope, stringAssignments, funcMapAssignments, structIndex, fc, seenPool)
+			processAssignStmt(node, info, fset, filesMap, scope, stringAssignments, funcMapAssignments, structIndex, fc, seenPool, stringMapIndex)
 		case *goast.GenDecl:
 			processGenDecl(node, info, fset, filesMap, scope, stringAssignments, funcMapAssignments, structIndex, fc, seenPool)
 		case *goast.CallExpr:
@@ -81,7 +83,54 @@ func collectAssignments(
 // - FuncMap composite literals
 // - Map index assignments to FuncMap[key]
 // - Map variable assignments for data argument resolution
-func processAssignStmt(assign *goast.AssignStmt, info *types.Info, fset *token.FileSet, filesMap map[string]*goast.File, scope *FuncScope, stringAssignments map[string][]string, funcMapAssignments map[string]*goast.CompositeLit, structIndex map[string]structIndexEntry, fc *fieldCache, seenPool *seenMapPool) {
+// - Map-lookup assignments: `view, ok := someStringMap[key]`
+func processAssignStmt(
+	assign *goast.AssignStmt,
+	info *types.Info,
+	fset *token.FileSet,
+	filesMap map[string]*goast.File,
+	scope *FuncScope,
+	stringAssignments map[string][]string,
+	funcMapAssignments map[string]*goast.CompositeLit,
+	structIndex map[string]structIndexEntry,
+	fc *fieldCache,
+	seenPool *seenMapPool,
+	stringMapIndex map[string][]string,
+) {
+	// ── Special case: map-index read  `v, ok := someMap[key]` ────────────────
+	//
+	// When the RHS is a single index expression (e.g. labforms[request.ReportType])
+	// and the indexed map is in stringMapIndex, expand the LHS variable(s) that
+	// receive the value (ignoring the boolean "ok" result) to all possible string
+	// values from that map.
+	//
+	// Handles both two-result  (v, ok := m[k])  and single-result  (v := m[k]).
+	if assign.Tok == token.DEFINE || assign.Tok == token.ASSIGN {
+		if len(assign.Rhs) == 1 {
+			if idx, ok := assign.Rhs[0].(*goast.IndexExpr); ok {
+				if ident, ok := idx.X.(*goast.Ident); ok {
+					if vals, found := stringMapIndex[ident.Name]; found {
+						// The first LHS identifier receives the map value.
+						// (The second, if present, is the "ok" boolean — skip it.)
+						if len(assign.Lhs) >= 1 {
+							if lhsIdent, ok := assign.Lhs[0].(*goast.Ident); ok && lhsIdent.Name != "_" {
+								if len(stringAssignments[lhsIdent.Name]) < MaxAssignmentsPerVar {
+									stringAssignments[lhsIdent.Name] = append(
+										stringAssignments[lhsIdent.Name],
+										vals...,
+									)
+								}
+							}
+						}
+						// Don't fall through: the RHS is not a regular assignment.
+						return
+					}
+				}
+			}
+		}
+	}
+
+	// ── Regular per-LHS processing ────────────────────────────────────────────
 	for i, lhs := range assign.Lhs {
 		if i >= len(assign.Rhs) {
 			continue

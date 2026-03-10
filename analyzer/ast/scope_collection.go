@@ -21,8 +21,6 @@ import (
 // - One worker per CPU core (maximum parallelism)
 // - Work distribution via chunk-based partitioning
 // - No shared state between workers (thread-safe by design)
-// Replace the collectFuncScopesOptimized signature and body to accept + build the mutator index.
-
 func collectFuncScopesOptimized(
 	files []*goast.File,
 	info *types.Info,
@@ -41,7 +39,13 @@ func collectFuncScopesOptimized(
 	// Build the cross-function map-mutator index before spawning workers.
 	// This is cheap (one AST walk, no type lookups beyond what is already loaded).
 	mutatorIndex := buildMapMutatorIndex(files, info)
-	return processNodesConcurrently(funcNodes, info, fset, structIndex, fc, config, filesMap, seenPool, mutatorIndex)
+
+	// Build the string-map index: package-level map[K]string variables whose
+	// values are string literals. Used to resolve template names that come
+	// from a map lookup (e.g. view, ok := labforms[request.ReportType]).
+	stringMapIndex := buildStringMapIndex(files, info)
+
+	return processNodesConcurrently(funcNodes, info, fset, structIndex, fc, config, filesMap, seenPool, mutatorIndex, stringMapIndex)
 }
 
 // identifyFuncNodes walks all AST files to identify nodes representing
@@ -83,6 +87,7 @@ func processNodesConcurrently(
 	filesMap map[string]*goast.File,
 	seenPool *seenMapPool,
 	mutatorIndex map[string][]*goast.KeyValueExpr,
+	stringMapIndex map[string][]string,
 ) []FuncScope {
 	numWorkers := max(runtime.NumCPU(), 1)
 	chunkSize := (len(funcNodes) + numWorkers - 1) / numWorkers
@@ -98,7 +103,7 @@ func processNodesConcurrently(
 		chunk := funcNodes[start:end]
 
 		wg.Add(1)
-		go processChunk(chunk, info, fset, structIndex, fc, config, filesMap, seenPool, mutatorIndex, resultChan, &wg)
+		go processChunk(chunk, info, fset, structIndex, fc, config, filesMap, seenPool, mutatorIndex, stringMapIndex, resultChan, &wg)
 	}
 
 	go func() {
@@ -125,13 +130,14 @@ func processChunk(
 	filesMap map[string]*goast.File,
 	seenPool *seenMapPool,
 	mutatorIndex map[string][]*goast.KeyValueExpr,
+	stringMapIndex map[string][]string,
 	resultChan chan<- []FuncScope,
 	wg *sync.WaitGroup,
 ) {
 	defer wg.Done()
 	localScopes := make([]FuncScope, 0, len(chunk)/2)
 	for _, unit := range chunk {
-		scope := processFunc(unit.node, info, fset, structIndex, fc, config, filesMap, seenPool, mutatorIndex)
+		scope := processFunc(unit.node, info, fset, structIndex, fc, config, filesMap, seenPool, mutatorIndex, stringMapIndex)
 		if len(scope.RenderNodes) > 0 || len(scope.SetVars) > 0 || len(scope.FuncMaps) > 0 {
 			localScopes = append(localScopes, scope)
 		}
@@ -204,6 +210,121 @@ func buildMapMutatorIndex(files []*goast.File, info *types.Info) map[string][]*g
 		}
 	}
 	return index
+}
+
+// buildStringMapIndex scans all files for package-level variable declarations
+// of map types whose *value* type is string (e.g. map[SomeEnum]string,
+// map[string]string). It records every string-literal value found in the
+// composite literal, keyed by the variable name.
+//
+// This powers dynamic template-name resolution for the common pattern:
+//
+//	var labforms = map[enums.ReportType]string{
+//	    enums.ReportTypeGeneral: "views/lab/labforms/GENERAL.html",
+//	    enums.ReportTypeCbc:     "views/lab/labforms/CBC-3Part.html",
+//	    ...
+//	}
+//	view, ok := labforms[request.ReportType]
+//	c.Render(view, data)  // → generates a RenderCall per value in labforms
+//
+// The returned map is: varName → []string{all literal string values}.
+func buildStringMapIndex(files []*goast.File, info *types.Info) map[string][]string {
+	index := make(map[string][]string)
+
+	for _, f := range files {
+		for _, decl := range f.Decls {
+			genDecl, ok := decl.(*goast.GenDecl)
+			if !ok || genDecl.Tok != token.VAR {
+				continue
+			}
+
+			for _, spec := range genDecl.Specs {
+				vspec, ok := spec.(*goast.ValueSpec)
+				if !ok {
+					continue
+				}
+
+				for i, name := range vspec.Names {
+					if i >= len(vspec.Values) {
+						continue
+					}
+
+					comp, ok := vspec.Values[i].(*goast.CompositeLit)
+					if !ok {
+						continue
+					}
+
+					// Confirm the variable's type resolves to map[K]string.
+					// Prefer type-checker info; fall back to AST inspection.
+					if info != nil {
+						if obj, ok := info.Defs[name]; ok && obj != nil {
+							if !isMapToStringType(obj.Type()) {
+								continue
+							}
+						} else {
+							// Defs entry missing — fall through to AST check.
+							if !isMapToStringLitType(comp) {
+								continue
+							}
+						}
+					} else {
+						if !isMapToStringLitType(comp) {
+							continue
+						}
+					}
+
+					// Collect all string-literal values from the map literal.
+					var vals []string
+					for _, elt := range comp.Elts {
+						kv, ok := elt.(*goast.KeyValueExpr)
+						if !ok {
+							continue
+						}
+						if s := extractStringFast(kv.Value); s != "" {
+							vals = append(vals, s)
+						}
+					}
+
+					if len(vals) > 0 {
+						index[name.Name] = vals
+					}
+				}
+			}
+		}
+	}
+
+	return index
+}
+
+// isMapToStringType reports whether t is (or unwraps to) a map whose value
+// type is the built-in string kind.
+func isMapToStringType(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	if named, ok := t.(*types.Named); ok {
+		t = named.Underlying()
+	}
+	m, ok := t.(*types.Map)
+	if !ok {
+		return false
+	}
+	basic, ok := m.Elem().Underlying().(*types.Basic)
+	return ok && basic.Kind() == types.String
+}
+
+// isMapToStringLitType is a best-effort AST-only check: it looks at the
+// composite literal's type node for the pattern map[…]string.
+func isMapToStringLitType(comp *goast.CompositeLit) bool {
+	if comp.Type == nil {
+		return false
+	}
+	mt, ok := comp.Type.(*goast.MapType)
+	if !ok {
+		return false
+	}
+	ident, ok := mt.Value.(*goast.Ident)
+	return ok && ident.Name == "string"
 }
 
 // isMapStringAnyParam reports whether a function parameter's type resolves to
