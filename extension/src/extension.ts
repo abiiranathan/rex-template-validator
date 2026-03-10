@@ -44,7 +44,7 @@ export async function activate(context: vscode.ExtensionContext) {
   statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
   context.subscriptions.push(statusBarItem);
 
-  outputChannel = vscode.window.createOutputChannel('Rex Template Validator');
+  outputChannel = vscode.window.createOutputChannel('Rex LSP');
   analyzerCollection = vscode.languages.createDiagnosticCollection('rex-analyzer');
   editorCollection = vscode.languages.createDiagnosticCollection('rex-editor');
   namedBlockCollection = vscode.languages.createDiagnosticCollection('rex-named-blocks');
@@ -286,7 +286,7 @@ async function rebuildIndex(workspaceRoot: string) {
   statusBarItem.text = '$(sync~spin) Rex: Analyzing Go sources...';
   statusBarItem.show();
 
-  const config = vscode.workspace.getConfiguration('rex-analyzer');
+  const config = vscode.workspace.getConfiguration('rex');
   const sourceDir: string = config.get('sourceDir') ?? '.';
   const templateRoot: string = config.get('templateRoot') ?? '';
   const templateBaseDir: string = config.get('templateBaseDir') ?? '';
@@ -427,7 +427,7 @@ async function applyAnalyzerDiagnostics(
   templateBaseDir: string
 ) {
   analyzerCollection.clear();
-  const config = vscode.workspace.getConfiguration('rex-analyzer');
+  const config = vscode.workspace.getConfiguration('rex');
   const contextFile: string = config.get('contextFile') ?? '';
 
   const issuesByFile = new Map<string, vscode.Diagnostic[]>();
@@ -567,7 +567,7 @@ async function validateDocument(doc: vscode.TextDocument, requestedVersion = doc
 async function validateFileDirect(filePath: string): Promise<void> {
   if (!analyzer) return;
 
-  const config = vscode.workspace.getConfiguration('rex-analyzer');
+  const config = vscode.workspace.getConfiguration('rex');
   const validationEnabled: boolean = config.get('validate') ?? true;
   if (!validationEnabled) return;
 
@@ -601,14 +601,14 @@ async function validateFileDirect(filePath: string): Promise<void> {
 // ── Debounce helpers ───────────────────────────────────────────────────────────
 
 function scheduleRebuild(workspaceRoot: string) {
-  const config = vscode.workspace.getConfiguration('rex-analyzer');
+  const config = vscode.workspace.getConfiguration('rex');
   const debounceMs = config.get<number>('debounceMs') ?? 1000;
   if (rebuildTimer) clearTimeout(rebuildTimer);
   rebuildTimer = setTimeout(() => rebuildIndex(workspaceRoot), debounceMs);
 }
 
 function scheduleValidateDocument(doc: vscode.TextDocument) {
-  const config = vscode.workspace.getConfiguration('rex-analyzer');
+  const config = vscode.workspace.getConfiguration('rex');
   const debounceMs = config.get<number>('debounceMs') ?? 1000;
   const docKey = doc.uri.toString();
   latestValidationVersions.set(docKey, doc.version);
@@ -632,7 +632,7 @@ function scheduleValidateDocument(doc: vscode.TextDocument) {
 }
 
 function scheduleValidateOpenTemplateDocuments(excludeDocKey?: string) {
-  const config = vscode.workspace.getConfiguration('rex-analyzer');
+  const config = vscode.workspace.getConfiguration('rex');
   const debounceMs = config.get<number>('debounceMs') ?? 1000;
 
   if (validateOpenTemplatesTimer) clearTimeout(validateOpenTemplatesTimer);

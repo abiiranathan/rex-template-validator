@@ -1,5 +1,5 @@
 {
-  "name": "rex-analyzer",
+  "name": "rex",
   "displayName": "Golang Template Validator and Language Server",
   "description": "Validates Go template variables in .html/.tmpl files and provides intellisense, go to definition etc",
   "version": "0.2.0",
@@ -58,44 +58,44 @@
       ]
     },
     "configuration": {
-      "title": "Rex Template Validator",
+      "title": "Rex LSP",
       "properties": {
-        "rex-analyzer.goAnalyzerPath": {
+        "rex.goAnalyzerPath": {
           "type": "string",
           "default": "",
-          "description": "Path to the rex-analyzer binary. Leave empty to use the bundled binary."
+          "description": "Path to the rex analyzer binary. Leave empty to use the bundled binary."
         },
-        "rex-analyzer.sourceDir": {
+        "rex.sourceDir": {
           "type": "string",
           "default": ".",
           "description": "Go source directory relative to the workspace root, passed as the -dir flag to the CLI (e.g. 'sample' if your Go files live in a subdirectory)."
         },
-        "rex-analyzer.templateRoot": {
+        "rex.templateRoot": {
           "type": "string",
           "default": "",
           "description": "Root directory for templates, relative to sourceDir, passed as the -template-root flag (e.g. 'templates')."
         },
-        "rex-analyzer.templateBaseDir": {
+        "rex.templateBaseDir": {
           "type": "string",
           "default": "",
           "description": "Base directory for templates, relative to the workspace root, used as the -template-base-dir flag. If empty, defaults to the workspace root."
         },
-        "rex-analyzer.contextFile": {
+        "rex.contextFile": {
           "type": "string",
           "default": "",
           "description": "Path to a JSON file containing additional context variables (e.g. injected by middleware). Can be absolute or relative to workspace root."
         },
-        "rex-analyzer.debounceMs": {
+        "rex.debounceMs": {
           "type": "number",
           "default": 1500,
           "description": "Debounce delay in milliseconds before re-validating on file change."
         },
-        "rex-analyzer.compress": {
+        "rex.compress": {
           "type": "boolean",
           "default": false,
           "description": "Enable GZIP compression from analyzer"
         },
-        "rex-analyzer.validate": {
+        "rex.validate": {
           "type": "boolean",
           "default": true,
           "description": "Validate variables passed into the context and template names"
@@ -107,7 +107,7 @@
     "vscode:prepublish": "npm run compile && npm run build-analyzer",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "build-analyzer": "cd ../analyzer && go build -o ../extension/out/rex-analyzer .",
+    "build-analyzer": "cd ../analyzer && go build -o ../extension/out/rex .",
     "package": "vsce package"
   },
   "devDependencies": {

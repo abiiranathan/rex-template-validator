@@ -7,7 +7,7 @@ EXT_DIR="$ROOT/extension"
 OUT_DIR="$EXT_DIR/out"
 
 echo "══════════════════════════════════════"
-echo "  Rex Template Validator — Build"
+echo "  Rex LSP — Build"
 echo "══════════════════════════════════════"
 
 # ─── Build Go Analyzer ───────────────────

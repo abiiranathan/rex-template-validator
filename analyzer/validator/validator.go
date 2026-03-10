@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strings"
 	"sync"
 
 	"github.com/rex-template-analyzer/ast"
@@ -172,7 +173,7 @@ func validateTemplateTree(
 		rel = filepath.ToSlash(rel)
 
 		// Skip files that are direct render-call targets — already validated.
-		if _, covered := renderVarsByTemplate[rel]; covered {
+		if isCoveredByRenderCall(rel, renderVarsByTemplate) {
 			return nil
 		}
 
@@ -209,6 +210,26 @@ func validateTemplateTree(
 		}
 		return errs
 	})
+}
+
+func isCoveredByRenderCall(rel string, renderVarsByTemplate map[string][]ast.TemplateVar) bool {
+	if _, ok := renderVarsByTemplate[rel]; ok {
+		return true
+	}
+	// Normalize and try suffix/prefix matching
+	normalizedRel := filepath.ToSlash(filepath.Clean(rel))
+	normalizedRel = strings.TrimPrefix(normalizedRel, "./")
+	for key := range renderVarsByTemplate {
+		normalizedKey := filepath.ToSlash(filepath.Clean(key))
+		normalizedKey = strings.TrimPrefix(normalizedKey, "./")
+		if normalizedRel == normalizedKey {
+			return true
+		}
+		if strings.HasSuffix(normalizedRel, normalizedKey) || strings.HasSuffix(normalizedKey, normalizedRel) {
+			return true
+		}
+	}
+	return false
 }
 
 // validateOrphanedNamedBlocks validates every {{define}} / {{block}} entry in
@@ -323,28 +344,47 @@ func validateRenderCallsConcurrently(
 		return nil
 	}
 
-	return runWorkers(len(renderCalls), func(chunk []int) []ValidationResult {
+	// Build the union var index FIRST — same as what the daemon uses for live validation.
+	renderVarsByTemplate := buildRenderVarIndex(renderCalls)
+
+	// Deduplicate: only validate each unique template once, with unioned vars.
+	type workItem struct {
+		template string
+		vars     []ast.TemplateVar
+		rc       ast.RenderCall // for GoFile/GoLine metadata — use first call
+	}
+
+	seen := make(map[string]bool)
+	var items []workItem
+	for _, rc := range renderCalls {
+		if seen[rc.Template] {
+			continue
+		}
+		seen[rc.Template] = true
+		if _, isNamedBlock := namedBlocks[rc.Template]; isNamedBlock && partialTargets[rc.Template] {
+			continue
+		}
+		items = append(items, workItem{
+			template: rc.Template,
+			vars:     renderVarsByTemplate[rc.Template],
+			rc:       rc,
+		})
+	}
+
+	return runWorkers(len(items), func(chunk []int) []ValidationResult {
 		var errors []ValidationResult
 		for _, i := range chunk {
-			rc := renderCalls[i]
-
-			if _, isNamedBlock := namedBlocks[rc.Template]; isNamedBlock && partialTargets[rc.Template] {
-				continue
-			}
-
-			templatePath := filepath.Join(baseDir, templateRoot, rc.Template)
-
+			item := items[i]
+			templatePath := filepath.Join(baseDir, templateRoot, item.template)
 			rcErrors := ValidateTemplateFile(
-				templatePath, rc.Vars, rc.Template, baseDir, templateRoot, namedBlocks, funcMaps,
+				templatePath, item.vars, item.template, baseDir, templateRoot, namedBlocks, funcMaps,
 			)
-
 			for j := range rcErrors {
-				rcErrors[j].GoFile = rc.File
-				rcErrors[j].GoLine = rc.Line
-				rcErrors[j].TemplateNameStartCol = rc.TemplateNameStartCol
-				rcErrors[j].TemplateNameEndCol = rc.TemplateNameEndCol
+				rcErrors[j].GoFile = item.rc.File
+				rcErrors[j].GoLine = item.rc.Line
+				rcErrors[j].TemplateNameStartCol = item.rc.TemplateNameStartCol
+				rcErrors[j].TemplateNameEndCol = item.rc.TemplateNameEndCol
 			}
-
 			errors = append(errors, rcErrors...)
 		}
 		return errors

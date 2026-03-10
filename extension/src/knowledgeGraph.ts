@@ -78,7 +78,7 @@ export class KnowledgeGraphBuilder {
     }
 
     private getTemplateBase(): string {
-        const config = vscode.workspace.getConfiguration('rex-analyzer');
+        const config = vscode.workspace.getConfiguration('rex');
         const sourceDir: string = config.get('sourceDir') ?? '.';
         const templateBaseDir: string = config.get('templateBaseDir') ?? '';
         const templateRoot: string = config.get('templateRoot') ?? '';
@@ -384,7 +384,7 @@ export class KnowledgeGraphBuilder {
         }
 
         const templateBase = this.getTemplateBase();
-        const config = vscode.workspace.getConfiguration('rex-analyzer');
+        const config = vscode.workspace.getConfiguration('rex');
         const sourceDir: string = config.get('sourceDir') ?? '.';
 
         const candidates = [
@@ -740,7 +740,7 @@ export class KnowledgeGraphBuilder {
     }
 
     resolveGoFilePath(relativeFile: string): string | null {
-        const config = vscode.workspace.getConfiguration('rex-analyzer');
+        const config = vscode.workspace.getConfiguration('rex');
         const sourceDir: string = config.get('sourceDir') ?? '.';
         const sourceDirAbs = path.resolve(this.workspaceRoot, sourceDir);
         const abs = path.join(sourceDirAbs, relativeFile);
@@ -762,7 +762,7 @@ export class KnowledgeGraphBuilder {
         }
 
         const templateBase = this.getTemplateBase();
-        const config = vscode.workspace.getConfiguration('rex-analyzer');
+        const config = vscode.workspace.getConfiguration('rex');
         const sourceDir: string = config.get('sourceDir') ?? '.';
 
         const candidates = [

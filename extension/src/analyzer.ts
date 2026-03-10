@@ -6,6 +6,7 @@ import * as readline from 'readline';
 import { createGunzip } from 'zlib';
 
 import { AnalysisResult, ExpressionTypeResult, GoTemplateValidationResult, ScopeFrame, TemplateVar } from './types';
+import { config } from './config';
 
 interface AnalyzerRequest {
   jsonrpc: '2.0';
@@ -41,8 +42,7 @@ export class GoAnalyzer {
   }
 
   private resolveAnalyzerPath(context: vscode.ExtensionContext): string {
-    const config = vscode.workspace.getConfiguration('rex-analyzer');
-    const configPath = config.get<string>('goAnalyzerPath');
+    const configPath = config.analyzerPath();
 
     if (configPath && fs.existsSync(configPath)) {
       return configPath;
@@ -82,9 +82,7 @@ export class GoAnalyzer {
   }
 
   async validateTemplate(workspaceRoot: string, absolutePath: string, content: string): Promise<GoTemplateValidationResult> {
-    const config = vscode.workspace.getConfiguration('rex-analyzer');
-    const validationEnabled: boolean = config.get('validate') ?? true;
-    if (!validationEnabled) {
+    if (!config.validate()) {
       return { validationErrors: [], hasContext: false };
     }
 
@@ -160,12 +158,11 @@ export class GoAnalyzer {
   }
 
   private buildAnalyzeParams(workspaceRoot: string): Record<string, unknown> {
-    const config = vscode.workspace.getConfiguration('rex-analyzer');
-    const sourceDir: string = config.get('sourceDir') ?? '.';
-    const templateRoot: string = config.get('templateRoot') ?? '';
-    const templateBaseDir: string = config.get('templateBaseDir') ?? '';
-    const contextFile: string = config.get('contextFile') ?? '';
-    const validate: boolean = config.get("validate") ?? true;
+    const sourceDir = config.sourceDir();
+    const templateRoot = config.templateRoot();
+    const templateBaseDir = config.templateBaseDir();
+    const contextFile = config.contextFile();
+    const validate = config.validate();
 
     // Resolve the Go source directory to an absolute path
     const absSourceDir = path.resolve(workspaceRoot, sourceDir);
@@ -180,13 +177,12 @@ export class GoAnalyzer {
   }
 
   private async analyzeWorkspaceViaCli(workspaceRoot: string): Promise<AnalysisResult> {
-    const config = vscode.workspace.getConfiguration('rex-analyzer');
-    const sourceDir: string = config.get('sourceDir') ?? '.';
-    const templateRoot: string = config.get('templateRoot') ?? '';
-    const templateBaseDir: string = config.get('templateBaseDir') ?? '';
-    const contextFile: string = config.get('contextFile') ?? '';
-    const enableGZIPCompression = config.get("compress") ?? false;
-    const validate: boolean = config.get("validate") ?? true;
+    const sourceDir = config.sourceDir();
+    const templateRoot = config.templateRoot();
+    const templateBaseDir = config.templateBaseDir();
+    const contextFile = config.contextFile();
+    const enableGZIPCompression = config.compress();
+    const validate = config.validate();
 
     this.outputChannel.appendLine(`SourceDir: ${sourceDir}`)
     this.outputChannel.appendLine(`templateRoot: ${templateRoot}`)
