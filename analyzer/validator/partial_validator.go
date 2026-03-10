@@ -67,22 +67,30 @@ func validateTemplateCall(
 	}
 
 	if entries, ok := registry[tmplName]; ok && len(entries) > 0 {
-		nt := entries[0]
-
-		partialScope := resolvePartialScope(contextArg, scopeStack, varMap, funcMaps)
-		partialVarMap := buildPartialVarMap(contextArg, partialScope, scopeStack, varMap)
-
-		partialErrors := ValidateTemplateContent(
-			nt.Content,
-			partialVarMap,
-			nt.TemplatePath,
-			baseDir,
-			templateRoot,
-			nt.Line,
-			registry,
-			funcMaps,
-		)
-		errors = append(errors, pinCallSite(partialErrors)...)
+		// Aggregate validation results for all call sites (contexts)
+		anyValid := false
+		allErrors := make([]ValidationResult, 0)
+		for _, nt := range entries {
+			partialScope := resolvePartialScope(contextArg, scopeStack, varMap, funcMaps)
+			partialVarMap := buildPartialVarMap(contextArg, partialScope, scopeStack, varMap)
+			partialErrors := ValidateTemplateContent(
+				nt.Content,
+				partialVarMap,
+				nt.TemplatePath,
+				baseDir,
+				templateRoot,
+				nt.Line,
+				registry,
+				funcMaps,
+			)
+			if len(partialErrors) == 0 {
+				anyValid = true
+			}
+			allErrors = append(allErrors, pinCallSite(partialErrors)...)
+		}
+		if !anyValid {
+			errors = append(errors, allErrors...)
+		}
 
 	} else if IsFileBasedPartial(tmplName) {
 		fullPath := filepath.Join(baseDir, templateRoot, tmplName)
