@@ -46,9 +46,24 @@ func ValidateTemplateFileStr(
 	templateName string,
 	baseDir, templateRoot string,
 	registry map[string][]NamedBlockEntry,
+	funcMaps FuncMapRegistry,
 ) []ValidationResult {
 	varMap := buildVarMap(vars)
-	return ValidateTemplateContent(content, varMap, templateName, baseDir, templateRoot, 1, registry)
+	return ValidateTemplateContent(content, varMap, templateName, baseDir, templateRoot, 1, registry, funcMaps)
+}
+
+// ValidateNamedBlockContent validates a named block body with a non-default line offset.
+func ValidateNamedBlockContent(
+	content string,
+	vars []ast.TemplateVar,
+	templateName string,
+	baseDir, templateRoot string,
+	lineOffset int,
+	registry map[string][]NamedBlockEntry,
+	funcMaps FuncMapRegistry,
+) []ValidationResult {
+	varMap := buildVarMap(vars)
+	return ValidateTemplateContent(content, varMap, templateName, baseDir, templateRoot, lineOffset, registry, funcMaps)
 }
 
 // ParseAllNamedTemplates exposes named template parsing for testing.

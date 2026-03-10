@@ -22,47 +22,35 @@ func parseTemplateAction(action string) []string {
 	rest := strings.TrimPrefix(action, "template ")
 	rest = strings.TrimSpace(rest)
 
-	var parts []string
-	var current strings.Builder
-	inString := false
-	stringChar := rune(0)
+	// Phase 1: extract the template name (first token, possibly quoted)
+	var tmplName string
+	remaining := rest
 
-	for _, r := range rest {
-		switch {
-		case !inString && (r == '"' || r == '`'):
-			// Start of string literal
-			inString = true
-			stringChar = r
-			if current.Len() > 0 {
-				parts = append(parts, strings.TrimSpace(current.String()))
-				current.Reset()
-			}
-
-		case inString && r == stringChar:
-			// End of string literal
-			inString = false
-			parts = append(parts, current.String())
-			current.Reset()
-
-		case !inString && (r == ' ' || r == '\n' || r == '\r' || r == '\t'):
-			// Whitespace separator (outside string)
-			if current.Len() > 0 {
-				parts = append(parts, strings.TrimSpace(current.String()))
-				current.Reset()
-			}
-
-		default:
-			// Regular character
-			current.WriteRune(r)
+	if len(rest) > 0 && (rest[0] == '"' || rest[0] == '`') {
+		// Quoted template name — find the closing quote
+		quoteChar := rest[0]
+		endIdx := strings.IndexByte(rest[1:], quoteChar)
+		if endIdx == -1 {
+			return []string{rest} // malformed, return as-is
 		}
+		tmplName = rest[1 : endIdx+1]
+		remaining = strings.TrimSpace(rest[endIdx+2:])
+	} else {
+		// Unquoted template name — take until whitespace
+		idx := strings.IndexAny(rest, " \t\n\r")
+		if idx == -1 {
+			return []string{rest}
+		}
+		tmplName = rest[:idx]
+		remaining = strings.TrimSpace(rest[idx+1:])
 	}
 
-	// Add any remaining content
-	if current.Len() > 0 {
-		parts = append(parts, strings.TrimSpace(current.String()))
+	if remaining == "" {
+		return []string{tmplName}
 	}
 
-	return parts
+	// Phase 2: everything after the template name is the context expression
+	return []string{tmplName, remaining}
 }
 
 // extractVariablesFromAction extracts all variable references from a template
@@ -134,8 +122,16 @@ func extractVariablesFromAction(action string, onVar func(string)) {
 //   - Not starting with .. (invalid)
 func emitVar(v string, onVar func(string)) {
 	v = strings.TrimSpace(v)
-	if (strings.HasPrefix(v, ".") || strings.HasPrefix(v, "$.")) &&
-		v != "." && v != "$" && !strings.HasPrefix(v, "..") {
+	if v == "." || v == "$" || strings.HasPrefix(v, "..") {
+		return
+	}
+
+	if strings.HasPrefix(v, ".") || strings.HasPrefix(v, "$.") {
+		onVar(v)
+		return
+	}
+
+	if strings.HasPrefix(v, "$") && len(v) > 1 && v[1] != '.' && v[1] != '$' {
 		onVar(v)
 	}
 }

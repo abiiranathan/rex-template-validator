@@ -50,9 +50,11 @@ import (
 //     used as a partial (concurrent).
 func ValidateTemplates(
 	renderCalls []ast.RenderCall,
+	funcMaps []ast.FuncMapInfo,
 	baseDir string,
 	templateRoot string,
 ) ([]ValidationResult, map[string][]NamedBlockEntry, []NamedBlockDuplicateError) {
+	funcMapRegistry := BuildFuncMapRegistry(funcMaps)
 	// Phase 1: Parse all named blocks from the entire template tree.
 	namedBlocks, namedBlockErrors := parseAllNamedTemplates(baseDir, templateRoot)
 
@@ -60,16 +62,16 @@ func ValidateTemplates(
 	renderVarsByTemplate := buildRenderVarIndex(renderCalls)
 
 	// Phase 3: Find all templates used as partials to avoid validating them with empty context.
-	partialTargets := findPartialTargets(baseDir, templateRoot)
+	partialTargets := FindPartialTargets(baseDir, templateRoot)
 
 	// Phase 4: Validate render-call targets (existing behaviour).
-	renderErrors := validateRenderCallsConcurrently(renderCalls, baseDir, templateRoot, namedBlocks)
+	renderErrors := validateRenderCallsConcurrently(renderCalls, baseDir, templateRoot, namedBlocks, partialTargets, funcMapRegistry)
 
 	// Phase 5: Validate all files in the tree not already covered.
-	treeErrors := validateTemplateTree(baseDir, templateRoot, namedBlocks, renderVarsByTemplate, partialTargets)
+	treeErrors := validateTemplateTree(baseDir, templateRoot, namedBlocks, renderVarsByTemplate, partialTargets, funcMapRegistry)
 
 	// Phase 6: Validate named blocks not already covered by a render call.
-	blockErrors := validateOrphanedNamedBlocks(namedBlocks, renderVarsByTemplate, baseDir, templateRoot, partialTargets)
+	blockErrors := validateOrphanedNamedBlocks(namedBlocks, renderVarsByTemplate, baseDir, templateRoot, partialTargets, funcMapRegistry)
 
 	allErrors := append(renderErrors, treeErrors...)
 	allErrors = append(allErrors, blockErrors...)
@@ -77,10 +79,18 @@ func ValidateTemplates(
 	return allErrors, namedBlocks, namedBlockErrors
 }
 
+func BuildFuncMapRegistry(funcMaps []ast.FuncMapInfo) FuncMapRegistry {
+	registry := make(FuncMapRegistry, len(funcMaps))
+	for _, funcMap := range funcMaps {
+		registry[funcMap.Name] = funcMap
+	}
+	return registry
+}
+
 var templateRegex = regexp.MustCompile(`\{\{-?\s*(?:template|block|define)\s+["'\x60]([^"'\x60]+)["'\x60]`)
 
-// findPartialTargets scans all template files to find targets of {{template "..."}} or {{block "..."}} calls.
-func findPartialTargets(baseDir, templateRoot string) map[string]bool {
+// FindPartialTargets scans all template files to find targets of {{template "..."}} or {{block "..."}} calls.
+func FindPartialTargets(baseDir, templateRoot string) map[string]bool {
 	targets := make(map[string]bool)
 
 	root := filepath.Join(baseDir, templateRoot)
@@ -136,6 +146,7 @@ func validateTemplateTree(
 	namedBlocks map[string][]NamedBlockEntry,
 	renderVarsByTemplate map[string][]ast.TemplateVar,
 	partialTargets map[string]bool,
+	funcMaps FuncMapRegistry,
 ) []ValidationResult {
 	root := filepath.Join(baseDir, templateRoot)
 
@@ -193,6 +204,7 @@ func validateTemplateTree(
 				baseDir,
 				templateRoot,
 				namedBlocks,
+				funcMaps,
 			)...)
 		}
 		return errs
@@ -208,6 +220,7 @@ func validateOrphanedNamedBlocks(
 	baseDir string,
 	templateRoot string,
 	partialTargets map[string]bool,
+	funcMaps FuncMapRegistry,
 ) []ValidationResult {
 	type workItem struct {
 		entry NamedBlockEntry
@@ -250,6 +263,7 @@ func validateOrphanedNamedBlocks(
 				templateRoot,
 				item.entry.Line,
 				namedBlocks,
+				funcMaps,
 			)...)
 		}
 		return errs
@@ -302,6 +316,8 @@ func validateRenderCallsConcurrently(
 	baseDir string,
 	templateRoot string,
 	namedBlocks map[string][]NamedBlockEntry,
+	partialTargets map[string]bool,
+	funcMaps FuncMapRegistry,
 ) []ValidationResult {
 	if len(renderCalls) == 0 {
 		return nil
@@ -311,10 +327,15 @@ func validateRenderCallsConcurrently(
 		var errors []ValidationResult
 		for _, i := range chunk {
 			rc := renderCalls[i]
+
+			if _, isNamedBlock := namedBlocks[rc.Template]; isNamedBlock && partialTargets[rc.Template] {
+				continue
+			}
+
 			templatePath := filepath.Join(baseDir, templateRoot, rc.Template)
 
 			rcErrors := ValidateTemplateFile(
-				templatePath, rc.Vars, rc.Template, baseDir, templateRoot, namedBlocks,
+				templatePath, rc.Vars, rc.Template, baseDir, templateRoot, namedBlocks, funcMaps,
 			)
 
 			for j := range rcErrors {
@@ -339,7 +360,23 @@ func ValidateTemplateFile(
 	templateName string,
 	baseDir, templateRoot string,
 	registry map[string][]NamedBlockEntry,
+	funcMaps ...FuncMapRegistry,
 ) []ValidationResult {
+	effectiveFuncMaps := optionalFuncMapRegistry(funcMaps...)
+	if entry, ok := findOverlayTemplateEntry(registry, templateName); ok {
+		varMap := buildVarMap(vars)
+		return ValidateTemplateContent(
+			entry.Content,
+			varMap,
+			entry.TemplatePath,
+			baseDir,
+			templateRoot,
+			1,
+			registry,
+			effectiveFuncMaps,
+		)
+	}
+
 	content, err := os.ReadFile(templatePath)
 	if err != nil {
 		if entries, ok := registry[templateName]; ok && len(entries) > 0 {
@@ -353,6 +390,7 @@ func ValidateTemplateFile(
 				templateRoot,
 				entry.Line,
 				registry,
+				effectiveFuncMaps,
 			)
 		}
 
@@ -380,7 +418,23 @@ func ValidateTemplateFile(
 		templateRoot,
 		1,
 		registry,
+		effectiveFuncMaps,
 	)
+}
+
+func findOverlayTemplateEntry(registry map[string][]NamedBlockEntry, templateName string) (NamedBlockEntry, bool) {
+	entries, ok := registry[templateName]
+	if !ok {
+		return NamedBlockEntry{}, false
+	}
+
+	for _, entry := range entries {
+		if entry.Name == templateName && entry.TemplatePath == templateName {
+			return entry, true
+		}
+	}
+
+	return NamedBlockEntry{}, false
 }
 
 // buildVarMap converts a slice of TemplateVar to a map for O(1) lookup.

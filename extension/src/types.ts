@@ -93,6 +93,23 @@ export interface AnalysisResult {
   types?: Record<string, FieldInfo[]>;
 }
 
+export interface GoTemplateValidationResult {
+  validationErrors: GoValidationError[];
+  hasContext: boolean;
+}
+
+export interface ExpressionTypeResult {
+  typeStr: string;
+  fields?: FieldInfo[];
+  isSlice?: boolean;
+  isMap?: boolean;
+  elemType?: string;
+  keyType?: string;
+  params?: ParamInfo[];
+  returns?: ParamInfo[];
+  doc?: string;
+}
+
 // ─── Named Block Registry ──────────────────────────────────────────────────────
 
 /**

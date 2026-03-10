@@ -474,9 +474,12 @@ export class ScopeUtils {
             this.processAssignment(node, vars, scopeStack, blockLocals);
 
             const isTemplateCall = node.kind === 'partial' && node.partialName === blockName;
+            const isBlockCall = node.kind === 'block' && node.blockName === blockName;
 
-            if (isTemplateCall) {
-                const contextArg = node.partialContext ?? '.';
+            if (isTemplateCall || isBlockCall) {
+                const contextArg = isTemplateCall
+                    ? (node.partialContext ?? '.')
+                    : this.rawBlockContext(node);
                 const normalizedCtx = normalizeDictArg(contextArg);
 
                 if (normalizedCtx === '.' || normalizedCtx === '') {
@@ -614,6 +617,17 @@ export class ScopeUtils {
             }
         }
         return null;
+    }
+
+    private rawBlockContext(node: TemplateNode): string {
+        if (node.path.length === 0) {
+            return '.';
+        }
+        if (node.path[0] === '$') {
+            if (node.path.length === 1) return '$';
+            return '$.' + node.path.slice(1).join('.');
+        }
+        return '.' + node.path.join('.');
     }
 
     findDefineNodeInAST(
@@ -1064,13 +1078,14 @@ export class ScopeUtils {
         }
 
         const localCtx = this.findCallSiteContext(currentFileNodes, blockName, currentFileVars, []);
-        if (localCtx) {
-            if ((!localCtx.fields || localCtx.fields.length === 0) && blockCtx) {
-                const synthFields = [...blockCtx.vars.values()] as unknown as FieldInfo[];
-                if (synthFields.length > 0) {
-                    return { ...localCtx, fields: synthFields };
-                }
-            }
+
+        // When the local call resolves to an empty-field context (e.g. the block
+        // definition itself with no file-level context), look for cross-file
+        // callers first — they may have the real scope.  Only fall back to the
+        // local result if no cross-file caller is found.
+        const localHasFields = localCtx && localCtx.fields && localCtx.fields.length > 0;
+
+        if (localCtx && localHasFields) {
             return localCtx;
         }
 
@@ -1096,10 +1111,24 @@ export class ScopeUtils {
                             return { ...callCtx, fields: synthFields };
                         }
                     }
-                    return callCtx;
+                    if (callCtx.fields && callCtx.fields.length > 0) {
+                        return callCtx;
+                    }
                 }
             } catch { /* ignore */ }
         }
+
+        // No cross-file caller found — fall back to local context
+        if (localCtx) {
+            if ((!localCtx.fields || localCtx.fields.length === 0) && blockCtx) {
+                const synthFields = [...blockCtx.vars.values()] as unknown as FieldInfo[];
+                if (synthFields.length > 0) {
+                    return { ...localCtx, fields: synthFields };
+                }
+            }
+            return localCtx;
+        }
+
         return null;
     }
 }

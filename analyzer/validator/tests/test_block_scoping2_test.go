@@ -30,10 +30,10 @@ func TestBlockScoping2(t *testing.T) {
 	// intentionally DO NOT add .Name to root scope, because . is the root, not the Drug!
 
 	errs := validator.ValidateTemplateContent(content, varMap, "test.html", ".", ".", 1, nil)
-	for _, e := range errs {
-		t.Logf("Error: %s (variable: %s)", e.Message, e.Variable)
-	}
 	if len(errs) > 0 {
-		t.Errorf("Expected some errors or no errors? Let's see")
+		for _, e := range errs {
+			t.Logf("Error: %s (variable: %s)", e.Message, e.Variable)
+		}
+		t.Fatalf("expected no validation errors, got %d", len(errs))
 	}
 }

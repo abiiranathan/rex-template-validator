@@ -6,6 +6,7 @@
 
 import * as vscode from 'vscode';
 import {
+    ExpressionTypeResult,
     FieldInfo,
     FuncMapInfo,
     ScopeFrame,
@@ -17,6 +18,7 @@ import { TemplateParser, resolvePath, ResolveResult } from './templateParser';
 import { KnowledgeGraphBuilder } from './knowledgeGraph';
 import { inferExpressionType, TypeResult } from './compiler/expressionParser';
 import { ScopeUtils } from './scopeUtils';
+import { GoAnalyzer } from './analyzer';
 
 /**
  * HoverProvider resolves hover information for template variables, fields,
@@ -26,6 +28,7 @@ export class HoverProvider {
     private readonly parser: TemplateParser;
     private readonly graphBuilder: KnowledgeGraphBuilder;
     private readonly scope: ScopeUtils;
+    private readonly analyzer: GoAnalyzer;
 
     // A registry of built-in functions to provide signatures and docs on hover
     private readonly builtInFunctions: Map<string, FuncMapInfo> = new Map([
@@ -56,10 +59,11 @@ export class HoverProvider {
         ['mod', { name: 'mod', params: [{ name: 'a', type: 'any' }, { name: 'b', type: 'any' }], returns: [{ type: 'any' }], doc: 'Returns the remainder of a / b' }]
     ]);
 
-    constructor(graphBuilder: KnowledgeGraphBuilder, scope: ScopeUtils) {
+    constructor(graphBuilder: KnowledgeGraphBuilder, scope: ScopeUtils, analyzer: GoAnalyzer) {
         this.graphBuilder = graphBuilder;
         this.parser = scope.parser;
         this.scope = scope;
+        this.analyzer = analyzer;
     }
 
     // ── Public API ─────────────────────────────────────────────────────────────
@@ -166,11 +170,7 @@ export class HoverProvider {
                 const cleanExpr = node.rawText
                     .replace(/^\{\{-?\s*/, '')
                     .replace(/\s*-?\}\}$/, '');
-                const exprType = inferExpressionType(
-                    cleanExpr, hitVars, stack, hitLocals,
-                    this.graphBuilder.getGraph().funcMaps,
-                    this.scope.buildFieldResolver(hitVars, stack)
-                );
+                const exprType = await this.inferExpressionType(document, cleanExpr, hitVars, stack, hitLocals);
 
                 if (exprType) {
                     result = {
@@ -194,6 +194,39 @@ export class HoverProvider {
         return this.buildHoverForPath(
             pathToUse, result, hitVars, stack, hitLocals, exprText
         );
+    }
+
+    private async inferExpressionType(
+        document: vscode.TextDocument,
+        expr: string,
+        vars: Map<string, TemplateVar>,
+        stack: ScopeFrame[],
+        locals?: Map<string, TemplateVar>,
+    ): Promise<ExpressionTypeResult | TypeResult | null> {
+        const workspaceRoot = vscode.workspace.getWorkspaceFolder(document.uri)?.uri.fsPath
+            ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+
+        if (workspaceRoot) {
+            try {
+                const result = await this.analyzer.inferExpressionType(workspaceRoot, expr, vars, stack, locals);
+                if (result) return result;
+            } catch {
+                // Fall back to the local inferencer below.
+            }
+        }
+
+        try {
+            return inferExpressionType(
+                expr,
+                vars,
+                stack,
+                locals,
+                this.graphBuilder.getGraph().funcMaps,
+                this.scope.buildFieldResolver(vars, stack)
+            );
+        } catch {
+            return null;
+        }
     }
 
     // ── Private helpers ────────────────────────────────────────────────────────

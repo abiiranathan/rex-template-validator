@@ -190,6 +190,20 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 		return nil
 	}
 
+	if strings.HasPrefix(varExpr, "$") && !strings.HasPrefix(varExpr, "$.") {
+		localVar, remainder, ok := lookupLocalVar(varExpr, scopeStack)
+		if !ok {
+			return undefinedVariableError(varExpr)
+		}
+		if len(remainder) == 0 {
+			return nil
+		}
+		if len(localVar.Fields) == 0 && !localVar.IsMap && !localVar.IsSlice {
+			return nil
+		}
+		return validateNestedFields(varExpr, remainder, localVar.Fields, localVar.TypeStr, localVar.IsMap, localVar.ElemType)
+	}
+
 	varExpr = strings.TrimRight(varExpr, ".")
 	parts := strings.Split(varExpr, ".")
 	if len(parts) < 2 {
@@ -205,7 +219,7 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 
 		if currentScope.IsMap {
 			if len(parts) > 2 {
-				return validateNestedFields(parts[2:], nil, currentScope.ElemType, false, "")
+				return validateNestedFields(varExpr, parts[2:], nil, currentScope.ElemType, false, "")
 			}
 			return nil
 		}
@@ -221,11 +235,16 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 
 		if foundField != nil {
 			if len(parts) > 2 {
-				return validateNestedFields(parts[2:], foundField.Fields, foundField.TypeStr, foundField.IsMap, foundField.ElemType)
+				return validateNestedFields(varExpr, parts[2:], foundField.Fields, foundField.TypeStr, foundField.IsMap, foundField.ElemType)
 			}
 			return nil
 		}
-		return nil
+
+		if len(currentScope.Fields) == 0 {
+			return nil
+		}
+
+		return undefinedVariableError(varExpr)
 	}
 
 	// ── Root variable access ───────────────────────────────────────────────
@@ -246,7 +265,11 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 		// Only report an error when we have concrete field metadata for the root
 		// scope. When the scope is unresolved (empty fields) stay permissive to
 		// avoid false positives from partials rendered from multiple templates.
-		return nil
+		if len(rootScope.Fields) == 0 && len(varMap) == 0 {
+			return nil
+		}
+
+		return undefinedVariableError(varExpr)
 	}
 
 	// ── Nested access: .Var.Field.SubField ─────────────────────────────────
@@ -262,11 +285,13 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 				if f.IsMap && len(parts) == 3 {
 					return nil
 				}
-				return validateNestedFields(parts[2:], f.Fields, f.TypeStr, f.IsMap, f.ElemType)
+				return validateNestedFields(varExpr, parts[2:], f.Fields, f.TypeStr, f.IsMap, f.ElemType)
 			}
 		}
-		// Root variable not found — permissive, may be injected externally.
-		return nil
+		if len(rootScope.Fields) == 0 && len(varMap) == 0 {
+			return nil
+		}
+		return undefinedVariableError(varExpr)
 	}
 
 	// rootVarInfo is guaranteed non-nil beyond this point.
@@ -274,7 +299,7 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 		return nil
 	}
 
-	return validateNestedFields(parts[2:], rootVarInfo.Fields, rootVarInfo.TypeStr, rootVarInfo.IsMap, rootVarInfo.ElemType)
+	return validateNestedFields(varExpr, parts[2:], rootVarInfo.Fields, rootVarInfo.TypeStr, rootVarInfo.IsMap, rootVarInfo.ElemType)
 }
 
 // validateNestedFields validates a field/method access path through a type
@@ -305,7 +330,7 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 // Returns: ValidationResult pointer if error found, nil if valid
 //
 // Thread-safety: Read-only operations, safe for concurrent calls.
-func validateNestedFields(fieldParts []string, fields []ast.FieldInfo, parentTypeName string, isMap bool, elemType string) *ValidationResult {
+func validateNestedFields(fullExpr string, fieldParts []string, fields []ast.FieldInfo, parentTypeName string, isMap bool, elemType string) *ValidationResult {
 	currentFields := fields
 	parentType := parentTypeName
 	currentIsMap := isMap
@@ -394,8 +419,11 @@ func validateNestedFields(fieldParts []string, fields []ast.FieldInfo, parentTyp
 				return nil
 			}
 
-			// Default to silence false positives
-			return nil
+			if len(currentFields) == 0 {
+				return nil
+			}
+
+			return undefinedVariableError(fullExpr)
 		}
 
 		// Move to next level in hierarchy
@@ -405,6 +433,14 @@ func validateNestedFields(fieldParts []string, fields []ast.FieldInfo, parentTyp
 	}
 
 	return nil
+}
+
+func undefinedVariableError(varExpr string) *ValidationResult {
+	return &ValidationResult{
+		Variable: varExpr,
+		Message:  `Template variable "` + varExpr + `" is not defined in the current scope`,
+		Severity: "error",
+	}
 }
 
 // validateContextArg checks whether a template call context expression
@@ -420,13 +456,18 @@ func validateContextArg(
 	contextArg string,
 	scopeStack []ScopeType,
 	varMap map[string]ast.TemplateVar,
-) bool {
+	funcMaps FuncMapRegistry,
+) *ValidationResult {
 	// Special cases always valid
 	if contextArg == "" || contextArg == "." || contextArg == "$" {
-		return true
+		return nil
+	}
+
+	inferred := InferExpressionType(contextArg, varMap, scopeStack, nil, funcMaps, nil)
+	if inferred != nil {
+		return nil
 	}
 
 	// Validate using standard validation logic
-	result := validateVariableInScope(contextArg, scopeStack, varMap)
-	return result == nil
+	return validateVariableInScope(contextArg, scopeStack, varMap)
 }

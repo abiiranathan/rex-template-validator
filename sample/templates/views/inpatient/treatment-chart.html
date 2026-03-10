@@ -62,8 +62,8 @@
     {{ $large := index $.billedDrugs 0 }}
     {{ $drugName := $large.Name }}
 
-    {{ $authUser := call getAuthUser 1 }}
-    {{ $authUser.PrintName }}
+    {{ $authUser := getAuthUser 1 }}
+    {{ $authUser.Name }}
 
     {{/* ------------------------------------------------------------------ */}}
     {{/* Complex nested block: role-aware prescription summary */}}

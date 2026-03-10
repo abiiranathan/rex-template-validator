@@ -1,6 +1,7 @@
 package validator_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/rex-template-analyzer/ast"
@@ -73,59 +74,64 @@ var sharedVars = map[string]ast.TemplateVar{
 // Test prefix) and was therefore never executed by go test.
 func TestValidateTemplateContent(t *testing.T) {
 	tests := []struct {
-		name     string
-		content  string
-		expected []validator.ValidationResult
+		name            string
+		content         string
+		wantErr         bool
+		wantVariable    string
+		wantMessagePart string
 	}{
 		// --- Basic variable access ---
 		{
-			name:     "Valid variable access",
-			content:  "{{ .User.Name }}",
-			expected: nil,
+			name:    "Valid variable access",
+			content: "{{ .User.Name }}",
 		},
 		{
-			name:     "Invalid variable access",
-			content:  "{{ .User.Invalid }}",
-			expected: nil,
+			name:            "Invalid variable access",
+			content:         "{{ .User.Invalid }}",
+			wantErr:         true,
+			wantVariable:    ".User.Invalid",
+			wantMessagePart: "not defined",
 		},
 		{
-			name:     "Valid nested variable access",
-			content:  "{{ .User.Address.City }}",
-			expected: nil,
+			name:    "Valid nested variable access",
+			content: "{{ .User.Address.City }}",
 		},
 		{
-			name:     "Invalid nested variable access",
-			content:  "{{ .User.Address.Invalid }}",
-			expected: nil,
+			name:            "Invalid nested variable access",
+			content:         "{{ .User.Address.Invalid }}",
+			wantErr:         true,
+			wantVariable:    ".User.Address.Invalid",
+			wantMessagePart: "not defined",
 		},
 
 		// --- Range scope ---
 		{
-			name:     "Valid range access",
-			content:  "{{ range .Items }}{{ .Title }}{{ end }}",
-			expected: nil,
+			name:    "Valid range access",
+			content: "{{ range .Items }}{{ .Title }}{{ end }}",
 		},
 		{
-			name:     "Invalid range access",
-			content:  "{{ range .Items }}{{ .Invalid }}{{ end }}",
-			expected: nil,
+			name:            "Invalid range access",
+			content:         "{{ range .Items }}{{ .Invalid }}{{ end }}",
+			wantErr:         true,
+			wantVariable:    ".Invalid",
+			wantMessagePart: "not defined",
 		},
 		{
-			name:     "Valid range with variable assignment",
-			content:  "{{ range $i := .Items }}{{ .Title }}{{ end }}",
-			expected: nil,
+			name:    "Valid range with variable assignment",
+			content: "{{ range $i := .Items }}{{ .Title }}{{ end }}",
 		},
 
 		// --- With scope ---
 		{
-			name:     "Valid with block",
-			content:  "{{ with .User }}{{ .Name }}{{ end }}",
-			expected: nil,
+			name:    "Valid with block",
+			content: "{{ with .User }}{{ .Name }}{{ end }}",
 		},
 		{
-			name:     "Invalid with block access",
-			content:  "{{ with .User }}{{ .Invalid }}{{ end }}",
-			expected: nil,
+			name:            "Invalid with block access",
+			content:         "{{ with .User }}{{ .Invalid }}{{ end }}",
+			wantErr:         true,
+			wantVariable:    ".Invalid",
+			wantMessagePart: "not defined",
 		},
 		{
 			name: "Valid nested scoped access inside with (bug reproduction)",
@@ -134,7 +140,6 @@ func TestValidateTemplateContent(t *testing.T) {
 					{{ .Address.City }}
 				{{ end }}
 			`,
-			expected: nil,
 		},
 		{
 			name: "Invalid nested scoped access inside with",
@@ -143,80 +148,81 @@ func TestValidateTemplateContent(t *testing.T) {
 					{{ .Address.Invalid }}
 				{{ end }}
 			`,
-			expected: nil,
+			wantErr:         true,
+			wantVariable:    ".Address.Invalid",
+			wantMessagePart: "not defined",
 		},
 
 		// --- Map support ---
 		{
-			name:     "Valid map key access",
-			content:  "{{ .MyMap.someKey.Name }}",
-			expected: nil,
+			name:    "Valid map key access",
+			content: "{{ .MyMap.someKey.Name }}",
 		},
 		{
-			name:     "Invalid field on map value",
-			content:  "{{ .MyMap.someKey.Invalid }}",
-			expected: nil,
+			name:            "Invalid field on map value",
+			content:         "{{ .MyMap.someKey.Invalid }}",
+			wantErr:         true,
+			wantVariable:    ".MyMap.someKey.Invalid",
+			wantMessagePart: "not defined",
 		},
 		{
-			name:     "Range over map gives value as dot",
-			content:  "{{ range .MyMap }}{{ .Name }}{{ end }}",
-			expected: nil,
+			name:    "Range over map gives value as dot",
+			content: "{{ range .MyMap }}{{ .Name }}{{ end }}",
 		},
 		{
-			name:     "Nested map access",
-			content:  "{{ .NestedMap.Key1.Key2.Name }}",
-			expected: nil,
+			name:    "Nested map access",
+			content: "{{ .NestedMap.Key1.Key2.Name }}",
 		},
 		{
-			name:     "Invalid nested map access",
-			content:  "{{ .NestedMap.Key1.Key2.Invalid }}",
-			expected: nil,
+			name:            "Invalid nested map access",
+			content:         "{{ .NestedMap.Key1.Key2.Invalid }}",
+			wantErr:         true,
+			wantVariable:    ".NestedMap.Key1.Key2.Invalid",
+			wantMessagePart: "not defined",
 		},
 
 		// --- Named block discrimination ---
 		{
-			name:     "Named block template call is not resolved as a file",
-			content:  `{{ template "content" . }}`,
-			expected: nil,
+			name:    "Named block template call is not resolved as a file",
+			content: `{{ template "content" . }}`,
 		},
 		{
-			name:     "Named block with dot-only context is not resolved as a file",
-			content:  `{{ template "sidebar" . }}`,
-			expected: nil,
+			name:    "Named block with dot-only context is not resolved as a file",
+			content: `{{ template "sidebar" . }}`,
 		},
 		{
-			name:     "Named block with variable context skips file resolution but validates var",
-			content:  `{{ template "header" .User }}`,
-			expected: nil,
+			name:    "Named block with variable context skips file resolution but validates var",
+			content: `{{ template "header" .User }}`,
 		},
 		{
-			name:     "Named block with invalid variable context still validates the variable",
-			content:  `{{ template "header" .NonExistent }}`,
-			expected: nil,
+			name:            "Named block with invalid variable context still validates the variable",
+			content:         `{{ template "header" .NonExistent }}`,
+			wantErr:         true,
+			wantVariable:    ".NonExistent",
+			wantMessagePart: "not defined",
 		},
 
 		// --- Dot reference ---
 		{
-			name:     "Bare dot is always valid",
-			content:  "{{ . }}",
-			expected: nil,
+			name:    "Bare dot is always valid",
+			content: "{{ . }}",
 		},
 		{
-			name:     "Dot passed to template is valid",
-			content:  `{{ template "block" . }}`,
-			expected: nil,
+			name:    "Dot passed to template is valid",
+			content: `{{ template "block" . }}`,
 		},
 
 		// --- if/else (no scope change) ---
 		{
-			name:     "Valid if block does not change scope",
-			content:  "{{ if .User.Name }}{{ .User.Age }}{{ end }}",
-			expected: nil,
+			name:    "Valid if block does not change scope",
+			content: "{{ if .User.Name }}{{ .User.Age }}{{ end }}",
 		},
 		{
-			name:     "Invalid variable inside if",
-			content:  "{{ if .User.Name }}{{ .User.Invalid }}{{ end }}",
-			expected: nil,
+			name:            "Invalid variable inside if",
+			content:         "{{ if .User.Name }}{{ .User.Invalid }}{{ end }}",
+			wantErr:         true,
+			wantVariable:    ".User.Invalid",
+			wantMessagePart: "not defined",
 		},
 	}
 
@@ -224,39 +230,68 @@ func TestValidateTemplateContent(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			got := validator.ValidateTemplateContent(tt.content, sharedVars, "test.html", ".", "", 1, nil)
 
-			if len(got) != len(tt.expected) {
-				t.Errorf("expected %d errors, got %d", len(tt.expected), len(got))
-				for i, err := range got {
-					t.Logf("Got[%d]: variable=%q message=%q line=%d col=%d",
-						i, err.Variable, err.Message, err.Line, err.Column)
+			if tt.wantErr {
+				if len(got) == 0 {
+					t.Fatalf("expected validation error, got none")
+				}
+				if tt.wantVariable != "" && got[0].Variable != tt.wantVariable {
+					t.Fatalf("expected variable %q, got %q", tt.wantVariable, got[0].Variable)
+				}
+				if tt.wantMessagePart != "" && !contains(got[0].Message, tt.wantMessagePart) {
+					t.Fatalf("expected message %q to contain %q", got[0].Message, tt.wantMessagePart)
 				}
 				return
 			}
 
-			for i := range got {
-				if got[i].Message != tt.expected[i].Message {
-					t.Errorf("[%d] message mismatch:\n  want: %q\n   got: %q",
-						i, tt.expected[i].Message, got[i].Message)
-				}
-				if got[i].Variable != tt.expected[i].Variable {
-					t.Errorf("[%d] variable mismatch:\n  want: %q\n   got: %q",
-						i, tt.expected[i].Variable, got[i].Variable)
-				}
-				if tt.expected[i].Severity != "" && got[i].Severity != tt.expected[i].Severity {
-					t.Errorf("[%d] severity mismatch:\n  want: %q\n   got: %q",
-						i, tt.expected[i].Severity, got[i].Severity)
-				}
-				if tt.expected[i].Line != 0 && got[i].Line != tt.expected[i].Line {
-					t.Errorf("[%d] line mismatch:\n  want: %d\n   got: %d",
-						i, tt.expected[i].Line, got[i].Line)
-				}
-				if tt.expected[i].Column != 0 && got[i].Column != tt.expected[i].Column {
-					t.Errorf("[%d] column mismatch:\n  want: %d\n   got: %d",
-						i, tt.expected[i].Column, got[i].Column)
-				}
+			if len(got) != 0 {
+				t.Fatalf("expected no validation errors, got %#v", got)
 			}
 		})
 	}
+}
+
+func TestValidateTemplateContentValidatesLocalNamedTemplateBodies(t *testing.T) {
+	content := `
+		{{ template "header" .User }}
+		{{ define "header" }}
+			{{ .Missing }}
+		{{ end }}
+	`
+
+	got := validator.ValidateTemplateContent(content, sharedVars, "test.html", ".", "", 1, nil)
+	if len(got) == 0 {
+		t.Fatal("expected validation error for missing variable inside local define body")
+	}
+	if got[0].Variable != ".Missing" {
+		t.Fatalf("expected missing variable .Missing, got %q", got[0].Variable)
+	}
+	if !contains(got[0].Message, "named template \"header\"") {
+		t.Fatalf("expected pinned named template message, got %q", got[0].Message)
+	}
+}
+
+func TestValidateTemplateContentValidatesBlockBodiesViaTemplateCallContext(t *testing.T) {
+	content := `
+		{{ template "header" .User }}
+		{{ block "header" .User }}
+			{{ .Missing }}
+		{{ end }}
+	`
+
+	got := validator.ValidateTemplateContent(content, sharedVars, "test.html", ".", "", 1, nil)
+	if len(got) == 0 {
+		t.Fatal("expected validation error for missing variable inside block body reached through template call")
+	}
+	if got[0].Variable != ".Missing" {
+		t.Fatalf("expected missing variable .Missing, got %q", got[0].Variable)
+	}
+	if !contains(got[0].Message, "named template \"header\"") {
+		t.Fatalf("expected pinned named template message, got %q", got[0].Message)
+	}
+}
+
+func contains(value, fragment string) bool {
+	return strings.Contains(value, fragment)
 }
 
 // TestIsFileBasedPartial directly tests block vs file discrimination.

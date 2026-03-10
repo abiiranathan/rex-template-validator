@@ -9,46 +9,33 @@ import (
 
 // resolvePartialScope determines what scope/type the context argument refers to
 // for a nested template call.
-//
-// Context argument types:
-//   - "." : Current scope (dot context)
-//   - ".VarName" : Specific variable from current scope
-//   - "$var" : Local pipeline variable (returns empty scope)
-//
-// Returns: ScopeType representing the context that will be passed to the nested template
 func resolvePartialScope(
 	contextArg string,
 	scopeStack []ScopeType,
 	varMap map[string]ast.TemplateVar,
+	funcMaps FuncMapRegistry,
 ) ScopeType {
-	if contextArg == "." {
-		// Pass current scope
-		if len(scopeStack) > 0 {
-			return scopeStack[len(scopeStack)-1]
+	if contextArg == "" || contextArg == "." || contextArg == "$" {
+		return resolveScopeFromExpression(contextArg, scopeStack, varMap, funcMaps)
+	}
+
+	// For complex expressions (like dict), use the robust expression inferencer
+	inferred := InferExpressionType(contextArg, varMap, scopeStack, nil, funcMaps, nil)
+	if inferred != nil {
+		return ScopeType{
+			TypeStr:  inferred.TypeStr,
+			Fields:   inferred.Fields,
+			IsSlice:  inferred.IsSlice,
+			IsMap:    inferred.IsMap,
+			KeyType:  inferred.KeyType,
+			ElemType: inferred.ElemType,
 		}
-		return ScopeType{IsRoot: true}
 	}
-
-	if strings.HasPrefix(contextArg, ".") {
-		// Specific variable access
-		return createScopeFromExpression(contextArg, scopeStack, varMap)
-	}
-
-	// Untracked local variable or other expression
-	return ScopeType{Fields: []ast.FieldInfo{}}
+	return resolveScopeFromExpression(contextArg, scopeStack, varMap, funcMaps)
 }
 
 // buildPartialVarMap constructs the variable map available to a nested template
 // based on the context argument.
-//
-// The resulting map represents what will be available as the dot (.) context
-// in the nested template.
-//
-// Context semantics:
-//   - "." : All variables from current scope
-//   - ".VarName" : Fields of VarName become top-level variables
-//
-// Returns: Map of variables available in the nested template
 func buildPartialVarMap(
 	contextArg string,
 	partialScope ScopeType,
@@ -56,6 +43,11 @@ func buildPartialVarMap(
 	varMap map[string]ast.TemplateVar,
 ) map[string]ast.TemplateVar {
 	result := make(map[string]ast.TemplateVar)
+
+	if contextArg == "$" {
+		maps.Copy(result, varMap)
+		return result
+	}
 
 	if contextArg == "." {
 		// Pass entire current scope
@@ -65,34 +57,30 @@ func buildPartialVarMap(
 				// Root scope: copy all variables
 				maps.Copy(result, varMap)
 			} else {
-				// Non-root scope: convert fields to variables
-				for _, f := range currentScope.Fields {
-					result[f.Name] = ast.TemplateVar{
-						Name:     f.Name,
-						TypeStr:  f.TypeStr,
-						Fields:   f.Fields,
-						IsSlice:  f.IsSlice,
-						IsMap:    f.IsMap,
-						KeyType:  f.KeyType,
-						ElemType: f.ElemType,
-					}
+				// Non-root scope: pass as "."
+				result["."] = ast.TemplateVar{
+					Name:     ".",
+					TypeStr:  currentScope.TypeStr,
+					Fields:   currentScope.Fields,
+					IsSlice:  currentScope.IsSlice,
+					IsMap:    currentScope.IsMap,
+					KeyType:  currentScope.KeyType,
+					ElemType: currentScope.ElemType,
 				}
 			}
 		}
 		return result
 	}
 
-	// Specific variable: its fields become top-level in nested template
-	for _, f := range partialScope.Fields {
-		result[f.Name] = ast.TemplateVar{
-			Name:     f.Name,
-			TypeStr:  f.TypeStr,
-			Fields:   f.Fields,
-			IsSlice:  f.IsSlice,
-			IsMap:    f.IsMap,
-			KeyType:  f.KeyType,
-			ElemType: f.ElemType,
-		}
+	// Specific variable: pass as "."
+	result["."] = ast.TemplateVar{
+		Name:     ".",
+		TypeStr:  partialScope.TypeStr,
+		Fields:   partialScope.Fields,
+		IsSlice:  partialScope.IsSlice,
+		IsMap:    partialScope.IsMap,
+		KeyType:  partialScope.KeyType,
+		ElemType: partialScope.ElemType,
 	}
 
 	return result
@@ -122,25 +110,10 @@ func createScopeFromRange(
 	expr string,
 	scopeStack []ScopeType,
 	varMap map[string]ast.TemplateVar,
+	funcMaps FuncMapRegistry,
 ) ScopeType {
 	expr = strings.TrimSpace(expr)
-
-	var collectionScope ScopeType
-
-	// Handle assignment syntax: $var := expr
-	if strings.Contains(expr, ":=") {
-		parts := strings.SplitN(expr, ":=", 2)
-		if len(parts) == 2 {
-			varExpr := strings.TrimSpace(parts[1])
-			collectionScope = createScopeFromExpression(varExpr, scopeStack, varMap)
-		} else {
-			// Fallback for malformed assignment
-			return ScopeType{Fields: []ast.FieldInfo{}}
-		}
-	} else {
-		// Simple range: {{range .Collection}}
-		collectionScope = createScopeFromExpression(expr, scopeStack, varMap)
-	}
+	collectionScope := resolveScopeFromExpression(expr, scopeStack, varMap, funcMaps)
 
 	// If we are iterating over a map or slice, the scope inside the range
 	// corresponds to the element type, not the collection type.
@@ -211,8 +184,302 @@ func createScopeFromWith(
 	expr string,
 	scopeStack []ScopeType,
 	varMap map[string]ast.TemplateVar,
+	funcMaps FuncMapRegistry,
 ) ScopeType {
-	return createScopeFromExpression(expr, scopeStack, varMap)
+	return resolveScopeFromExpression(expr, scopeStack, varMap, funcMaps)
+}
+
+func resolveScopeFromExpression(
+	expr string,
+	scopeStack []ScopeType,
+	varMap map[string]ast.TemplateVar,
+	funcMaps FuncMapRegistry,
+) ScopeType {
+	expr = unwrapExpression(expr)
+	if expr == "" {
+		return ScopeType{Fields: []ast.FieldInfo{}}
+	}
+
+	if scope, ok := createScopeFromFunctionExpression(expr, funcMaps); ok {
+		return scope
+	}
+
+	if strings.HasPrefix(expr, "index ") {
+		return createScopeFromIndexExpression(expr, scopeStack, varMap, funcMaps)
+	}
+
+	if expr == "$" {
+		return rootScopeFromStack(scopeStack, varMap)
+	}
+
+	if strings.HasPrefix(expr, "$.") {
+		return createScopeFromRootExpression(expr, scopeStack, varMap)
+	}
+
+	if strings.HasPrefix(expr, "$") {
+		return createScopeFromLocalExpression(expr, scopeStack)
+	}
+
+	if strings.HasPrefix(expr, ".") {
+		return createScopeFromExpression(expr, scopeStack, varMap)
+	}
+
+	return ScopeType{Fields: []ast.FieldInfo{}}
+}
+
+func childScope(scope ScopeType) ScopeType {
+	return ScopeType{
+		IsRoot:   scope.IsRoot,
+		VarName:  scope.VarName,
+		TypeStr:  scope.TypeStr,
+		ElemType: scope.ElemType,
+		KeyType:  scope.KeyType,
+		Fields:   scope.Fields,
+		IsSlice:  scope.IsSlice,
+		IsMap:    scope.IsMap,
+	}
+}
+
+func rootScopeFromStack(scopeStack []ScopeType, varMap map[string]ast.TemplateVar) ScopeType {
+	if len(scopeStack) > 0 {
+		root := childScope(scopeStack[0])
+		root.IsRoot = true
+		return root
+	}
+	return buildRootScope(varMap)
+}
+
+func createScopeFromRootExpression(expr string, scopeStack []ScopeType, varMap map[string]ast.TemplateVar) ScopeType {
+	parts := strings.Split(strings.TrimPrefix(expr, "$."), ".")
+	if len(parts) == 0 || parts[0] == "" {
+		return rootScopeFromStack(scopeStack, varMap)
+	}
+
+	rootVar, ok := lookupRootVar(parts[0], scopeStack, varMap)
+	if !ok {
+		return ScopeType{Fields: []ast.FieldInfo{}}
+	}
+
+	return walkScopePath(scopeFromTemplateVar(rootVar), parts[1:])
+}
+
+func createScopeFromLocalExpression(expr string, scopeStack []ScopeType) ScopeType {
+	localVar, remainder, ok := lookupLocalVar(expr, scopeStack)
+	if !ok {
+		return ScopeType{Fields: []ast.FieldInfo{}}
+	}
+	return walkScopePath(scopeFromTemplateVar(localVar), remainder)
+}
+
+func createScopeFromIndexExpression(expr string, scopeStack []ScopeType, varMap map[string]ast.TemplateVar, funcMaps FuncMapRegistry) ScopeType {
+	parts := strings.Fields(expr)
+	if len(parts) < 2 {
+		return ScopeType{Fields: []ast.FieldInfo{}}
+	}
+
+	baseScope := resolveScopeFromExpression(parts[1], scopeStack, varMap, funcMaps)
+	return elementScopeFromCollection(baseScope)
+}
+
+func createScopeFromFunctionExpression(expr string, funcMaps FuncMapRegistry) (ScopeType, bool) {
+	if len(funcMaps) == 0 {
+		return ScopeType{}, false
+	}
+
+	tokens := strings.Fields(unwrapExpression(expr))
+	if len(tokens) == 0 {
+		return ScopeType{}, false
+	}
+
+	funcName := strings.Trim(tokens[0], "()")
+	if funcName == "call" {
+		if len(tokens) < 2 {
+			return ScopeType{}, false
+		}
+		funcName = strings.Trim(tokens[1], "()")
+	}
+
+	if !isFunctionIdentifier(funcName) {
+		return ScopeType{}, false
+	}
+
+	funcMap, ok := funcMaps[funcName]
+	if !ok || len(funcMap.Returns) == 0 {
+		return ScopeType{}, false
+	}
+
+	primaryReturn := funcMap.Returns[0]
+	returnFields := primaryReturn.Fields
+	if len(returnFields) == 0 && len(funcMap.ReturnTypeFields) > 0 {
+		returnFields = funcMap.ReturnTypeFields
+	}
+
+	return ScopeType{
+		TypeStr: primaryReturn.TypeStr,
+		Fields:  returnFields,
+	}, true
+}
+
+func elementScopeFromCollection(scope ScopeType) ScopeType {
+	if !scope.IsMap && !scope.IsSlice {
+		return scope
+	}
+
+	baseType := scope.ElemType
+	for strings.HasPrefix(baseType, "*") {
+		baseType = baseType[1:]
+	}
+
+	newScope := childScope(scope)
+	newScope.IsRoot = false
+	newScope.VarName = scope.VarName
+	newScope.TypeStr = scope.ElemType
+	newScope.KeyType = ""
+	newScope.IsMap = false
+	newScope.IsSlice = false
+	newScope.ElemType = ""
+
+	if strings.HasPrefix(baseType, "map[") {
+		depth := 0
+		splitIdx := -1
+		for i := 3; i < len(baseType); i++ {
+			if baseType[i] == '[' {
+				depth++
+			} else if baseType[i] == ']' {
+				depth--
+				if depth == 0 {
+					splitIdx = i
+					break
+				}
+			}
+		}
+		if splitIdx != -1 {
+			newScope.IsMap = true
+			newScope.ElemType = strings.TrimSpace(baseType[splitIdx+1:])
+		}
+	} else if strings.HasPrefix(baseType, "[]") {
+		newScope.IsSlice = true
+		newScope.ElemType = baseType[2:]
+	}
+
+	return newScope
+}
+
+func walkScopePath(scope ScopeType, parts []string) ScopeType {
+	current := childScope(scope)
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+
+		if current.IsMap {
+			current = elementScopeFromCollection(current)
+			continue
+		}
+
+		found := false
+		for _, f := range current.Fields {
+			if f.Name == part {
+				current = ScopeType{
+					VarName:  current.VarName,
+					TypeStr:  f.TypeStr,
+					Fields:   f.Fields,
+					IsSlice:  f.IsSlice,
+					IsMap:    f.IsMap,
+					KeyType:  f.KeyType,
+					ElemType: f.ElemType,
+				}
+				found = true
+				break
+			}
+		}
+		if !found {
+			return ScopeType{Fields: []ast.FieldInfo{}}
+		}
+	}
+	return current
+}
+
+func scopeFromTemplateVar(v ast.TemplateVar) ScopeType {
+	return ScopeType{
+		VarName:  v.Name,
+		TypeStr:  v.TypeStr,
+		Fields:   v.Fields,
+		IsSlice:  v.IsSlice,
+		IsMap:    v.IsMap,
+		KeyType:  v.KeyType,
+		ElemType: v.ElemType,
+	}
+}
+
+func scopeToTemplateVar(name string, scope ScopeType) ast.TemplateVar {
+	return ast.TemplateVar{
+		Name:     name,
+		TypeStr:  scope.TypeStr,
+		Fields:   scope.Fields,
+		IsSlice:  scope.IsSlice,
+		IsMap:    scope.IsMap,
+		KeyType:  scope.KeyType,
+		ElemType: scope.ElemType,
+	}
+}
+
+func lookupRootVar(name string, scopeStack []ScopeType, varMap map[string]ast.TemplateVar) (ast.TemplateVar, bool) {
+	if v, ok := varMap[name]; ok {
+		return v, true
+	}
+
+	if len(scopeStack) == 0 {
+		return ast.TemplateVar{}, false
+	}
+
+	for _, f := range scopeStack[0].Fields {
+		if f.Name == name {
+			return ast.TemplateVar{
+				Name:     f.Name,
+				TypeStr:  f.TypeStr,
+				Fields:   f.Fields,
+				IsSlice:  f.IsSlice,
+				IsMap:    f.IsMap,
+				KeyType:  f.KeyType,
+				ElemType: f.ElemType,
+			}, true
+		}
+	}
+
+	return ast.TemplateVar{}, false
+}
+
+func lookupLocalVar(expr string, scopeStack []ScopeType) (ast.TemplateVar, []string, bool) {
+	parts := strings.Split(expr, ".")
+	if len(parts) == 0 || parts[0] == "" {
+		return ast.TemplateVar{}, nil, false
+	}
+
+	name := parts[0]
+	for i := len(scopeStack) - 1; i >= 0; i-- {
+		locals := scopeStack[i].Locals
+		if locals == nil {
+			continue
+		}
+		if v, ok := locals[name]; ok {
+			return v, parts[1:], true
+		}
+	}
+
+	return ast.TemplateVar{}, nil, false
+}
+
+func unwrapExpression(expr string) string {
+	trimmed := strings.TrimSpace(expr)
+	for strings.HasPrefix(trimmed, "(") && strings.HasSuffix(trimmed, ")") {
+		inner := strings.TrimSpace(trimmed[1 : len(trimmed)-1])
+		if inner == trimmed {
+			break
+		}
+		trimmed = inner
+	}
+	return trimmed
 }
 
 // createScopeFromExpression creates a scope by resolving a variable expression.

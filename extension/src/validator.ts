@@ -1,10 +1,12 @@
 /**
- * Package validator provides the public TemplateValidator façade for the Rex Template Validator.
- * It assembles the role-based providers and delegates every public method to them.
+ * Package validator provides the editor-facing TemplateValidator façade.
+ * Diagnostics are produced by the Go analyzer daemon; this class keeps the
+ * TypeScript-side language features for hover, completion, definitions, and
+ * references.
  *
  * Named blocks ({{ define "name" }} / {{ block "name" ... }}) are resolved
  * from a cross-file NamedBlockRegistry built by KnowledgeGraphBuilder. This means
- * intellisense (hover, completion, validation) works correctly inside a named
+ * intellisense works correctly inside a named
  * block even when it lives in a different file from the template that calls it.
  *
  * Duplicate block-name detection: if the same name is declared in more than one
@@ -12,27 +14,24 @@
  */
 
 import * as vscode from 'vscode';
-import {
-    TemplateContext,
-    ValidationError,
-} from './types';
+import { TemplateContext } from './types';
 import { TemplateParser } from './templateParser';
 import { KnowledgeGraphBuilder } from './knowledgeGraph';
 import { ScopeUtils } from './scopeUtils';
-import { ValidatorCore } from './validatorCore';
 import { HoverProvider } from './hoverProvider';
 import { DefinitionProvider } from './definitionProvider';
 import { CompletionProvider } from './completionProvider';
 import { ReferenceProvider } from './referenceProvider';
+import { GoAnalyzer } from './analyzer';
 
 export class TemplateValidator {
     private readonly parser: TemplateParser;
     private readonly graphBuilder: KnowledgeGraphBuilder;
     private readonly outputChannel: vscode.OutputChannel;
+    private readonly analyzer: GoAnalyzer;
 
     // Role-based providers assembled once at construction.
     private readonly scope: ScopeUtils;
-    private readonly core: ValidatorCore;
     private readonly hover: HoverProvider;
     private readonly definition: DefinitionProvider;
     private readonly completion: CompletionProvider;
@@ -40,17 +39,18 @@ export class TemplateValidator {
 
     constructor(
         outputChannel: vscode.OutputChannel,
-        graphBuilder: KnowledgeGraphBuilder
+        graphBuilder: KnowledgeGraphBuilder,
+        analyzer: GoAnalyzer,
     ) {
         this.outputChannel = outputChannel;
         this.graphBuilder = graphBuilder;
+        this.analyzer = analyzer;
         this.parser = new TemplateParser();
 
         this.scope = new ScopeUtils(this.parser, graphBuilder);
-        this.core = new ValidatorCore(outputChannel, graphBuilder, this.scope);
-        this.hover = new HoverProvider(graphBuilder, this.scope);
+        this.hover = new HoverProvider(graphBuilder, this.scope, analyzer);
         this.definition = new DefinitionProvider(graphBuilder, this.scope, this.hover);
-        this.completion = new CompletionProvider(graphBuilder, this.scope);
+        this.completion = new CompletionProvider(graphBuilder, this.scope, analyzer);
         this.reference = new ReferenceProvider(graphBuilder);
     }
 
@@ -66,72 +66,6 @@ export class TemplateValidator {
         includeDeclaration: boolean
     ): Promise<vscode.Location[] | null> {
         return this.reference.getReferences(document, position, includeDeclaration);
-    }
-
-    /**
-     * Validates a VS Code TextDocument against the Rex render context and returns
-     * an array of Diagnostic objects suitable for pushing to a DiagnosticCollection.
-     * When no context is found a single Hint diagnostic is returned.
-     */
-    async validateDocument(
-        document: vscode.TextDocument,
-        providedCtx?: TemplateContext
-    ): Promise<vscode.Diagnostic[]> {
-        // Return no errors if validation turned off in configuration
-        const config = vscode.workspace.getConfiguration('rex-analyzer');
-        const validationEnabled: boolean = config.get("validate") ?? true;
-
-        if (!validationEnabled) {
-            return []
-        }
-
-        const ctx =
-            providedCtx ||
-            this.graphBuilder.findContextForFile(document.uri.fsPath);
-
-        if (!ctx) {
-            return [
-                new vscode.Diagnostic(
-                    new vscode.Range(0, 0, 0, 0),
-                    'No rex.Render() call found for this template. Run "Rex: Rebuild Template Index" if you just added it.',
-                    vscode.DiagnosticSeverity.Hint
-                ),
-            ];
-        }
-
-        const content = document.getText();
-        const errors = this.validate(content, ctx, document.uri.fsPath);
-
-        return errors.map((e) => {
-            const line = Math.max(0, e.line - 1);
-            const col = Math.max(0, e.col - 1);
-            const range = new vscode.Range(
-                line, col, line, col + (e.variable?.length ?? 10)
-            );
-            const diag = new vscode.Diagnostic(
-                range,
-                e.message,
-                e.severity === 'error'
-                    ? vscode.DiagnosticSeverity.Error
-                    : e.severity === 'warning'
-                        ? vscode.DiagnosticSeverity.Warning
-                        : vscode.DiagnosticSeverity.Information
-            );
-            diag.source = 'Rex';
-            return diag;
-        });
-    }
-
-    /**
-     * Validates the raw template content string against the provided context.
-     * Returns a list of ValidationError values; does not interact with VS Code APIs.
-     */
-    validate(
-        content: string,
-        ctx: TemplateContext,
-        filePath: string
-    ): ValidationError[] {
-        return this.core.validate(content, ctx, filePath);
     }
 
     /**

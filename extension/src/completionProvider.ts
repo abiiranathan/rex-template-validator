@@ -6,6 +6,7 @@
 
 import * as vscode from 'vscode';
 import {
+    ExpressionTypeResult,
     FieldInfo,
     FuncMapInfo,
     ScopeFrame,
@@ -16,6 +17,7 @@ import { TemplateParser, resolvePath } from './templateParser';
 import { KnowledgeGraphBuilder } from './knowledgeGraph';
 import { inferExpressionType } from './compiler/expressionParser';
 import { ScopeUtils } from './scopeUtils';
+import { GoAnalyzer } from './analyzer';
 
 /**
  * CompletionProvider supplies IntelliSense completion items for Rex template files.
@@ -24,6 +26,7 @@ export class CompletionProvider {
     private readonly parser: TemplateParser;
     private readonly graphBuilder: KnowledgeGraphBuilder;
     private readonly scope: ScopeUtils;
+    private readonly analyzer: GoAnalyzer;
 
     private readonly builtInFunctions = [
         { name: 'and', doc: 'Returns the boolean AND of its arguments' },
@@ -48,10 +51,11 @@ export class CompletionProvider {
         { name: 'dict', doc: 'Creates a map from a list of key-value pairs' }
     ];
 
-    constructor(graphBuilder: KnowledgeGraphBuilder, scope: ScopeUtils) {
+    constructor(graphBuilder: KnowledgeGraphBuilder, scope: ScopeUtils, analyzer: GoAnalyzer) {
         this.graphBuilder = graphBuilder;
         this.parser = scope.parser;
         this.scope = scope;
+        this.analyzer = analyzer;
     }
 
     // ── Public API ─────────────────────────────────────────────────────────────
@@ -66,6 +70,8 @@ export class CompletionProvider {
         position: vscode.Position,
         ctx: TemplateContext
     ): Promise<vscode.CompletionItem[]> {
+        const complex = await this.getComplexExpressionCompletions(document, position, ctx);
+        if (complex) return complex;
         return this.resolveCompletions(document, position, ctx);
     }
 
@@ -80,6 +86,67 @@ export class CompletionProvider {
         ctx: TemplateContext
     ): vscode.CompletionItem[] {
         return this.resolveCompletions(document, position, ctx);
+    }
+
+    private async getComplexExpressionCompletions(
+        document: vscode.TextDocument,
+        position: vscode.Position,
+        ctx: TemplateContext,
+    ): Promise<vscode.CompletionItem[] | null> {
+        const content = document.getText();
+        const nodes = this.parser.parse(content);
+        const lineText = document.lineAt(position.line).text;
+        const linePrefix = lineText.slice(0, position.character);
+        const inComplexExpr = /\(\s*[^)]*$|\|\s*[^|}]*$/.test(linePrefix);
+        if (!inComplexExpr) return null;
+
+        const scopeResult = this.scope.findScopeAtPosition(
+            nodes, position, ctx.vars, [], nodes, ctx
+        );
+        const stack = scopeResult?.stack ?? [] as ScopeFrame[];
+        const locals = scopeResult?.locals ?? new Map<string, TemplateVar>();
+
+        const match = linePrefix.match(/(?:\(|\|)\s*(.*)$/);
+        if (!match) return null;
+
+        const partialExpr = match[1].trim();
+        const exprType = await this.inferExpressionType(document, partialExpr, ctx.vars, stack, locals);
+        if (!exprType?.fields?.length) return null;
+
+        return exprType.fields.map(f => this.fieldToCompletionItem(f, null));
+    }
+
+    private async inferExpressionType(
+        document: vscode.TextDocument,
+        expr: string,
+        vars: Map<string, TemplateVar>,
+        stack: ScopeFrame[],
+        locals?: Map<string, TemplateVar>,
+    ): Promise<ExpressionTypeResult | ReturnType<typeof inferExpressionType> | null> {
+        const workspaceRoot = vscode.workspace.getWorkspaceFolder(document.uri)?.uri.fsPath
+            ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+
+        if (workspaceRoot) {
+            try {
+                const result = await this.analyzer.inferExpressionType(workspaceRoot, expr, vars, stack, locals);
+                if (result) return result;
+            } catch {
+                // Fall back to the TypeScript inferencer below.
+            }
+        }
+
+        try {
+            return inferExpressionType(
+                expr,
+                vars,
+                stack,
+                locals,
+                this.graphBuilder.getGraph().funcMaps,
+                this.scope.buildFieldResolver(vars, stack)
+            );
+        } catch {
+            return null;
+        }
     }
 
     // ── Core resolution ───────────────────────────────────────────────────────

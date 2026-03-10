@@ -20,7 +20,7 @@ func BenchmarkColdStart(b *testing.B) {
 	for b.Loop() {
 		// Clear the cache to force a full re-parse of the Go AST
 		result := ast.AnalyzeDir(absDir, contextFile, ast.DefaultConfig)
-		_, _, _ = validator.ValidateTemplates(result.RenderCalls, templateBase, templateRoot)
+		_, _, _ = validator.ValidateTemplates(result.RenderCalls, result.FuncMaps, templateBase, templateRoot)
 	}
 }
 
@@ -41,7 +41,7 @@ func BenchmarkWarmStart(b *testing.B) {
 	for b.Loop() {
 		// We DO NOT clear the cache here.
 		result := ast.AnalyzeDir(absDir, contextFile, ast.DefaultConfig)
-		_, _, _ = validator.ValidateTemplates(result.RenderCalls, templateBase, templateRoot)
+		_, _, _ = validator.ValidateTemplates(result.RenderCalls, result.FuncMaps, templateBase, templateRoot)
 	}
 }
 

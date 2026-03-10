@@ -49,8 +49,11 @@ func ValidateTemplateContent(
 	baseDir, templateRoot string,
 	lineOffset int,
 	registry map[string][]NamedBlockEntry,
+	funcMaps ...FuncMapRegistry,
 ) []ValidationResult {
 	var errors []ValidationResult
+	effectiveFuncMaps := optionalFuncMapRegistry(funcMaps...)
+	effectiveRegistry := mergeNamedBlockRegistry(registry, content, templateName)
 
 	// Initialize scope stack with root scope
 	var scopeStack []ScopeType
@@ -183,11 +186,43 @@ func ValidateTemplateContent(
 
 		// ── Validate variables in action ────────────────────────────────
 		// Extract and validate all variable references in this action.
+		assignmentTargets := assignmentTargetSet(action)
+		errors = append(errors, validateActionFunctions(action, first, templateName, actualLineNum, col, effectiveFuncMaps)...)
 		extractVariablesFromAction(action, func(v string) {
+			if assignmentTargets[v] {
+				return
+			}
 			if err := validateVariableInScope(v, scopeStack, varMap); err != nil {
+				err.Template = templateName
+				err.Line = actualLineNum
+				err.Column = col + strings.Index(action, v)
+				if err.Column < col {
+					err.Column = col
+				}
 				errors = append(errors, *err)
 			}
 		})
+
+		if first == "block" {
+			syntheticAction := "template " + strings.TrimSpace(strings.TrimPrefix(action, "block"))
+			parts := parseTemplateAction(syntheticAction)
+			if len(parts) >= 2 {
+				// If other {{template "name"}} calls exist in the content for this
+				// block, skip validation at the definition site — the template
+				// call sites will each validate the block with their own scope.
+				// This avoids false positives when the block is designed to be
+				// called from a narrower scope (e.g. inside a range).
+				blockName := parts[0]
+				if !hasTemplateCallForBlock(content, blockName) {
+					partialErrs := validateTemplateCall(syntheticAction, scopeStack, varMap, actualLineNum, col, templateName, baseDir, templateRoot, effectiveRegistry, effectiveFuncMaps)
+					errors = append(errors, partialErrs...)
+				}
+			}
+		}
+
+		if first != "range" && first != "with" && first != "if" {
+			registerInlineLocalAssignments(action, scopeStack, varMap, effectiveFuncMaps, templateName, actualLineNum, col, &errors)
+		}
 
 		// ── {{block}} and {{define}} open a skip region ──────────────────────
 		if first == "block" || first == "define" {
@@ -224,19 +259,40 @@ func ValidateTemplateContent(
 		switch actionToPush {
 		case "range":
 			rangeExpr := strings.TrimSpace(strings.TrimPrefix(exprToParse, "range"))
-			scopeStack = append(scopeStack, createScopeFromRange(rangeExpr, scopeStack, varMap))
+			assignmentNames, rangePipeline, hasAssignment := splitAssignment(rangeExpr)
+			if hasAssignment {
+				rangeExpr = rangePipeline
+			}
+			newScope := childScope(createScopeFromRange(rangeExpr, scopeStack, varMap, effectiveFuncMaps))
+			if hasAssignment {
+				registerRangeLocals(&newScope, assignmentNames, rangeExpr, scopeStack, varMap, effectiveFuncMaps, templateName, actualLineNum, col, &errors)
+			}
+			scopeStack = append(scopeStack, newScope)
 			openingActions = append(openingActions, "range")
 
 		case "with":
 			withExpr := strings.TrimSpace(strings.TrimPrefix(exprToParse, "with"))
-			scopeStack = append(scopeStack, createScopeFromWith(withExpr, scopeStack, varMap))
+			assignmentNames, withPipeline, hasAssignment := splitAssignment(withExpr)
+			if hasAssignment {
+				withExpr = withPipeline
+			}
+			newScope := childScope(createScopeFromWith(withExpr, scopeStack, varMap, effectiveFuncMaps))
+			if hasAssignment {
+				registerAssignedLocals(&newScope, assignmentNames, withExpr, scopeStack, varMap, effectiveFuncMaps, templateName, actualLineNum, col, &errors)
+			}
+			scopeStack = append(scopeStack, newScope)
 			openingActions = append(openingActions, "with")
 
 		case "if":
 			// {{if}} does not change the dot context
 			top := ScopeType{}
 			if len(scopeStack) > 0 {
-				top = scopeStack[len(scopeStack)-1]
+				top = childScope(scopeStack[len(scopeStack)-1])
+			}
+			ifExpr := strings.TrimSpace(strings.TrimPrefix(exprToParse, "if"))
+			assignmentNames, ifPipeline, hasAssignment := splitAssignment(ifExpr)
+			if hasAssignment {
+				registerAssignedLocals(&top, assignmentNames, ifPipeline, scopeStack, varMap, effectiveFuncMaps, templateName, actualLineNum, col, &errors)
 			}
 			scopeStack = append(scopeStack, top)
 			openingActions = append(openingActions, "if")
@@ -245,7 +301,7 @@ func ValidateTemplateContent(
 		// ── Handle {{template}} calls ───────────────────────────────────
 		// Template calls invoke other templates/named blocks with a context.
 		if first == "template" {
-			partialErrs := validateTemplateCall(action, scopeStack, varMap, actualLineNum, col, templateName, baseDir, templateRoot, registry)
+			partialErrs := validateTemplateCall(action, scopeStack, varMap, actualLineNum, col, templateName, baseDir, templateRoot, effectiveRegistry, effectiveFuncMaps)
 			errors = append(errors, partialErrs...)
 		}
 
@@ -267,9 +323,314 @@ func ValidateTemplateContent(
 	return errors
 }
 
+// hasTemplateCallForBlock reports whether the content contains a
+// {{template "name" ...}} call (not a {{block}}) for the given block name.
+func hasTemplateCallForBlock(content, blockName string) bool {
+	// Look for {{ template "blockName" ... }} patterns, excluding {{ block "blockName" ... }}.
+	searchQuoted := `"` + blockName + `"`
+	idx := 0
+	for idx < len(content) {
+		pos := strings.Index(content[idx:], "{{")
+		if pos == -1 {
+			break
+		}
+		pos += idx
+		closePos := strings.Index(content[pos:], "}}")
+		if closePos == -1 {
+			break
+		}
+		closePos += pos
+
+		inner := strings.TrimSpace(content[pos+2 : closePos])
+		// Strip trim markers
+		inner = strings.TrimPrefix(inner, "-")
+		inner = strings.TrimSuffix(inner, "-")
+		inner = strings.TrimSpace(inner)
+
+		if strings.HasPrefix(inner, "template ") && strings.Contains(inner, searchQuoted) {
+			return true
+		}
+		idx = closePos + 2
+	}
+	return false
+}
+
+func optionalFuncMapRegistry(funcMaps ...FuncMapRegistry) FuncMapRegistry {
+	if len(funcMaps) == 0 {
+		return nil
+	}
+	if funcMaps[0] == nil {
+		return nil
+	}
+	return funcMaps[0]
+}
+
+func mergeNamedBlockRegistry(registry map[string][]NamedBlockEntry, content, templateName string) map[string][]NamedBlockEntry {
+	merged := make(map[string][]NamedBlockEntry)
+	for name, entries := range registry {
+		merged[name] = append([]NamedBlockEntry(nil), entries...)
+	}
+	extractNamedTemplatesFromContent(content, templateName, templateName, merged)
+	return merged
+}
+
+func assignmentTargetSet(action string) map[string]bool {
+	targets := make(map[string]bool)
+	assignmentNames, _, ok := splitAssignment(action)
+	if !ok {
+		return targets
+	}
+	for _, name := range assignmentNames {
+		targets[name] = true
+	}
+	return targets
+}
+
+func splitAssignment(action string) ([]string, string, bool) {
+	parts := strings.SplitN(action, ":=", 2)
+	if len(parts) != 2 {
+		return nil, "", false
+	}
+
+	lhs := strings.TrimSpace(parts[0])
+	rhs := strings.TrimSpace(parts[1])
+	if lhs == "" || rhs == "" {
+		return nil, "", false
+	}
+
+	fields := strings.Split(lhs, ",")
+	names := make([]string, 0, len(fields))
+	for _, field := range fields {
+		for _, token := range strings.Fields(strings.TrimSpace(field)) {
+			if strings.HasPrefix(token, "$") {
+				names = append(names, token)
+			}
+		}
+	}
+	if len(names) == 0 {
+		return nil, "", false
+	}
+
+	return names, rhs, true
+}
+
+func registerInlineLocalAssignments(action string, scopeStack []ScopeType, varMap map[string]ast.TemplateVar, funcMaps FuncMapRegistry, templateName string, line int, col int, errors *[]ValidationResult) {
+	if len(scopeStack) == 0 {
+		return
+	}
+	assignmentNames, rhs, ok := splitAssignment(action)
+	if !ok {
+		return
+	}
+	registerAssignedLocals(&scopeStack[len(scopeStack)-1], assignmentNames, rhs, scopeStack, varMap, funcMaps, templateName, line, col, errors)
+}
+
+func registerAssignedLocals(frame *ScopeType, names []string, rhs string, scopeStack []ScopeType, varMap map[string]ast.TemplateVar, funcMaps FuncMapRegistry, templateName string, line int, col int, errors *[]ValidationResult) {
+	funcErrs := validateExpressionFunctions(rhs, templateName, line, col, funcMaps)
+	if len(funcErrs) > 0 {
+		*errors = append(*errors, funcErrs...)
+		return
+	}
+	if frame.Locals == nil {
+		frame.Locals = make(map[string]ast.TemplateVar)
+	}
+	resolved := scopeToTemplateVar("", resolveScopeFromExpression(rhs, scopeStack, varMap, funcMaps))
+	for _, name := range names {
+		local := resolved
+		local.Name = name
+		frame.Locals[name] = local
+	}
+}
+
+func registerRangeLocals(frame *ScopeType, names []string, rangeExpr string, scopeStack []ScopeType, varMap map[string]ast.TemplateVar, funcMaps FuncMapRegistry, templateName string, line int, col int, errors *[]ValidationResult) {
+	if frame.Locals == nil {
+		frame.Locals = make(map[string]ast.TemplateVar)
+	}
+
+	funcErrs := validateExpressionFunctions(rangeExpr, templateName, line, col, funcMaps)
+	if len(funcErrs) > 0 {
+		*errors = append(*errors, funcErrs...)
+		return
+	}
+
+	collectionScope := resolveScopeFromExpression(rangeExpr, scopeStack, varMap, funcMaps)
+	valueVar := scopeToTemplateVar("", *frame)
+
+	if len(names) == 1 {
+		valueVar.Name = names[0]
+		frame.Locals[names[0]] = valueVar
+		return
+	}
+
+	if len(names) >= 2 {
+		keyType := ""
+		switch {
+		case collectionScope.IsMap:
+			keyType = collectionScope.KeyType
+		case collectionScope.IsSlice:
+			keyType = "int"
+		}
+		frame.Locals[names[0]] = ast.TemplateVar{Name: names[0], TypeStr: keyType}
+		valueVar.Name = names[1]
+		frame.Locals[names[1]] = valueVar
+	}
+}
+
+var templateBuiltins = map[string]bool{
+	"and":      true,
+	"or":       true,
+	"not":      true,
+	"eq":       true,
+	"ne":       true,
+	"lt":       true,
+	"le":       true,
+	"gt":       true,
+	"ge":       true,
+	"index":    true,
+	"slice":    true,
+	"len":      true,
+	"print":    true,
+	"printf":   true,
+	"println":  true,
+	"html":     true,
+	"js":       true,
+	"urlquery": true,
+	"dict":     true,
+	"add":      true,
+	"sub":      true,
+	"mul":      true,
+	"div":      true,
+	"mod":      true,
+	"call":     true,
+}
+
+func validateActionFunctions(action, first, templateName string, line, col int, funcMaps FuncMapRegistry) []ValidationResult {
+	trimmed := strings.TrimSpace(action)
+	if first == "template" || first == "block" || first == "define" || first == "end" {
+		return nil
+	}
+	if first == "else" {
+		switch {
+		case strings.HasPrefix(trimmed, "else if "):
+			return validateExpressionFunctions(strings.TrimSpace(strings.TrimPrefix(trimmed, "else if")), templateName, line, col, funcMaps)
+		case strings.HasPrefix(trimmed, "else with "):
+			return validateExpressionFunctions(strings.TrimSpace(strings.TrimPrefix(trimmed, "else with")), templateName, line, col, funcMaps)
+		case strings.HasPrefix(trimmed, "else range "):
+			return validateExpressionFunctions(strings.TrimSpace(strings.TrimPrefix(trimmed, "else range")), templateName, line, col, funcMaps)
+		default:
+			return nil
+		}
+	}
+	if first == "if" || first == "with" || first == "range" {
+		return validateExpressionFunctions(strings.TrimSpace(strings.TrimPrefix(trimmed, first)), templateName, line, col, funcMaps)
+	}
+	return validateExpressionFunctions(trimmed, templateName, line, col, funcMaps)
+}
+
+func validateExpressionFunctions(expr, templateName string, line, col int, funcMaps FuncMapRegistry) []ValidationResult {
+	if funcMaps == nil {
+		return nil
+	}
+	var errors []ValidationResult
+	for _, candidate := range functionCandidates(expr) {
+		if templateBuiltins[candidate.name] {
+			continue
+		}
+		if _, ok := funcMaps[candidate.name]; ok {
+			continue
+		}
+		errors = append(errors, ValidationResult{
+			Template: templateName,
+			Line:     line,
+			Column:   col + candidate.offset,
+			Variable: candidate.name,
+			Message:  fmt.Sprintf("Template function %q is not defined in the current FuncMap", candidate.name),
+			Severity: "error",
+		})
+	}
+	return errors
+}
+
+type functionCandidate struct {
+	name   string
+	offset int
+}
+
+func functionCandidates(expr string) []functionCandidate {
+	var candidates []functionCandidate
+	segments := strings.Split(expr, "|")
+	segmentOffset := 0
+	for index, segment := range segments {
+		trimmed := strings.TrimSpace(segment)
+		if trimmed == "" {
+			segmentOffset += len(segment) + 1
+			continue
+		}
+
+		tokens := strings.Fields(trimmed)
+		if len(tokens) == 0 {
+			segmentOffset += len(segment) + 1
+			continue
+		}
+
+		candidate := ""
+		if tokens[0] == "call" {
+			if len(tokens) > 1 {
+				candidate = strings.Trim(tokens[1], "()")
+			}
+		} else if index > 0 || len(tokens) > 1 {
+			candidate = strings.Trim(tokens[0], "()")
+		}
+
+		if isFunctionIdentifier(candidate) {
+			if offset := strings.Index(segment, candidate); offset >= 0 {
+				candidates = append(candidates, functionCandidate{name: candidate, offset: segmentOffset + offset})
+			}
+		}
+
+		segmentOffset += len(segment) + 1
+	}
+	return candidates
+}
+
+func isFunctionIdentifier(value string) bool {
+	if value == "" {
+		return false
+	}
+	if strings.HasPrefix(value, ".") || strings.HasPrefix(value, "$") || strings.HasPrefix(value, `"`) || strings.HasPrefix(value, "`") {
+		return false
+	}
+	for index, char := range value {
+		if index == 0 {
+			if !(char == '_' || (char >= 'A' && char <= 'Z') || (char >= 'a' && char <= 'z')) {
+				return false
+			}
+			continue
+		}
+		if !(char == '_' || (char >= 'A' && char <= 'Z') || (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9')) {
+			return false
+		}
+	}
+	return true
+}
+
 // buildRootScope creates the root scope from the available variables.
 // The root scope contains all top-level variables accessible via $.VarName.
 func buildRootScope(varMap map[string]ast.TemplateVar) ScopeType {
+	// If the context was passed as a single value (e.g. via a partial call),
+	// use it directly as the root scope.
+	if dot, ok := varMap["."]; ok {
+		return ScopeType{
+			IsRoot:   true,
+			TypeStr:  dot.TypeStr,
+			Fields:   dot.Fields,
+			IsSlice:  dot.IsSlice,
+			IsMap:    dot.IsMap,
+			KeyType:  dot.KeyType,
+			ElemType: dot.ElemType,
+		}
+	}
+
 	rootScope := ScopeType{
 		IsRoot: true,
 		Fields: make([]ast.FieldInfo, 0, len(varMap)),

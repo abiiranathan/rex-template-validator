@@ -10,7 +10,7 @@ const content = `{{ block "billed-drug" .Drug }}
 
 // Dummy output channel
 const outputChannel: any = { appendLine: console.log };
-const validator = new TemplateValidator(outputChannel, {} as any);
+const validator = new TemplateValidator(outputChannel, {} as any, {} as any);
 
 const vars = new Map<string, any>([
   ['Drug', { name: 'Drug', type: 'Drug', isSlice: false, fields: [{ name: 'Name', type: 'string', isSlice: false, doc: 'The name' }] }]

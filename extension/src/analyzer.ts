@@ -2,13 +2,38 @@ import * as cp from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as vscode from 'vscode';
+import * as readline from 'readline';
 import { createGunzip } from 'zlib';
 
-import { AnalysisResult } from './types';
+import { AnalysisResult, ExpressionTypeResult, GoTemplateValidationResult, ScopeFrame, TemplateVar } from './types';
+
+interface AnalyzerRequest {
+  jsonrpc: '2.0';
+  id: number;
+  method: string;
+  params?: Record<string, unknown>;
+}
+
+interface AnalyzerResponse<T> {
+  jsonrpc: '2.0';
+  id: number;
+  result?: T;
+  error?: {
+    code: number;
+    message: string;
+  };
+}
 
 export class GoAnalyzer {
   private analyzerPath: string;
   private outputChannel: vscode.OutputChannel;
+  private daemonProcess: cp.ChildProcessWithoutNullStreams | undefined;
+  private daemonReader: readline.Interface | undefined;
+  private requestId = 0;
+  private pendingRequests = new Map<number, {
+    resolve: (value: unknown) => void;
+    reject: (reason?: unknown) => void;
+  }>();
 
   constructor(context: vscode.ExtensionContext, outputChannel: vscode.OutputChannel) {
     this.outputChannel = outputChannel;
@@ -43,6 +68,103 @@ export class GoAnalyzer {
    * cwd is set to workspaceRoot so relative paths in output stay predictable.
    */
   async analyzeWorkspace(workspaceRoot: string): Promise<AnalysisResult> {
+    try {
+      const result = await this.sendDaemonRequest<AnalysisResult>(workspaceRoot, 'analyze', this.buildAnalyzeParams(workspaceRoot));
+      this.outputChannel.appendLine(
+        `[Analyzer] Daemon returned ${result.renderCalls?.length ?? 0} render calls, ` +
+        `${result.validationErrors?.length ?? 0} validation errors`
+      );
+      return result;
+    } catch (err) {
+      this.outputChannel.appendLine(`[Analyzer] Daemon analyze failed, falling back to CLI: ${err}`);
+      return this.analyzeWorkspaceViaCli(workspaceRoot);
+    }
+  }
+
+  async validateTemplate(workspaceRoot: string, absolutePath: string, content: string): Promise<GoTemplateValidationResult> {
+    const config = vscode.workspace.getConfiguration('rex-analyzer');
+    const validationEnabled: boolean = config.get('validate') ?? true;
+    if (!validationEnabled) {
+      return { validationErrors: [], hasContext: false };
+    }
+
+    return this.sendDaemonRequest<GoTemplateValidationResult>(workspaceRoot, 'validateTemplate', {
+      absolutePath,
+      content,
+    });
+  }
+
+  async updateTemplate(workspaceRoot: string, absolutePath: string, content: string): Promise<void> {
+    await this.sendDaemonRequest(workspaceRoot, 'updateTemplate', {
+      absolutePath,
+      content,
+    });
+  }
+
+  async clearTemplate(workspaceRoot: string, absolutePath: string): Promise<void> {
+    await this.sendDaemonRequest(workspaceRoot, 'clearTemplate', {
+      absolutePath,
+    });
+  }
+
+  async inferExpressionType(
+    workspaceRoot: string,
+    expression: string,
+    vars: Map<string, TemplateVar>,
+    scopeStack: ScopeFrame[],
+    blockLocals?: Map<string, TemplateVar>,
+  ): Promise<ExpressionTypeResult | null> {
+    return this.sendDaemonRequest<ExpressionTypeResult | null>(workspaceRoot, 'inferExpressionType', {
+      expression,
+      vars: serializeTemplateVarMap(vars),
+      scopeStack: serializeScopeStack(scopeStack),
+      blockLocals: serializeTemplateVarMap(blockLocals),
+    });
+  }
+
+  dispose(): void {
+    if (this.daemonProcess && !this.daemonProcess.killed) {
+      const shutdownId = ++this.requestId;
+      const request: AnalyzerRequest = { jsonrpc: '2.0', id: shutdownId, method: 'shutdown' };
+      try {
+        this.daemonProcess.stdin.write(`${JSON.stringify(request)}\n`);
+      } catch {
+        // Ignore shutdown errors and terminate below.
+      }
+      this.daemonProcess.kill();
+    }
+
+    this.daemonReader?.close();
+    this.daemonReader = undefined;
+    this.daemonProcess = undefined;
+
+    for (const pending of this.pendingRequests.values()) {
+      pending.reject(new Error('Analyzer daemon disposed'));
+    }
+    this.pendingRequests.clear();
+  }
+
+  private buildAnalyzeParams(workspaceRoot: string): Record<string, unknown> {
+    const config = vscode.workspace.getConfiguration('rex-analyzer');
+    const sourceDir: string = config.get('sourceDir') ?? '.';
+    const templateRoot: string = config.get('templateRoot') ?? '';
+    const templateBaseDir: string = config.get('templateBaseDir') ?? '';
+    const contextFile: string = config.get('contextFile') ?? '';
+    const validate: boolean = config.get("validate") ?? true;
+
+    // Resolve the Go source directory to an absolute path
+    const absSourceDir = path.resolve(workspaceRoot, sourceDir);
+
+    return {
+      dir: absSourceDir,
+      templateRoot,
+      templateBaseDir: templateBaseDir ? path.resolve(workspaceRoot, templateBaseDir) : '',
+      contextFile: contextFile ? path.resolve(workspaceRoot, contextFile) : '',
+      validate,
+    };
+  }
+
+  private async analyzeWorkspaceViaCli(workspaceRoot: string): Promise<AnalysisResult> {
     const config = vscode.workspace.getConfiguration('rex-analyzer');
     const sourceDir: string = config.get('sourceDir') ?? '.';
     const templateRoot: string = config.get('templateRoot') ?? '';
@@ -56,7 +178,6 @@ export class GoAnalyzer {
     this.outputChannel.appendLine(`templateBaseDir: ${templateBaseDir}`)
     this.outputChannel.appendLine(`contextFile: ${contextFile}`)
 
-    // Resolve the Go source directory to an absolute path
     const absSourceDir = path.resolve(workspaceRoot, sourceDir);
 
     if (!fs.existsSync(absSourceDir)) {
@@ -175,4 +296,112 @@ export class GoAnalyzer {
       });
     });
   }
+
+  private async sendDaemonRequest<T>(workspaceRoot: string, method: string, params?: Record<string, unknown>): Promise<T> {
+    await this.ensureDaemonStarted(workspaceRoot);
+
+    if (!this.daemonProcess) {
+      throw new Error('Analyzer daemon is not running');
+    }
+
+    const id = ++this.requestId;
+    const request: AnalyzerRequest = {
+      jsonrpc: '2.0',
+      id,
+      method,
+      params,
+    };
+
+    return new Promise<T>((resolve, reject) => {
+      this.pendingRequests.set(id, {
+        resolve: (value) => resolve(value as T),
+        reject,
+      });
+      this.daemonProcess!.stdin.write(`${JSON.stringify(request)}\n`, (err) => {
+        if (err) {
+          this.pendingRequests.delete(id);
+          reject(err);
+        }
+      });
+    });
+  }
+
+  private async ensureDaemonStarted(workspaceRoot: string): Promise<void> {
+    if (this.daemonProcess && !this.daemonProcess.killed) {
+      return;
+    }
+
+    this.outputChannel.appendLine('[Analyzer] Starting daemon...');
+    const proc = cp.spawn(this.analyzerPath, ['-daemon'], {
+      cwd: workspaceRoot,
+      env: process.env,
+      stdio: 'pipe',
+    });
+
+    proc.stderr.on('data', (data: Buffer) => {
+      this.outputChannel.appendLine(`[Analyzer] daemon stderr: ${data.toString()}`);
+    });
+
+    proc.on('error', (err) => {
+      this.outputChannel.appendLine(`[Analyzer] Daemon failed to start: ${err.message}`);
+      for (const pending of this.pendingRequests.values()) {
+        pending.reject(err);
+      }
+      this.pendingRequests.clear();
+    });
+
+    proc.on('exit', (code, signal) => {
+      this.outputChannel.appendLine(`[Analyzer] Daemon exited (code=${code}, signal=${signal ?? 'none'})`);
+      if (this.daemonReader) {
+        this.daemonReader.close();
+        this.daemonReader = undefined;
+      }
+      this.daemonProcess = undefined;
+      for (const pending of this.pendingRequests.values()) {
+        pending.reject(new Error(`Analyzer daemon exited before responding`));
+      }
+      this.pendingRequests.clear();
+    });
+
+    const reader = readline.createInterface({ input: proc.stdout, crlfDelay: Infinity });
+    reader.on('line', (line) => {
+      if (!line.trim()) return;
+
+      let response: AnalyzerResponse<unknown>;
+      try {
+        response = JSON.parse(line) as AnalyzerResponse<unknown>;
+      } catch (err) {
+        this.outputChannel.appendLine(`[Analyzer] Invalid daemon response: ${err}`);
+        return;
+      }
+
+      const pending = this.pendingRequests.get(response.id);
+      if (!pending) {
+        return;
+      }
+
+      this.pendingRequests.delete(response.id);
+      if (response.error) {
+        pending.reject(new Error(response.error.message));
+        return;
+      }
+
+      pending.resolve(response.result as unknown);
+    });
+
+    this.daemonProcess = proc;
+    this.daemonReader = reader;
+  }
+}
+
+function serializeTemplateVarMap(vars?: Map<string, TemplateVar>): Record<string, TemplateVar> {
+  if (!vars) return {};
+  return Object.fromEntries(vars.entries());
+}
+
+function serializeScopeStack(scopeStack: ScopeFrame[]): Array<Omit<ScopeFrame, 'locals'> & { locals?: Record<string, TemplateVar> }> {
+  return scopeStack.map(frame => ({
+    ...frame,
+    locals: frame.locals ? Object.fromEntries(frame.locals.entries()) : undefined,
+  }));
 }

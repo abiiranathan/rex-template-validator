@@ -21,6 +21,7 @@ func validateTemplateCall(
 	baseDir string,
 	templateRoot string,
 	registry map[string][]NamedBlockEntry,
+	funcMaps FuncMapRegistry,
 ) []ValidationResult {
 	var errors []ValidationResult
 	parts := parseTemplateAction(action)
@@ -36,7 +37,14 @@ func validateTemplateCall(
 	}
 
 	if contextArg != "" && contextArg != "." {
-		if !validateContextArg(contextArg, scopeStack, varMap) {
+		if err := validateContextArg(contextArg, scopeStack, varMap, funcMaps); err != nil {
+			err.Template = templateName
+			err.Line = actualLineNum
+			err.Column = col + strings.Index(action, contextArg)
+			if err.Column < col {
+				err.Column = col
+			}
+			errors = append(errors, *err)
 			return errors
 		}
 	}
@@ -49,12 +57,14 @@ func validateTemplateCall(
 		for i := range inner {
 			e := &inner[i]
 			e.Message = fmt.Sprintf(
-				`[in block %q @ %s] %s`,
+				`[in named template %q @ %s] %s`,
 				tmplName, e.Template, e.Message,
 			)
-			e.Template = templateName
-			e.Line = actualLineNum
-			e.Column = col
+			if e.Template != templateName {
+				e.Template = templateName
+				e.Line = actualLineNum
+				e.Column = col
+			}
 		}
 		return inner
 	}
@@ -62,11 +72,7 @@ func validateTemplateCall(
 	if entries, ok := registry[tmplName]; ok && len(entries) > 0 {
 		nt := entries[0]
 
-		if contextArg != "" && contextArg != "." && !strings.HasPrefix(contextArg, ".") {
-			return errors
-		}
-
-		partialScope := resolvePartialScope(contextArg, scopeStack, varMap)
+		partialScope := resolvePartialScope(contextArg, scopeStack, varMap, funcMaps)
 		partialVarMap := buildPartialVarMap(contextArg, partialScope, scopeStack, varMap)
 
 		partialErrors := ValidateTemplateContent(
@@ -77,6 +83,7 @@ func validateTemplateCall(
 			templateRoot,
 			nt.Line,
 			registry,
+			funcMaps,
 		)
 		errors = append(errors, pinCallSite(partialErrors)...)
 
@@ -94,11 +101,7 @@ func validateTemplateCall(
 			return errors
 		}
 
-		if contextArg != "" && contextArg != "." && !strings.HasPrefix(contextArg, ".") {
-			return errors
-		}
-
-		partialScope := resolvePartialScope(contextArg, scopeStack, varMap)
+		partialScope := resolvePartialScope(contextArg, scopeStack, varMap, funcMaps)
 		partialVarMap := buildPartialVarMap(contextArg, partialScope, scopeStack, varMap)
 
 		partialErrors := ValidateTemplateFile(
@@ -108,6 +111,7 @@ func validateTemplateCall(
 			baseDir,
 			templateRoot,
 			registry,
+			funcMaps,
 		)
 		errors = append(errors, pinCallSite(partialErrors)...)
 	}

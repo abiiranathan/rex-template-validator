@@ -2,6 +2,8 @@ package validator
 
 import "github.com/rex-template-analyzer/ast"
 
+type FuncMapRegistry map[string]ast.FuncMapInfo
+
 // ValidationResult represents a single diagnostic (error or warning) found during template validation.
 type ValidationResult struct {
 	// Template is the name or path of the template where the issue was found.
@@ -39,6 +41,10 @@ type ValidationResult struct {
 type ScopeType struct {
 	// IsRoot indicates if this is the top-level scope.
 	IsRoot bool
+
+	// Locals are template-local variables declared in the current lexical frame
+	// (for example via {{$x := ...}} or range assignments).
+	Locals map[string]ast.TemplateVar
 
 	// VarName is the name of the variable that established this scope (e.g., in a `with` or `range` action).
 	VarName string

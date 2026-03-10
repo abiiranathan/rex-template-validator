@@ -63,9 +63,17 @@ func main() {
 	validate := flag.Bool("validate", false, "Validate templates against render calls")
 	contextFile := flag.String("context-file", "", "Path to JSON file with additional context variables")
 	compress := flag.Bool("compress", false, "Output gzip-compressed JSON")
+	daemon := flag.Bool("daemon", false, "Run as a long-lived JSON-RPC daemon over stdio")
 	showNamedTemplates := flag.Bool("named-templates", false, "Return all named template as JSON")
 	viewContext := flag.String("view-context", "", "Show context for a specific template")
 	flag.Parse()
+
+	if *daemon {
+		if err := runDaemon(os.Stdin, os.Stdout); err != nil {
+			panic("daemon failed: " + err.Error())
+		}
+		return
+	}
 
 	// Resolve absolute paths
 	absDir := mustAbs(*dir)
@@ -98,6 +106,7 @@ func main() {
 		// so those trees are available throughout the validation pass.
 		ve, namedBlocks, namedBlockErrors := validator.ValidateTemplates(
 			result.RenderCalls,
+			result.FuncMaps,
 			templateBase,
 			*templateRoot,
 		)
