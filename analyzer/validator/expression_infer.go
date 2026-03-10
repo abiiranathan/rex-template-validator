@@ -416,7 +416,7 @@ func (i expressionInferencer) inferDictResult(rawArgs []templateparse.Node, args
 	for idx := 0; idx+1 < len(args); idx += 2 {
 		keyNode := args[idx]
 		valueNode := i.hydrateResult(args[idx+1])
-		if keyNode == nil || keyNode.TypeStr != "string" {
+		if keyNode == nil || keyNode.TypeStr != "string" || valueNode == nil {
 			continue
 		}
 		keyName := keyNode.Literal
