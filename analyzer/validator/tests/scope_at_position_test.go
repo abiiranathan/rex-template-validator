@@ -112,7 +112,7 @@ func TestGetHoverResult_InsideBlock_LocalVar(t *testing.T) {
 
 	result := validator.GetHoverResult(
 		content, hoverVarMap(), "test.html", "", "",
-		0, 4, 5,
+		0, 4, 10, // col 10 = on "DrugName" in "$rx.DrugName"
 		nil, nil, hoverTypeRegistry(),
 	)
 	if result == nil {
@@ -155,6 +155,28 @@ func TestGetHoverResult_InsideBlock_NestedRange(t *testing.T) {
 	t.Logf("Expression: %q -> type: %q", result.Expression, result.TypeStr)
 	if result.TypeStr != "float64" {
 		t.Errorf("expected type 'float64', got %q", result.TypeStr)
+	}
+}
+
+func TestGetHoverResult_SubExpressionInIfClause(t *testing.T) {
+	// Hover on ".Name" inside {{ if eq .Name $rx.DrugName }}
+	// Line 5: {{ if eq .Name $rx.DrugName }}
+	//          1234567890123
+	//                   ^col 12 = on "N" of ".Name"
+	content := "{{ block \"prescription-summary\" . }}\n{{ range .prescriptions }}\n{{ $rx := . }}\n{{ range $.billedDrugs }}\n{{ if eq .Name $rx.DrugName }}\nmatched\n{{ end }}\n{{ end }}\n{{ end }}\n{{ end }}"
+
+	result := validator.GetHoverResult(
+		content, hoverVarMap(), "test.html", "", "",
+		0, 5, 12,
+		nil, nil, hoverTypeRegistry(),
+	)
+	if result == nil {
+		t.Fatal("expected hover result, got nil")
+	}
+	t.Logf("Expression: %q -> type: %q", result.Expression, result.TypeStr)
+	// Should resolve .Name (sub-expression) to string, not the whole "eq .Name $rx.DrugName" to bool
+	if result.TypeStr != "string" {
+		t.Errorf("expected type 'string' for sub-expression .Name, got %q", result.TypeStr)
 	}
 }
 

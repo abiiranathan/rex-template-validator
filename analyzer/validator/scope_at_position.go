@@ -2,6 +2,7 @@ package validator
 
 import (
 	"strings"
+	"unicode"
 
 	"github.com/rex-template-analyzer/ast"
 )
@@ -11,6 +12,12 @@ import (
 type PositionScope struct {
 	// Expression is the raw expression text of the action at the cursor position.
 	Expression string `json:"expression"`
+
+	// RawAction is the full text between {{ and }} (trimmed of whitespace/dash).
+	RawAction string `json:"rawAction"`
+
+	// CursorOffset is the byte offset of the cursor within RawAction.
+	CursorOffset int `json:"cursorOffset"`
 
 	// ScopeStack is the full scope chain from root down to the current scope.
 	ScopeStack []ScopeType `json:"scopeStack"`
@@ -66,8 +73,19 @@ func GetHoverResult(
 		return nil
 	}
 
-	// Resolve the expression to its type.
-	result := InferExpressionType(ps.Expression, ps.Vars, ps.ScopeStack, ps.Locals, funcMaps, typeRegistry)
+	// Try resolving the sub-expression at cursor first (e.g., ".Name" inside "if eq .Name $rx.DrugName").
+	var result *ExpressionTypeResult
+	subExpr := extractSubPathAtCursor(ps.RawAction, ps.CursorOffset)
+	if subExpr != "" && subExpr != ps.Expression {
+		result = InferExpressionType(subExpr, ps.Vars, ps.ScopeStack, ps.Locals, funcMaps, typeRegistry)
+	}
+
+	useExpr := subExpr
+	if result == nil {
+		// Fall back to full expression.
+		result = InferExpressionType(ps.Expression, ps.Vars, ps.ScopeStack, ps.Locals, funcMaps, typeRegistry)
+		useExpr = ps.Expression
+	}
 	if result == nil {
 		return nil
 	}
@@ -84,7 +102,7 @@ func GetHoverResult(
 	}
 
 	return &HoverResult{
-		Expression: ps.Expression,
+		Expression: useExpr,
 		TypeStr:    result.TypeStr,
 		Fields:     result.Fields,
 		IsSlice:    result.IsSlice,
@@ -220,11 +238,28 @@ func buildScopeAtPosition(
 			expr := extractHoverExpression(action, first, targetLine, actualLineNum+1, col, targetCol)
 			if expr != "" {
 				locals := collectLocals(scopeStack)
+
+				// Compute cursor offset within the raw action text.
+				// col is the 1-based column of {{ on the action's line.
+				// targetCol is the 1-based column of the cursor.
+				cursorOffset := targetCol - col - 2 // -2 for "{{"
+				if contentStart > openIdx+2 {
+					cursorOffset -= (contentStart - openIdx - 2) // adjust for dash/whitespace
+				}
+				if cursorOffset < 0 {
+					cursorOffset = 0
+				}
+				if cursorOffset > len(action) {
+					cursorOffset = len(action)
+				}
+
 				return &PositionScope{
-					Expression: expr,
-					ScopeStack: scopeStack,
-					Vars:       varMap,
-					Locals:     locals,
+					Expression:   expr,
+					RawAction:    action,
+					CursorOffset: cursorOffset,
+					ScopeStack:   scopeStack,
+					Vars:         varMap,
+					Locals:       locals,
 				}
 			}
 		}
@@ -433,6 +468,61 @@ func collectLocals(scopeStack []ScopeType) map[string]ast.TemplateVar {
 		}
 	}
 	return result
+}
+
+// extractSubPathAtCursor extracts the dot-path or $var-path segment at the
+// cursor offset within an action's raw text. For example, in "if eq .Name $rx.DrugName"
+// with cursor on ".Name", it returns ".Name"; with cursor on "$rx.DrugName", it
+// returns "$rx.DrugName".
+func extractSubPathAtCursor(action string, offset int) string {
+	if len(action) == 0 || offset < 0 || offset > len(action) {
+		return ""
+	}
+	// If cursor is exactly on a dot, no useful segment.
+	if offset < len(action) && action[offset] == '.' {
+		return ""
+	}
+
+	isPathChar := func(b byte) bool {
+		return b == '.' || b == '$' || b == '_' || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+	}
+	isIdentChar := func(b byte) bool {
+		return b == '$' || b == '_' || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+	}
+
+	// Walk backward through dots and identifiers.
+	pathStart := offset
+	for pathStart > 0 && isPathChar(action[pathStart-1]) {
+		pathStart--
+	}
+
+	// Walk forward through identifier chars only (stop at dot).
+	segEnd := offset
+	for segEnd < len(action) && isIdentChar(action[segEnd]) {
+		segEnd++
+	}
+
+	if pathStart >= segEnd {
+		return ""
+	}
+
+	sub := action[pathStart:segEnd]
+	// Reject bare "$" or "."
+	if sub == "." || sub == "$" {
+		return ""
+	}
+	// Must contain an actual identifier — reject if it's just dots/symbols.
+	hasIdent := false
+	for _, r := range sub {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' {
+			hasIdent = true
+			break
+		}
+	}
+	if !hasIdent {
+		return ""
+	}
+	return sub
 }
 
 // findDefineVars looks up the vars that a {{define "name"}} block receives from

@@ -142,6 +142,10 @@ export class HoverProvider {
                         this.scope.buildFieldResolver(hitVars, stack)
                     );
                     if (subResult.found) {
+                        if (!subResult.typeStr || subResult.typeStr === 'unknown') {
+                            const goHover = await this.tryGoHoverFallback(document, position);
+                            if (goHover) return goHover;
+                        }
                         return this.buildHoverForPath(
                             parts, subResult, hitVars, stack, hitLocals
                         );
@@ -189,6 +193,11 @@ export class HoverProvider {
         }
 
         if (!result.found) return this.tryGoHoverFallback(document, position);
+
+        if (!result.typeStr || result.typeStr === 'unknown') {
+            const goHover = await this.tryGoHoverFallback(document, position);
+            if (goHover) return goHover;
+        }
 
         const pathToUse = isExpressionFallback ? ['expression'] : node.path;
         return this.buildHoverForPath(
