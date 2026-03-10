@@ -40,10 +40,7 @@ func validateTemplateCall(
 		if err := validateContextArg(contextArg, scopeStack, varMap, funcMaps); err != nil {
 			err.Template = templateName
 			err.Line = actualLineNum
-			err.Column = col + strings.Index(action, contextArg)
-			if err.Column < col {
-				err.Column = col
-			}
+			err.Column = max(col+strings.Index(action, contextArg), col)
 			errors = append(errors, *err)
 			return errors
 		}

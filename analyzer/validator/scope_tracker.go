@@ -9,6 +9,8 @@ import (
 
 // resolvePartialScope determines what scope/type the context argument refers to
 // for a nested template call.
+// resolvePartialScope determines what scope/type the context argument refers to
+// for a nested template call.
 func resolvePartialScope(
 	contextArg string,
 	scopeStack []ScopeType,
@@ -19,10 +21,9 @@ func resolvePartialScope(
 		return resolveScopeFromExpression(contextArg, scopeStack, varMap, funcMaps)
 	}
 
-	// For complex expressions (like dict), use the robust expression inferencer
 	inferred := InferExpressionType(contextArg, varMap, scopeStack, nil, funcMaps, nil)
 	if inferred != nil {
-		return ScopeType{
+		scope := ScopeType{
 			TypeStr:  inferred.TypeStr,
 			Fields:   inferred.Fields,
 			IsSlice:  inferred.IsSlice,
@@ -30,10 +31,18 @@ func resolvePartialScope(
 			KeyType:  inferred.KeyType,
 			ElemType: inferred.ElemType,
 		}
+		// Ensure KeyType is populated for map[string]any results (e.g. dict).
+		// InferExpressionType may leave KeyType empty when TypeStr encodes it.
+		if scope.IsMap && scope.KeyType == "" {
+			scope.KeyType = unwrapMapKeyType(inferred.TypeStr)
+		}
+		return scope
 	}
 	return resolveScopeFromExpression(contextArg, scopeStack, varMap, funcMaps)
 }
 
+// buildPartialVarMap constructs the variable map available to a nested template
+// based on the context argument.
 // buildPartialVarMap constructs the variable map available to a nested template
 // based on the context argument.
 func buildPartialVarMap(
@@ -50,14 +59,11 @@ func buildPartialVarMap(
 	}
 
 	if contextArg == "." {
-		// Pass entire current scope
 		if len(scopeStack) > 0 {
 			currentScope := scopeStack[len(scopeStack)-1]
 			if currentScope.IsRoot {
-				// Root scope: copy all variables
 				maps.Copy(result, varMap)
 			} else {
-				// Non-root scope: pass as "."
 				result["."] = ast.TemplateVar{
 					Name:     ".",
 					TypeStr:  currentScope.TypeStr,
@@ -67,6 +73,25 @@ func buildPartialVarMap(
 					KeyType:  currentScope.KeyType,
 					ElemType: currentScope.ElemType,
 				}
+			}
+		}
+		return result
+	}
+
+	// For string-keyed maps with known fields (e.g. dict "key" val ...),
+	// promote each field as a top-level variable WITHOUT setting ".".
+	// Setting "." causes buildRootScope to return early using only the dot
+	// entry's fields, making the promoted keys invisible to the validator.
+	if partialScope.IsMap && len(partialScope.Fields) > 0 && partialScope.KeyType == "string" {
+		for _, f := range partialScope.Fields {
+			result[f.Name] = ast.TemplateVar{
+				Name:     f.Name,
+				TypeStr:  f.TypeStr,
+				Fields:   f.Fields,
+				IsSlice:  f.IsSlice,
+				IsMap:    f.IsMap,
+				KeyType:  f.KeyType,
+				ElemType: f.ElemType,
 			}
 		}
 		return result

@@ -416,9 +416,11 @@ func (i expressionInferencer) inferDictResult(rawArgs []templateparse.Node, args
 	for idx := 0; idx+1 < len(args); idx += 2 {
 		keyNode := args[idx]
 		valueNode := i.hydrateResult(args[idx+1])
-		if keyNode == nil || keyNode.TypeStr != "string" || valueNode == nil {
+
+		if keyNode == nil || keyNode.TypeStr != "string" {
 			continue
 		}
+
 		keyName := keyNode.Literal
 		if keyName == "" && idx < len(rawArgs) {
 			if literal, ok := rawArgs[idx].(*templateparse.StringNode); ok {
@@ -428,28 +430,28 @@ func (i expressionInferencer) inferDictResult(rawArgs []templateparse.Node, args
 		if keyName == "" {
 			continue
 		}
-		// Defensive: check valueNode fields for nil/zero values
-		typeStr := "unknown"
-		var subFields []ast.FieldInfo
-		isSlice := false
-		isMap := false
-		keyType := ""
-		elemType := ""
-		typeStr = valueNode.TypeStr
-		subFields = valueNode.Fields
-		isSlice = valueNode.IsSlice
-		isMap = valueNode.IsMap
-		keyType = valueNode.KeyType
-		elemType = valueNode.ElemType
+
+		// When the value couldn't be resolved (e.g. $.SomeVar in a context
+		// with empty vars), still record the key with type "any" so it is
+		// visible as a valid top-level variable in the partial's scope.
+		// Previously nil was skipped, which made $.RedirectPrefix / $.Path
+		// disappear from the dict fields when the caller had no var context.
+		if valueNode == nil {
+			fields = append(fields, ast.FieldInfo{
+				Name:    keyName,
+				TypeStr: "any",
+			})
+			continue
+		}
 
 		fields = append(fields, ast.FieldInfo{
 			Name:     keyName,
-			TypeStr:  typeStr,
-			Fields:   subFields,
-			IsSlice:  isSlice,
-			IsMap:    isMap,
-			KeyType:  keyType,
-			ElemType: elemType,
+			TypeStr:  valueNode.TypeStr,
+			Fields:   valueNode.Fields,
+			IsSlice:  valueNode.IsSlice,
+			IsMap:    valueNode.IsMap,
+			KeyType:  valueNode.KeyType,
+			ElemType: valueNode.ElemType,
 		})
 	}
 	return &ExpressionTypeResult{TypeStr: "map[string]any", IsMap: true, Fields: fields}
