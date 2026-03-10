@@ -428,14 +428,28 @@ func (i expressionInferencer) inferDictResult(rawArgs []templateparse.Node, args
 		if keyName == "" {
 			continue
 		}
+		// Defensive: check valueNode fields for nil/zero values
+		typeStr := "unknown"
+		var subFields []ast.FieldInfo
+		isSlice := false
+		isMap := false
+		keyType := ""
+		elemType := ""
+		typeStr = valueNode.TypeStr
+		subFields = valueNode.Fields
+		isSlice = valueNode.IsSlice
+		isMap = valueNode.IsMap
+		keyType = valueNode.KeyType
+		elemType = valueNode.ElemType
+
 		fields = append(fields, ast.FieldInfo{
 			Name:     keyName,
-			TypeStr:  valueNode.TypeStr,
-			Fields:   valueNode.Fields,
-			IsSlice:  valueNode.IsSlice,
-			IsMap:    valueNode.IsMap,
-			KeyType:  valueNode.KeyType,
-			ElemType: valueNode.ElemType,
+			TypeStr:  typeStr,
+			Fields:   subFields,
+			IsSlice:  isSlice,
+			IsMap:    isMap,
+			KeyType:  keyType,
+			ElemType: elemType,
 		})
 	}
 	return &ExpressionTypeResult{TypeStr: "map[string]any", IsMap: true, Fields: fields}

@@ -29,19 +29,15 @@ func processFunc(
 	config AnalysisConfig,
 	filesMap map[string]*goast.File,
 	seenPool *seenMapPool,
+	mutatorIndex map[string][]*goast.KeyValueExpr,
 ) FuncScope {
 	scope := FuncScope{
 		MapAssignments: make(map[string]*goast.CompositeLit, 4),
 	}
-
-	// Local symbol tables for name resolution
 	stringAssignments := make(map[string][]string, 8)
 	funcMapAssignments := make(map[string]*goast.CompositeLit, 4)
 
-	// Pass 1: Collect assignments
-	collectAssignments(n, info, fset, filesMap, &scope, stringAssignments, funcMapAssignments, structIndex, fc, seenPool)
-
-	// Pass 2: Find template operations
+	collectAssignments(n, info, fset, filesMap, &scope, stringAssignments, funcMapAssignments, structIndex, fc, seenPool, mutatorIndex)
 	findTemplateOperations(n, info, fset, structIndex, fc, config, filesMap, seenPool, &scope, stringAssignments)
 
 	return scope
@@ -60,6 +56,7 @@ func collectAssignments(
 	structIndex map[string]structIndexEntry,
 	fc *fieldCache,
 	seenPool *seenMapPool,
+	mutatorIndex map[string][]*goast.KeyValueExpr,
 ) {
 	goast.Inspect(n, func(child goast.Node) bool {
 		if child != n {
@@ -72,6 +69,8 @@ func collectAssignments(
 			processAssignStmt(node, info, fset, filesMap, scope, stringAssignments, funcMapAssignments, structIndex, fc, seenPool)
 		case *goast.GenDecl:
 			processGenDecl(node, info, fset, filesMap, scope, stringAssignments, funcMapAssignments, structIndex, fc, seenPool)
+		case *goast.CallExpr:
+			applyMapMutatorCall(node, scope, mutatorIndex)
 		}
 		return true
 	})
@@ -82,18 +81,7 @@ func collectAssignments(
 // - FuncMap composite literals
 // - Map index assignments to FuncMap[key]
 // - Map variable assignments for data argument resolution
-func processAssignStmt(
-	assign *goast.AssignStmt,
-	info *types.Info,
-	fset *token.FileSet,
-	filesMap map[string]*goast.File,
-	scope *FuncScope,
-	stringAssignments map[string][]string,
-	funcMapAssignments map[string]*goast.CompositeLit,
-	structIndex map[string]structIndexEntry,
-	fc *fieldCache,
-	seenPool *seenMapPool,
-) {
+func processAssignStmt(assign *goast.AssignStmt, info *types.Info, fset *token.FileSet, filesMap map[string]*goast.File, scope *FuncScope, stringAssignments map[string][]string, funcMapAssignments map[string]*goast.CompositeLit, structIndex map[string]structIndexEntry, fc *fieldCache, seenPool *seenMapPool) {
 	for i, lhs := range assign.Lhs {
 		if i >= len(assign.Rhs) {
 			continue

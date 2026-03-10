@@ -68,7 +68,7 @@ func GetHoverResult(
 	funcMaps FuncMapRegistry,
 	typeRegistry map[string][]ast.FieldInfo,
 ) *HoverResult {
-	ps := buildScopeAtPosition(content, varMap, templateName, baseDir, templateRoot, lineOffset, targetLine, targetCol, registry, funcMaps)
+	ps := buildScopeAtPosition(content, varMap, templateName, lineOffset, targetLine, targetCol, registry, funcMaps)
 	if ps == nil {
 		return nil
 	}
@@ -122,17 +122,7 @@ func GetHoverResult(
 //
 // Key difference from validation: block/define bodies are entered with the
 // scope derived from the block's context argument instead of being skipped.
-func buildScopeAtPosition(
-	content string,
-	varMap map[string]ast.TemplateVar,
-	templateName string,
-	baseDir, templateRoot string,
-	lineOffset int,
-	targetLine int,
-	targetCol int,
-	registry map[string][]NamedBlockEntry,
-	funcMaps FuncMapRegistry,
-) *PositionScope {
+func buildScopeAtPosition(content string, varMap map[string]ast.TemplateVar, templateName string, lineOffset, targetLine, targetCol int, registry map[string][]NamedBlockEntry, funcMaps FuncMapRegistry) *PositionScope {
 	effectiveFuncMaps := optionalFuncMapRegistry(funcMaps)
 	effectiveRegistry := mergeNamedBlockRegistry(registry, content, templateName)
 
@@ -235,7 +225,7 @@ func buildScopeAtPosition(
 
 		if inAction {
 			// Target is within this action — this is what the cursor is on.
-			expr := extractHoverExpression(action, first, targetLine, actualLineNum+1, col, targetCol)
+			expr := extractHoverExpression(action, first)
 			if expr != "" {
 				locals := collectLocals(scopeStack)
 
@@ -324,7 +314,8 @@ func buildScopeAtPosition(
 			// call that provides vars, otherwise use an empty scope.
 			if len(words) >= 2 {
 				defName := strings.Trim(words[1], `"`)
-				varMapForDefine := findDefineVars(defName, effectiveRegistry, varMap, scopeStack, effectiveFuncMaps)
+				var _ string = defName
+				varMapForDefine := findDefineVars(effectiveRegistry, varMap, scopeStack, effectiveFuncMaps)
 				newScope := buildRootScope(varMapForDefine)
 				scopeStack = append(scopeStack, newScope)
 			} else {
@@ -403,7 +394,7 @@ func buildScopeAtPosition(
 // extractHoverExpression extracts the expression from a template action that
 // corresponds to the cursor position. For keyword actions (range, with, if),
 // it strips the keyword. For block/define, it returns empty (keyword line).
-func extractHoverExpression(action, first string, targetLine, actionLine, actionCol, targetCol int) string {
+func extractHoverExpression(action, first string) string {
 	switch first {
 	case "end", "define":
 		return ""
@@ -527,13 +518,7 @@ func extractSubPathAtCursor(action string, offset int) string {
 
 // findDefineVars looks up the vars that a {{define "name"}} block receives from
 // its callers. It looks in the registry + render var index for matching entries.
-func findDefineVars(
-	name string,
-	registry map[string][]NamedBlockEntry,
-	parentVars map[string]ast.TemplateVar,
-	parentStack []ScopeType,
-	funcMaps FuncMapRegistry,
-) map[string]ast.TemplateVar {
+func findDefineVars(registry map[string][]NamedBlockEntry, parentVars map[string]ast.TemplateVar, parentStack []ScopeType, funcMaps FuncMapRegistry) map[string]ast.TemplateVar {
 	// For defines, the scope depends on how they are called. If they exist as
 	// named blocks called from parent templates, use the parent template's vars.
 	// Otherwise, return empty — we can't know the context.

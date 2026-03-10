@@ -82,10 +82,14 @@ func ValidateTemplateContent(
 
 		closeRel := strings.Index(content[openIdx:], "}}")
 		if closeRel == -1 {
-			panic(fmt.Sprintf(
-				"template %q: unclosed action tag '{{' at line %d — add the closing '}}'",
-				templateName, actualLineNum,
-			))
+			errors = append(errors, ValidationResult{
+				Template: templateName,
+				Line:     actualLineNum,
+				Column:   0,
+				Message:  fmt.Sprintf("Unclosed action tag '{{' at line %d — add the closing '}}'", actualLineNum),
+				Severity: "error",
+			})
+			break
 		}
 		closeIdx := openIdx + closeRel
 
@@ -157,10 +161,14 @@ func ValidateTemplateContent(
 
 		if isElse {
 			if len(scopeStack) <= 1 {
-				panic(fmt.Sprintf(
-					"template %q: {{else}} at line %d has no matching opening block",
-					templateName, actualLineNum,
-				))
+				errors = append(errors, ValidationResult{
+					Template: templateName,
+					Line:     actualLineNum,
+					Column:   0,
+					Message:  fmt.Sprintf("{{else}} at line %d has no matching opening block", actualLineNum),
+					Severity: "error",
+				})
+				break
 			}
 			scopeStack = scopeStack[:len(scopeStack)-1]
 			openingActions = openingActions[:len(openingActions)-1]
@@ -173,10 +181,14 @@ func ValidateTemplateContent(
 			}
 		} else if first == "end" {
 			if len(scopeStack) <= 1 {
-				panic(fmt.Sprintf(
-					"template %q: unexpected {{end}} at line %d — no open block to close",
-					templateName, actualLineNum,
-				))
+				errors = append(errors, ValidationResult{
+					Template: templateName,
+					Line:     actualLineNum,
+					Column:   0,
+					Message:  fmt.Sprintf("unexpected {{end}} at line %d — no open block to close", actualLineNum),
+					Severity: "error",
+				})
+				break
 			}
 			scopeStack = scopeStack[:len(scopeStack)-1]
 			openingActions = openingActions[:len(openingActions)-1]
@@ -314,10 +326,13 @@ func ValidateTemplateContent(
 		for _, a := range openingActions[1:] {
 			unclosed = append(unclosed, "{{"+a+"}}")
 		}
-		panic(fmt.Sprintf(
-			"template %q: %d unclosed scope block(s) at end of template — missing {{end}} for: %s",
-			templateName, len(scopeStack)-1, strings.Join(unclosed, ", "),
-		))
+		errors = append(errors, ValidationResult{
+			Template: templateName,
+			Line:     lineNum + lineOffset,
+			Column:   0,
+			Message:  fmt.Sprintf("%d unclosed scope block(s) at end of template — missing {{end}} for: %s", len(scopeStack)-1, strings.Join(unclosed, ", ")),
+			Severity: "error",
+		})
 	}
 
 	return errors
