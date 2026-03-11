@@ -2,13 +2,10 @@ package validator
 
 import (
 	"path/filepath"
-	"regexp"
 	"strings"
 
 	"github.com/rex-template-analyzer/ast"
 )
-
-var validTemplateName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 // IsFileBasedPartial determines if a template name refers to a file path
 // rather than a named block.

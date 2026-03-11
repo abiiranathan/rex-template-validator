@@ -56,22 +56,22 @@ func ValidateTemplates(
 	templateRoot string,
 ) ([]ValidationResult, map[string][]NamedBlockEntry, []NamedBlockDuplicateError) {
 	funcMapRegistry := BuildFuncMapRegistry(funcMaps)
-	// Phase 1: Parse all named blocks from the entire template tree.
+	// Parse all named blocks from the entire template tree.
 	namedBlocks, namedBlockErrors := parseAllNamedTemplates(baseDir, templateRoot)
 
-	// Phase 2: Build template-name → merged var list from all render calls.
+	// Build template-name → merged var list from all render calls.
 	renderVarsByTemplate := buildRenderVarIndex(renderCalls)
 
-	// Phase 3: Find all templates used as partials to avoid validating them with empty context.
+	// Find all templates used as partials to avoid validating them with empty context.
 	partialTargets := FindPartialTargets(baseDir, templateRoot)
 
-	// Phase 4: Validate render-call targets (existing behaviour).
+	// Validate render-call targets (existing behaviour).
 	renderErrors := validateRenderCallsConcurrently(renderCalls, baseDir, templateRoot, namedBlocks, partialTargets, funcMapRegistry)
 
-	// Phase 5: Validate all files in the tree not already covered.
+	// Validate all files in the tree not already covered.
 	treeErrors := validateTemplateTree(baseDir, templateRoot, namedBlocks, renderVarsByTemplate, partialTargets, funcMapRegistry)
 
-	// Phase 6: Validate named blocks not already covered by a render call.
+	// Validate named blocks not already covered by a render call.
 	blockErrors := validateOrphanedNamedBlocks(namedBlocks, renderVarsByTemplate, baseDir, templateRoot, partialTargets, funcMapRegistry)
 
 	allErrors := append(renderErrors, treeErrors...)
@@ -390,6 +390,8 @@ func validateRenderCallsConcurrently(
 		return errors
 	})
 }
+
+var validTemplateName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 // ValidateTemplateFile validates a single template file against its expected
 // variable context.  If the file does not exist it falls back to the named
