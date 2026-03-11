@@ -57,138 +57,57 @@ export class KnowledgeGraphPanel {
   }
 
   private buildHTML(graph: KnowledgeGraph): string {
-    const nodes: { id: string; label: string; group: string; level?: number }[] = [];
-    const edges: { from: string; to: string; label?: string; arrows?: string }[] = [];
-
-    for (const [tplPath, ctx] of graph.templates) {
-      const tplId = `tpl:${tplPath}`;
-      const tplName = tplPath.split('/').slice(-2).join('/');
-
-      nodes.push({
-        id: tplId,
-        label: tplName,
-        group: 'template',
-        level: 1,
-      });
-
-      // Add Go source files
-      for (const rc of ctx.renderCalls) {
-        const srcId = `src:${rc.file}:${rc.line}`;
-        const existingNode = nodes.find((n) => n.id === srcId);
-
-        if (!existingNode) {
-          const shortFile = rc.file.split('/').slice(-2).join('/');
-          nodes.push({
-            id: srcId,
-            label: `${shortFile}:${rc.line}`,
-            group: 'gofile',
-            level: 0,
-          });
-        }
-
-        edges.push({
-          from: srcId,
-          to: tplId,
-          label: 'renders',
-          arrows: 'to'
-        });
-      }
-
-      // Add variables
-      for (const [varName, v] of ctx.vars) {
-        const varId = `var:${tplPath}:${varName}`;
-        nodes.push({
-          id: varId,
-          label: `${varName}: ${this.shortType(v.type)}`,
-          group: 'variable',
-          level: 2,
-        });
-
-        edges.push({
-          from: tplId,
-          to: varId,
-          arrows: 'to'
-        });
-
-        // Add fields (limit to prevent overcrowding)
-        if (v.fields && v.fields.length > 0) {
-          const fieldsToShow = v.fields.slice(0, 6);
-
-          for (const f of fieldsToShow) {
-            const fId = `field:${tplPath}:${varName}:${f.name}`;
-            nodes.push({
-              id: fId,
-              label: `${f.name}: ${this.shortType(f.type)}`,
-              group: 'field',
-              level: 3,
-            });
-
-            edges.push({
-              from: varId,
-              to: fId,
-              arrows: 'to'
-            });
-          }
-
-          // Add indicator for more fields
-          if (v.fields.length > 6) {
-            const moreId = `more:${tplPath}:${varName}`;
-            nodes.push({
-              id: moreId,
-              label: `+${v.fields.length - 6} more fields`,
-              group: 'more',
-              level: 3,
-            });
-            edges.push({
-              from: varId,
-              to: moreId,
-              arrows: 'to'
-            });
-          }
-        }
-      }
-    }
-
-    const nodesJson = JSON.stringify(nodes);
-    const edgesJson = JSON.stringify(edges);
     const analyzedAt = graph.analyzedAt.toLocaleTimeString();
-
     const stats = {
       templates: graph.templates.size,
       handlers: new Set(Array.from(graph.templates.values()).flatMap(ctx => ctx.renderCalls.map(rc => rc.file))).size,
       variables: Array.from(graph.templates.values()).reduce((sum, ctx) => sum + ctx.vars.size, 0),
     };
 
+    // Helper to render variable fields recursively
+    function renderFields(fields: any[] | undefined, depth = 0): string {
+      if (!fields || fields.length === 0) return '';
+      return `<details style="margin-left:${depth * 16}px;">\n` +
+        `<summary>Fields (${fields.length})</summary>` +
+        `<ul style="margin:0; padding-left:16px;">` +
+        fields.map(f => `<li><b>${f.name}</b>: <span>${f.type}</span>${renderFields(f.fields, depth + 1)}</li>`).join('') +
+        `</ul></details>`;
+    }
+
+    // Helper to render variables
+    function renderVars(vars: Map<string, any>): string {
+      if (!vars || vars.size === 0) return '<em>No variables</em>';
+      return `<table class="vars-table">\n        <thead><tr><th>Name</th><th>Type</th><th>Fields</th></tr></thead>\n        <tbody>\n        ${Array.from(vars.values()).map(v => `\n          <tr>\n            <td>${v.name}</td>\n            <td>${v.type}</td>\n            <td>${v.fields && v.fields.length > 0 ? renderFields(v.fields) : '<em>None</em>'}</td>\n          </tr>\n        `).join('')}\n        </tbody>\n      </table>`;
+    }
+
+    // Helper to render renderCalls
+    function renderRenderCalls(renderCalls: any[]): string {
+      if (!renderCalls || renderCalls.length === 0) return '<em>No render calls</em>';
+      return `<ul>
+        ${renderCalls.map(rc => `<li><b>${rc.file}:${rc.line}</b> (vars: ${rc.vars.map((v: any) => v.name).join(', ')})</li>`).join('')}
+      </ul>`;
+    }
+
+    // Main HTML
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Knowledge Graph</title>
-  <script src="https://unpkg.com/vis-network@9.1.2/dist/vis-network.min.js"></script>
+  <title>Templates Table</title>
   <style>
-    * {
-      margin: 0;
-      padding: 0;
-      box-sizing: border-box;
-    }
-    
     body {
       font-family: var(--vscode-font-family);
       color: var(--vscode-foreground);
       background: var(--vscode-editor-background);
-      height: 100vh;
-      display: flex;
-      flex-direction: column;
+      margin: 0;
+      padding: 0;
     }
-    
     .header {
       padding: 16px 20px;
       background: var(--vscode-sideBar-background);
       border-bottom: 1px solid var(--vscode-panel-border);
-      flex-shrink: 0;
     }
-    
     .header h1 {
       font-size: 16px;
       font-weight: 600;
@@ -197,13 +116,11 @@ export class KnowledgeGraphPanel {
       align-items: center;
       gap: 8px;
     }
-    
     .header h1::before {
-      content: '⬡';
+      content: '📄';
       color: var(--vscode-textLink-foreground);
       font-size: 20px;
     }
-    
     .stats {
       display: flex;
       gap: 20px;
@@ -211,157 +128,59 @@ export class KnowledgeGraphPanel {
       color: var(--vscode-descriptionForeground);
       margin-bottom: 8px;
     }
-    
     .stat-item {
       display: flex;
       align-items: center;
       gap: 6px;
     }
-    
     .stat-value {
       font-weight: 600;
       color: var(--vscode-foreground);
     }
-    
-    .controls {
-      display: flex;
-      gap: 12px;
-      flex-wrap: wrap;
-      align-items: center;
+    .templates-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 24px 0;
     }
-    
-    .control-group {
-      display: flex;
-      gap: 8px;
-      align-items: center;
+    .templates-table th, .templates-table td {
+      border: 1px solid var(--vscode-panel-border);
+      padding: 8px 12px;
+      text-align: left;
+      vertical-align: top;
     }
-    
-    .control-group label {
-      font-size: 11px;
-      color: var(--vscode-descriptionForeground);
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
+    .templates-table th {
+      background: var(--vscode-sideBar-background);
     }
-    
-    select, button {
-      background: var(--vscode-dropdown-background);
-      color: var(--vscode-dropdown-foreground);
-      border: 1px solid var(--vscode-dropdown-border);
+    details {
+      margin-bottom: 8px;
+      background: var(--vscode-editorWidget-background);
+      border-radius: 4px;
       padding: 4px 8px;
-      font-size: 12px;
-      border-radius: 2px;
+    }
+    summary {
+      font-weight: 600;
       cursor: pointer;
     }
-    
-    button:hover {
-      background: var(--vscode-button-hoverBackground);
-    }
-    
-    #graph-container {
-      flex: 1;
-      position: relative;
-      overflow: hidden;
-    }
-    
-    #network {
+    .vars-table {
       width: 100%;
-      height: 100%;
+      border-collapse: collapse;
+      margin: 8px 0;
     }
-    
-    .empty-state {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      height: 100%;
-      color: var(--vscode-descriptionForeground);
-      text-align: center;
-      padding: 40px;
-    }
-    
-    .empty-state-icon {
-      font-size: 48px;
-      margin-bottom: 16px;
-      opacity: 0.5;
-    }
-    
-    .empty-state h2 {
-      font-size: 14px;
-      font-weight: 600;
-      margin-bottom: 8px;
-    }
-    
-    .empty-state p {
-      font-size: 12px;
-      max-width: 300px;
-    }
-    
-    .legend {
-      position: absolute;
-      bottom: 16px;
-      right: 16px;
-      background: var(--vscode-sideBar-background);
+    .vars-table th, .vars-table td {
       border: 1px solid var(--vscode-panel-border);
-      border-radius: 4px;
-      padding: 12px;
-      font-size: 11px;
-      box-shadow: 0 2px 8px rgba(0,0,0,0.15);
-    }
-    
-    .legend-title {
-      font-weight: 600;
-      margin-bottom: 8px;
-      color: var(--vscode-foreground);
-    }
-    
-    .legend-item {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      margin-bottom: 4px;
-    }
-    
-    .legend-color {
-      width: 16px;
-      height: 16px;
-      border-radius: 50%;
-      flex-shrink: 0;
-    }
-    
-    .info-panel {
-      position: absolute;
-      top: 16px;
-      left: 16px;
-      background: var(--vscode-sideBar-background);
-      border: 1px solid var(--vscode-panel-border);
-      border-radius: 4px;
-      padding: 12px;
-      max-width: 300px;
-      display: none;
-      box-shadow: 0 2px 8px rgba(0,0,0,0.15);
-    }
-    
-    .info-panel.visible {
-      display: block;
-    }
-    
-    .info-panel h3 {
+      padding: 4px 8px;
+      text-align: left;
+      vertical-align: top;
       font-size: 12px;
-      font-weight: 600;
-      margin-bottom: 8px;
     }
-    
-    .info-panel p {
-      font-size: 11px;
-      color: var(--vscode-descriptionForeground);
-      margin-bottom: 4px;
+    .vars-table th {
+      background: var(--vscode-sideBar-background);
     }
   </style>
 </head>
 <body>
   <div class="header">
-    <h1>Rex Template Knowledge Graph</h1>
-    
+    <h1>Rex Templates</h1>
     <div class="stats">
       <div class="stat-item">
         <span class="stat-value">${stats.templates}</span>
@@ -380,256 +199,31 @@ export class KnowledgeGraphPanel {
         <span>Updated ${analyzedAt}</span>
       </div>
     </div>
-    
-    <div class="controls">
-      <div class="control-group">
-        <label>Layout:</label>
-        <select id="layout-select">
-          <option value="hierarchical">Hierarchical</option>
-          <option value="force">Force-directed</option>
-          <option value="circular">Circular</option>
-        </select>
-      </div>
-      
-      <div class="control-group">
-        <label>Direction:</label>
-        <select id="direction-select">
-          <option value="UD">Top → Down</option>
-          <option value="LR">Left → Right</option>
-          <option value="DU">Bottom → Up</option>
-          <option value="RL">Right → Left</option>
-        </select>
-      </div>
-      
-      <button id="fit-btn">Fit to Screen</button>
-      <button id="reset-btn">Reset View</button>
-    </div>
   </div>
-  
-  <div id="graph-container">
-    ${nodes.length === 0 ? `
-      <div class="empty-state">
-        <div class="empty-state-icon">🔍</div>
-        <h2>No render calls found</h2>
-        <p>Rebuild the index to analyze your templates and handler relationships.</p>
-      </div>
-    ` : `
-      <div id="network"></div>
-      
-      <div id="info-panel" class="info-panel">
-        <h3 id="info-title">Select a node</h3>
-        <div id="info-content"></div>
-      </div>
-      
-      <div class="legend">
-        <div class="legend-title">Legend</div>
-        <div class="legend-item">
-          <div class="legend-color" style="background: #4CAF50;"></div>
-          <span>Go Handler</span>
-        </div>
-        <div class="legend-item">
-          <div class="legend-color" style="background: #2196F3;"></div>
-          <span>Template</span>
-        </div>
-        <div class="legend-item">
-          <div class="legend-color" style="background: #FF9800;"></div>
-          <span>Variable</span>
-        </div>
-        <div class="legend-item">
-          <div class="legend-color" style="background: #9C27B0;"></div>
-          <span>Field</span>
-        </div>
-      </div>
-    `}
+  <div style="padding: 20px;">
+    <table class="templates-table">
+      <thead>
+        <tr>
+          <th>Template</th>
+          <th>Context</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${Array.from(graph.templates.values()).map(ctx => `
+          <tr>
+            <td><b>${ctx.templatePath}</b></td>
+            <td>
+              <details>
+                <summary>Show Context</summary>
+                <div><b>Variables:</b>${renderVars(ctx.vars)}</div>
+                <div style="margin-top:8px;"><b>Render Calls:</b>${renderRenderCalls(ctx.renderCalls)}</div>
+              </details>
+            </td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
   </div>
-
-  <script>
-    (function() {
-      const nodes = ${nodesJson};
-      const edges = ${edgesJson};
-      
-      if (nodes.length === 0) return;
-      
-      const container = document.getElementById('network');
-      const infoPanel = document.getElementById('info-panel');
-      const infoTitle = document.getElementById('info-title');
-      const infoContent = document.getElementById('info-content');
-      
-      const colorMap = {
-        gofile: '#4CAF50',
-        template: '#2196F3',
-        variable: '#FF9800',
-        field: '#9C27B0',
-        more: '#757575'
-      };
-      
-      const shapeMap = {
-        gofile: 'box',
-        template: 'diamond',
-        variable: 'ellipse',
-        field: 'dot',
-        more: 'text'
-      };
-      
-      const nodesDataset = new vis.DataSet(
-        nodes.map(n => ({
-          id: n.id,
-          label: n.label,
-          group: n.group,
-          level: n.level,
-          color: {
-            background: colorMap[n.group],
-            border: colorMap[n.group],
-            highlight: {
-              background: colorMap[n.group],
-              border: '#FFF'
-            }
-          },
-          shape: shapeMap[n.group],
-          font: {
-            color: '#FFF',
-            size: n.group === 'more' ? 10 : 12,
-            face: 'monospace'
-          },
-          size: n.group === 'template' ? 20 : n.group === 'variable' ? 15 : 10
-        }))
-      );
-      
-      const edgesDataset = new vis.DataSet(
-        edges.map(e => ({
-          from: e.from,
-          to: e.to,
-          label: e.label,
-          arrows: e.arrows || 'to',
-          color: { color: '#666', highlight: '#FFF' },
-          smooth: { type: 'cubicBezier' },
-          font: { size: 10, color: '#999', strokeWidth: 0 }
-        }))
-      );
-      
-      let currentLayout = 'hierarchical';
-      let currentDirection = 'UD';
-      
-      function getOptions() {
-        const baseOptions = {
-          nodes: {
-            borderWidth: 2,
-            borderWidthSelected: 3
-          },
-          edges: {
-            width: 1.5,
-            selectionWidth: 3
-          },
-          physics: {
-            enabled: currentLayout !== 'hierarchical',
-            stabilization: {
-              iterations: 200
-            }
-          },
-          interaction: {
-            hover: true,
-            navigationButtons: true,
-            keyboard: true
-          }
-        };
-        
-        if (currentLayout === 'hierarchical') {
-          baseOptions.layout = {
-            hierarchical: {
-              enabled: true,
-              direction: currentDirection,
-              sortMethod: 'directed',
-              nodeSpacing: 150,
-              levelSeparation: 200,
-              treeSpacing: 200
-            }
-          };
-        } else if (currentLayout === 'force') {
-          baseOptions.layout = {
-            randomSeed: 42
-          };
-          baseOptions.physics = {
-            enabled: true,
-            barnesHut: {
-              gravitationalConstant: -2000,
-              springConstant: 0.001,
-              springLength: 200
-            },
-            stabilization: {
-              iterations: 300
-            }
-          };
-        } else if (currentLayout === 'circular') {
-          baseOptions.layout = {
-            randomSeed: undefined
-          };
-          baseOptions.physics = {
-            enabled: false
-          };
-        }
-        
-        return baseOptions;
-      }
-      
-      let network = new vis.Network(container, {
-        nodes: nodesDataset,
-        edges: edgesDataset
-      }, getOptions());
-      
-      // Event handlers
-      network.on('click', function(params) {
-        if (params.nodes.length > 0) {
-          const nodeId = params.nodes[0];
-          const node = nodesDataset.get(nodeId);
-          
-          infoTitle.textContent = node.label;
-          
-          let content = '';
-          content += '<p><strong>Type:</strong> ' + node.group + '</p>';
-          
-          const connected = network.getConnectedNodes(nodeId);
-          if (connected.length > 0) {
-            content += '<p><strong>Connected:</strong> ' + connected.length + ' nodes</p>';
-          }
-          
-          infoContent.innerHTML = content;
-          infoPanel.classList.add('visible');
-        } else {
-          infoPanel.classList.remove('visible');
-        }
-      });
-      
-      // Controls
-      document.getElementById('layout-select').addEventListener('change', function(e) {
-        currentLayout = e.target.value;
-        network.setOptions(getOptions());
-        network.fit();
-      });
-      
-      document.getElementById('direction-select').addEventListener('change', function(e) {
-        currentDirection = e.target.value;
-        if (currentLayout === 'hierarchical') {
-          network.setOptions(getOptions());
-          network.fit();
-        }
-      });
-      
-      document.getElementById('fit-btn').addEventListener('click', function() {
-        network.fit({ animation: true });
-      });
-      
-      document.getElementById('reset-btn').addEventListener('click', function() {
-        network.moveTo({
-          position: {x: 0, y: 0},
-          scale: 1,
-          animation: true
-        });
-      });
-      
-      // Initial fit
-      setTimeout(() => network.fit(), 100);
-    })();
-  </script>
 </body>
 </html>`;
   }
