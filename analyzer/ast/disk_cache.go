@@ -10,6 +10,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // diskCacheVersion must be bumped whenever AnalysisResult's schema changes in a
@@ -23,11 +26,50 @@ type diskCacheEntry struct {
 	Result     AnalysisResult `json:"r"`
 }
 
+// hashCacheEntry caches a computed source hash with its computation time.
+type hashCacheEntry struct {
+	hash       string
+	computedAt time.Time
+}
+
+// hashCache is an in-memory cache of source hashes to avoid redundant filesystem walks.
+// The TTL is 2 seconds — fast enough for interactive use, long enough to amortise
+// repeated calls within a single analysis cycle (ReadDiskCache + WriteDiskCache).
+var (
+	hashCacheMu    sync.RWMutex
+	hashCacheStore = make(map[string]hashCacheEntry, 4)
+	hashCacheTTL   = 2 * time.Second
+)
+
 // computeSourceHash produces a fast fingerprint of every Go source file under
 // dir plus the optional contextFile.  We use path + mtime + size rather than
 // content hashing – O(n) stat calls, no file reads, milliseconds for most
 // projects.  Vendor and hidden directories are skipped.
+//
+// Results are cached in-process for hashCacheTTL to avoid redundant walks when
+// ReadDiskCache and WriteDiskCache are called in the same analysis cycle.
 func computeSourceHash(dir, contextFile string) string {
+	cacheKey := dir + "\x00" + contextFile
+
+	// Fast path: check in-memory cache under read lock.
+	hashCacheMu.RLock()
+	if entry, ok := hashCacheStore[cacheKey]; ok && time.Since(entry.computedAt) < hashCacheTTL {
+		hashCacheMu.RUnlock()
+		return entry.hash
+	}
+	hashCacheMu.RUnlock()
+
+	hash := computeSourceHashSlow(dir, contextFile)
+
+	hashCacheMu.Lock()
+	hashCacheStore[cacheKey] = hashCacheEntry{hash: hash, computedAt: time.Now()}
+	hashCacheMu.Unlock()
+
+	return hash
+}
+
+// computeSourceHashSlow is the actual filesystem walk. Called only on cache miss.
+func computeSourceHashSlow(dir, contextFile string) string {
 	type fe struct {
 		p    string
 		mods int64 // mod-time nanoseconds
@@ -42,11 +84,8 @@ func computeSourceHash(dir, contextFile string) string {
 		}
 
 		if d.IsDir() {
-			// Skip vendor, node_modules, and hidden directories to avoid unnecessary cache misses
 			name := d.Name()
-			if name == "vendor" ||
-				name == "node_modules" ||
-				strings.HasPrefix(name, ".") {
+			if name == "vendor" || name == "node_modules" || strings.HasPrefix(name, ".") {
 				return filepath.SkipDir
 			}
 			return nil
@@ -79,9 +118,16 @@ func computeSourceHash(dir, contextFile string) string {
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
+// InvalidateHashCache removes the in-memory hash cache entry for dir so the
+// next call to computeSourceHash performs a fresh filesystem walk.
+func InvalidateHashCache(dir, contextFile string) {
+	cacheKey := dir + "\x00" + contextFile
+	hashCacheMu.Lock()
+	delete(hashCacheStore, cacheKey)
+	hashCacheMu.Unlock()
+}
+
 // diskCachePath returns the path for the gzip-compressed cache file.
-// The path is stable: it depends only on the canonical directory path and the
-// contextFile argument (not on source content).
 func diskCachePath(dir, contextFile string) string {
 	base, err := os.UserCacheDir()
 	if err != nil {
@@ -93,12 +139,38 @@ func diskCachePath(dir, contextFile string) string {
 	return filepath.Join(base, "rex-template-analyzer", fmt.Sprintf("%x.gz", sum[:8]))
 }
 
-// ReadDiskCache attempts to load a previously cached AnalysisResult.
-// It returns (result, true) on a valid cache hit, (nil, false) otherwise.
-// Stale entries (wrong version or source hash mismatch) are silently discarded.
-func ReadDiskCache(dir, contextFile string) (*AnalysisResult, bool) {
-	path := diskCachePath(dir, contextFile)
+// inMemoryCache holds the last AnalysisResult per (dir, contextFile) key so that
+// a second call within the same process (e.g. from a test) avoids deserializing
+// the gzip+JSON blob entirely.
+var (
+	inMemCacheMu    sync.RWMutex
+	inMemCacheStore = make(map[string]*AnalysisResult, 4)
+	// inMemCacheHash tracks the source hash that was current when the entry was stored.
+	inMemCacheHash = make(map[string]string, 4)
+)
 
+// inMemoryCacheHits is an atomic counter for observability / benchmarks.
+var inMemoryCacheHits atomic.Int64
+
+// ReadDiskCache attempts to load a previously cached AnalysisResult.
+// Check order: (1) in-process memory cache, (2) gzip+JSON on disk.
+func ReadDiskCache(dir, contextFile string) (*AnalysisResult, bool) {
+	cacheKey := dir + "\x00" + contextFile
+	currentHash := computeSourceHash(dir, contextFile)
+
+	// 1. In-process cache: O(1) lookup, no I/O.
+	inMemCacheMu.RLock()
+	if result, ok := inMemCacheStore[cacheKey]; ok {
+		if inMemCacheHash[cacheKey] == currentHash {
+			inMemCacheMu.RUnlock()
+			inMemoryCacheHits.Add(1)
+			return result, true
+		}
+	}
+	inMemCacheMu.RUnlock()
+
+	// 2. Disk cache: decompress + decode.
+	path := diskCachePath(dir, contextFile)
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, false
@@ -120,22 +192,35 @@ func ReadDiskCache(dir, contextFile string) (*AnalysisResult, bool) {
 		return nil, false
 	}
 
-	if entry.SourceHash != computeSourceHash(dir, contextFile) {
+	if entry.SourceHash != currentHash {
 		return nil, false
 	}
 
-	return &entry.Result, true
+	result := &entry.Result
+
+	// Populate in-memory cache so subsequent calls skip disk I/O.
+	inMemCacheMu.Lock()
+	inMemCacheStore[cacheKey] = result
+	inMemCacheHash[cacheKey] = currentHash
+	inMemCacheMu.Unlock()
+
+	return result, true
 }
 
 // WriteDiskCache serializes result to disk using gzip+JSON.
-// It writes to a temporary file then renames atomically to avoid partial reads.
-// The write is synchronous so callers can be sure the cache is ready before the
-// process exits; the added latency (~150 ms for a 10 MB pre-flatten result) only
-// applies to cache-miss runs.
+// Also updates the in-memory cache atomically.
 func WriteDiskCache(dir, contextFile string, result AnalysisResult) {
 	hash := computeSourceHash(dir, contextFile)
-	path := diskCachePath(dir, contextFile)
+	cacheKey := dir + "\x00" + contextFile
 
+	// Update in-memory cache first (fast path for next ReadDiskCache call).
+	resultCopy := result // shallow copy to avoid sharing mutable slices
+	inMemCacheMu.Lock()
+	inMemCacheStore[cacheKey] = &resultCopy
+	inMemCacheHash[cacheKey] = hash
+	inMemCacheMu.Unlock()
+
+	path := diskCachePath(dir, contextFile)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return
 	}
@@ -146,7 +231,6 @@ func WriteDiskCache(dir, contextFile string, result AnalysisResult) {
 		return
 	}
 
-	// BestSpeed: fast write, still achieves 5-8x compression on repetitive JSON.
 	gw, _ := gzip.NewWriterLevel(f, gzip.BestSpeed)
 
 	entry := diskCacheEntry{
@@ -164,8 +248,9 @@ func WriteDiskCache(dir, contextFile string, result AnalysisResult) {
 		return
 	}
 
-	os.Rename(tmpPath, path) // atomic on POSIX
-	// Remove all other cache entries in the directory so only one is kept.
+	os.Rename(tmpPath, path)
+
+	// Remove stale cache siblings.
 	cacheDir := filepath.Dir(path)
 	if entries, err := os.ReadDir(cacheDir); err == nil {
 		for _, e := range entries {
@@ -177,7 +262,15 @@ func WriteDiskCache(dir, contextFile string, result AnalysisResult) {
 	}
 }
 
-// ClearDiskCache removes the on-disk cache entry for the given directory.
+// ClearDiskCache removes the on-disk and in-memory cache entries for dir.
 func ClearDiskCache(dir, contextFile string) {
 	os.Remove(diskCachePath(dir, contextFile))
+
+	cacheKey := dir + "\x00" + contextFile
+	inMemCacheMu.Lock()
+	delete(inMemCacheStore, cacheKey)
+	delete(inMemCacheHash, cacheKey)
+	inMemCacheMu.Unlock()
+
+	InvalidateHashCache(dir, contextFile)
 }

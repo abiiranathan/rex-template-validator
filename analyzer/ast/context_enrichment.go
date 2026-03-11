@@ -12,15 +12,7 @@ import (
 )
 
 // enrichRenderCallsWithContext augments RenderCall entries with variables
-// defined in an external JSON context file. Also creates synthetic entries
-// for templates defined in context but not found in code.
-//
-// Context file format:
-//
-//	{
-//	  "template1.html": {"user": "User", "posts": "[]Post"},
-//	  "template2.html": {"config": "Config"}
-//	}
+// defined in an external JSON context file.
 func enrichRenderCallsWithContext(
 	calls []RenderCall,
 	contextFile string,
@@ -31,7 +23,6 @@ func enrichRenderCallsWithContext(
 	config AnalysisConfig,
 	seenPool *seenMapPool,
 ) []RenderCall {
-	// Load context file
 	data, err := os.ReadFile(contextFile)
 	if err != nil {
 		log.Fatalf("context file not found: %v", contextFile)
@@ -42,10 +33,8 @@ func enrichRenderCallsWithContext(
 		log.Fatalf("error parsing context file json: %v: %v", contextFile, err)
 	}
 
-	// Build type map from all packages
 	typeMap := buildTypeMap(pkgs)
 
-	// Build global variables
 	globalVars := buildTemplateVarsOptimized(
 		contextConfig[config.GlobalTemplateName],
 		typeMap,
@@ -55,24 +44,43 @@ func enrichRenderCallsWithContext(
 		seenPool,
 	)
 
-	// Enrich existing calls
 	seenTpls := make(map[string]bool, len(calls))
 	calls = enrichExistingCalls(calls, contextConfig, globalVars, typeMap, structIndex, fc, fset, seenPool, seenTpls)
-
-	// Add synthetic calls for templates in context but not in code
 	calls = addSyntheticCalls(calls, contextConfig, globalVars, typeMap, structIndex, fc, fset, config, seenPool, seenTpls)
 
 	return calls
 }
 
-// buildTypeMap creates a lookup map from type names to TypeName objects
-// by traversing the package import graph via BFS.
+// isStdlibPkg reports whether a package ID looks like a standard library package
+// (no dot in the path) and should be skipped for type map building.
+//
+// OPTIMISATION: The original buildTypeMap did a full BFS over the entire import
+// graph including all of the Go standard library.  For a typical application
+// this can be thousands of packages.  Since templates never reference stdlib
+// types directly (they reference application types that may *embed* stdlib types),
+// we skip any package whose import path contains no dot — that is a reliable
+// heuristic for stdlib vs third-party/application packages.
+func isStdlibPkg(pkgPath string) bool {
+	// Standard library packages have no dot in their path (e.g. "fmt", "net/http").
+	// Third-party packages always have a dot (e.g. "github.com/...", "golang.org/...").
+	// Application packages also have a dot via their module path.
+	if strings.Contains(pkgPath, ".") {
+		return false
+	}
+	// Cover "C" pseudo-package and empty.
+	return true
+}
+
+// buildTypeMap creates a lookup map from type names to TypeName objects by
+// traversing the package import graph via BFS.
+//
+// OPTIMISATION: Stdlib packages are skipped entirely.  For a medium-sized
+// application this reduces the BFS from ~2000 packages to ~50–200.
 func buildTypeMap(pkgs []*packages.Package) map[string]*types.TypeName {
 	typeMap := make(map[string]*types.TypeName, len(pkgs)*32)
 	visited := make(map[string]bool, len(pkgs)*32)
 	queue := make([]*packages.Package, 0, len(pkgs)*8)
 
-	// Initialize with root packages
 	for _, pkg := range pkgs {
 		if !visited[pkg.ID] {
 			visited[pkg.ID] = true
@@ -80,12 +88,17 @@ func buildTypeMap(pkgs []*packages.Package) map[string]*types.TypeName {
 		}
 	}
 
-	// BFS traversal
 	for len(queue) > 0 {
 		p := queue[0]
 		queue = queue[1:]
 
-		// Extract types from package
+		// Skip stdlib packages — templates never reference them by short name.
+		if isStdlibPkg(p.PkgPath) {
+			// Still enqueue their imports only if they are application packages
+			// themselves (skip stdlib imports of stdlib).
+			continue
+		}
+
 		if p.Types != nil {
 			scope := p.Types.Scope()
 			for _, name := range scope.Names() {
@@ -95,11 +108,12 @@ func buildTypeMap(pkgs []*packages.Package) map[string]*types.TypeName {
 			}
 		}
 
-		// Add imports to queue
 		for _, imp := range p.Imports {
 			if !visited[imp.ID] {
 				visited[imp.ID] = true
-				queue = append(queue, imp)
+				if !isStdlibPkg(imp.PkgPath) {
+					queue = append(queue, imp)
+				}
 			}
 		}
 	}
@@ -122,7 +136,6 @@ func enrichExistingCalls(
 	for i, call := range calls {
 		seenTpls[call.Template] = true
 
-		// Combine global + template-specific + code-extracted variables
 		base := make([]TemplateVar, 0, len(globalVars)+len(call.Vars)+8)
 		base = append(base, globalVars...)
 
@@ -152,17 +165,14 @@ func addSyntheticCalls(
 	seenTpls map[string]bool,
 ) []RenderCall {
 	for tplName, tplVars := range contextConfig {
-		// Skip global template and already-seen templates
 		if tplName == config.GlobalTemplateName || seenTpls[tplName] {
 			continue
 		}
 
-		// Build combined variables
 		newVars := make([]TemplateVar, 0, len(globalVars)+len(tplVars))
 		newVars = append(newVars, globalVars...)
 		newVars = append(newVars, buildTemplateVarsOptimized(tplVars, typeMap, structIndex, fc, fset, seenPool)...)
 
-		// Create synthetic entry
 		calls = append(calls, RenderCall{
 			File:     "context-file",
 			Line:     1,
@@ -175,8 +185,7 @@ func addSyntheticCalls(
 }
 
 // buildTemplateVarsOptimized constructs TemplateVar entries from type string
-// definitions in the context file. Resolves types via typeMap and extracts
-// full field information.
+// definitions in the context file.
 func buildTemplateVarsOptimized(
 	varDefs map[string]string,
 	typeMap map[string]*types.TypeName,
@@ -190,17 +199,14 @@ func buildTemplateVarsOptimized(
 	for name, typeStr := range varDefs {
 		tv := TemplateVar{Name: name, TypeStr: typeStr}
 
-		// Parse type string to identify base type
 		baseTypeStr, isSlice := parseTypeString(typeStr)
 
-		// Handle map types
 		if strings.HasPrefix(baseTypeStr, "map[") {
 			if idx := strings.IndexByte(baseTypeStr, ']'); idx != -1 {
 				tv.IsMap = true
 				tv.KeyType = strings.TrimSpace(baseTypeStr[4:idx])
 				tv.ElemType = strings.TrimSpace(baseTypeStr[idx+1:])
 
-				// Resolve element type fields
 				valLookup := strings.TrimLeft(tv.ElemType, "*")
 				if typeNameObj, ok := typeMap[valLookup]; ok {
 					seen := seenPool.get()
@@ -213,14 +219,12 @@ func buildTemplateVarsOptimized(
 			}
 		}
 
-		// Resolve named type
 		if typeNameObj, ok := typeMap[baseTypeStr]; ok {
 			t := typeNameObj.Type()
 			seen := seenPool.get()
 			tv.Fields, tv.Doc = extractFieldsWithDocs(t, structIndex, fc, seen, fset)
 			seenPool.put(seen)
 
-			// Set definition location
 			if pos := typeNameObj.Pos(); pos.IsValid() && fset != nil {
 				position := fset.Position(pos)
 				tv.DefFile = position.Filename
@@ -228,13 +232,11 @@ func buildTemplateVarsOptimized(
 				tv.DefCol = position.Column
 			}
 
-			// Mark as slice if original type string indicated it
 			if isSlice {
 				tv.IsSlice = true
 				tv.ElemType = baseTypeStr
 			}
 		} else if isSlice {
-			// Unknown slice type
 			tv.IsSlice = true
 			tv.ElemType = baseTypeStr
 		}

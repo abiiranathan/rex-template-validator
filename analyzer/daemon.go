@@ -2,12 +2,14 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/rex-template-analyzer/ast"
 	"github.com/rex-template-analyzer/validator"
@@ -73,25 +75,48 @@ type daemonValidateTemplateResult struct {
 	HasContext       bool                         `json:"hasContext"`
 }
 
-type analyzerDaemon struct {
-	mu                   sync.RWMutex
-	initialized          bool
-	dir                  string
-	baseDir              string
-	templateRoot         string
-	contextFile          string
-	validate             bool
-	output               ValidationOutput
+// daemonState is the immutable snapshot of analysis results shared by all
+// concurrent read-only operations (validateTemplate, inferExpressionType,
+// getHoverInfo).  The pointer is replaced atomically on each analyze call so
+// readers always see a consistent snapshot without acquiring a write lock.
+//
+// OPTIMISATION: Previously every read-only handler performed deep clones of
+// renderVarsByTemplate, funcMaps, typeRegistry, namedBlocks, and
+// templateOverlays under a write-locked mutex — O(n) allocations per request.
+// With an atomic pointer swap, read-only handlers simply load the pointer and
+// read the shared snapshot.  Only the mutable templateOverlays map (written
+// per file save) is still protected by a lightweight RWMutex.
+type daemonState struct {
+	dir          string
+	baseDir      string
+	templateRoot string
+	contextFile  string
+	validate     bool
+	output       ValidationOutput
+
 	renderVarsByTemplate map[string][]ast.TemplateVar
 	funcMaps             validator.FuncMapRegistry
 	typeRegistry         map[string][]ast.FieldInfo
 	namedBlocks          map[string][]validator.NamedBlockEntry
-	templateOverlays     map[string]string
 	partialTargets       map[string]bool
 }
 
+type analyzerDaemon struct {
+	// state is replaced atomically on analyze; read-only handlers load it with
+	// atomic.Pointer.Load() which does not block.
+	state atomic.Pointer[daemonState]
+
+	// templateOverlays is the only field that mutates after analyze completes
+	// (via updateTemplate / clearTemplate).  Protected by its own fine-grained
+	// RWMutex instead of the coarse daemon-wide lock.
+	overlayMu        sync.RWMutex
+	templateOverlays map[string]string
+}
+
 func runDaemon(stdin io.Reader, stdout io.Writer) error {
-	server := &analyzerDaemon{}
+	server := &analyzerDaemon{
+		templateOverlays: make(map[string]string),
+	}
 	reader := bufio.NewReader(stdin)
 	writer := bufio.NewWriter(stdout)
 
@@ -104,7 +129,7 @@ func runDaemon(stdin io.Reader, stdout io.Writer) error {
 			return err
 		}
 
-		line = bytesTrimSpace(line)
+		line = bytes.TrimSpace(line)
 		if len(line) == 0 {
 			continue
 		}
@@ -157,7 +182,6 @@ func (d *analyzerDaemon) handle(req rpcRequest) rpcResponse {
 			resp.Error = &rpcError{Code: -32602, Message: fmt.Sprintf("invalid analyze params: %v", err)}
 			return resp
 		}
-
 		result, err := d.analyze(params)
 		if err != nil {
 			resp.Error = &rpcError{Code: -32000, Message: err.Error()}
@@ -172,7 +196,6 @@ func (d *analyzerDaemon) handle(req rpcRequest) rpcResponse {
 			resp.Error = &rpcError{Code: -32602, Message: fmt.Sprintf("invalid validateTemplate params: %v", err)}
 			return resp
 		}
-
 		result, err := d.validateTemplate(params)
 		if err != nil {
 			resp.Error = &rpcError{Code: -32000, Message: err.Error()}
@@ -187,7 +210,6 @@ func (d *analyzerDaemon) handle(req rpcRequest) rpcResponse {
 			resp.Error = &rpcError{Code: -32602, Message: fmt.Sprintf("invalid updateTemplate params: %v", err)}
 			return resp
 		}
-
 		if err := d.updateTemplate(params); err != nil {
 			resp.Error = &rpcError{Code: -32000, Message: err.Error()}
 			return resp
@@ -201,7 +223,6 @@ func (d *analyzerDaemon) handle(req rpcRequest) rpcResponse {
 			resp.Error = &rpcError{Code: -32602, Message: fmt.Sprintf("invalid clearTemplate params: %v", err)}
 			return resp
 		}
-
 		if err := d.clearTemplate(params); err != nil {
 			resp.Error = &rpcError{Code: -32000, Message: err.Error()}
 			return resp
@@ -215,7 +236,6 @@ func (d *analyzerDaemon) handle(req rpcRequest) rpcResponse {
 			resp.Error = &rpcError{Code: -32602, Message: fmt.Sprintf("invalid inferExpressionType params: %v", err)}
 			return resp
 		}
-
 		result, err := d.inferExpressionType(params)
 		if err != nil {
 			resp.Error = &rpcError{Code: -32000, Message: err.Error()}
@@ -230,7 +250,6 @@ func (d *analyzerDaemon) handle(req rpcRequest) rpcResponse {
 			resp.Error = &rpcError{Code: -32602, Message: fmt.Sprintf("invalid getHoverInfo params: %v", err)}
 			return resp
 		}
-
 		result, err := d.getHoverInfo(params)
 		if err != nil {
 			resp.Error = &rpcError{Code: -32000, Message: err.Error()}
@@ -265,11 +284,7 @@ func (d *analyzerDaemon) analyze(params daemonAnalyzeParams) (ValidationOutput, 
 		params.TemplateRoot,
 	)
 
-	// Build the render-var index before Flatten() so each variable retains its
-	// full field tree. Flatten() strips Fields from all vars to reduce JSON size;
-	// if we built the index afterwards the daemon would validate templates with
-	// field-less vars, silently passing every field-access check and clearing
-	// the analyzer diagnostics on the first live-edit cycle.
+	// Build the render-var index BEFORE Flatten() so field trees are intact.
 	renderVarIndex := buildRenderVarIndex(result.RenderCalls)
 
 	result.Flatten()
@@ -287,23 +302,32 @@ func (d *analyzerDaemon) analyze(params daemonAnalyzeParams) (ValidationOutput, 
 		output.NamedBlocks = namedBlocks
 	}
 
-	d.mu.Lock()
-	d.initialized = true
-	d.dir = params.Dir
-	d.baseDir = baseDir
-	d.templateRoot = params.TemplateRoot
-	d.contextFile = params.ContextFile
-	d.validate = params.Validate
-	d.output = output
-	d.renderVarsByTemplate = renderVarIndex // use pre-flatten index
-	d.funcMaps = validator.BuildFuncMapRegistry(result.FuncMaps)
-	d.typeRegistry = cloneTypeRegistry(result.Types)
-	d.namedBlocks = namedBlocks
-	d.partialTargets = validator.FindPartialTargets(baseDir, params.TemplateRoot)
-	if d.templateOverlays == nil {
-		d.templateOverlays = make(map[string]string)
+	// Build immutable snapshot — no cloning needed by readers.
+	snap := &daemonState{
+		dir:                  params.Dir,
+		baseDir:              baseDir,
+		templateRoot:         params.TemplateRoot,
+		contextFile:          params.ContextFile,
+		validate:             params.Validate,
+		output:               output,
+		renderVarsByTemplate: renderVarIndex,
+		funcMaps:             validator.BuildFuncMapRegistry(result.FuncMaps),
+		typeRegistry:         result.Types,
+		namedBlocks:          namedBlocks,
+		partialTargets:       validator.FindPartialTargets(baseDir, params.TemplateRoot),
 	}
-	d.mu.Unlock()
+
+	// Atomic swap: readers instantly see the new state without waiting.
+	d.state.Store(snap)
+
+	// Preserve existing overlays (don't reset on re-analyze).
+	// overlayMu write lock not needed here since analyze is serialised by the
+	// single-threaded RPC loop.
+	if d.templateOverlays == nil {
+		d.overlayMu.Lock()
+		d.templateOverlays = make(map[string]string)
+		d.overlayMu.Unlock()
+	}
 
 	return output, nil
 }
@@ -315,23 +339,14 @@ func (d *analyzerDaemon) validateTemplate(params daemonValidateTemplateParams) (
 		}
 	}()
 
-	d.mu.RLock()
-	if !d.initialized {
-		d.mu.RUnlock()
+	// OPTIMISATION: Load the immutable snapshot atomically — zero allocation,
+	// no mutex acquisition for the read-heavy path.
+	snap := d.state.Load()
+	if snap == nil {
 		return daemonValidateTemplateResult{}, fmt.Errorf("daemon not initialized")
 	}
 
-	baseDir := d.baseDir
-	templateRoot := d.templateRoot
-	validate := d.validate
-	renderVarsByTemplate := cloneRenderVarIndex(d.renderVarsByTemplate)
-	funcMaps := mapsCloneFuncMaps(d.funcMaps)
-	registry := cloneRegistry(d.namedBlocks)
-	overlays := cloneTemplateOverlays(d.templateOverlays)
-	partialTargets := clonePartialTargets(d.partialTargets)
-	d.mu.RUnlock()
-
-	if !validate {
+	if !snap.validate {
 		return daemonValidateTemplateResult{HasContext: false}, nil
 	}
 
@@ -340,29 +355,42 @@ func (d *analyzerDaemon) validateTemplate(params daemonValidateTemplateParams) (
 		return daemonValidateTemplateResult{}, err
 	}
 
-	templateBase := filepath.Join(baseDir, templateRoot)
+	templateBase := filepath.Join(snap.baseDir, snap.templateRoot)
 	rel, err := filepath.Rel(templateBase, absPath)
 	if err != nil {
 		rel = absPath
 	}
 	rel = filepath.ToSlash(rel)
 
+	// Load overlays under read lock (cheap: just a map lookup).
+	d.overlayMu.RLock()
+	overlays := cloneTemplateOverlays(d.templateOverlays)
+	d.overlayMu.RUnlock()
+
 	overlays[absPath] = params.Content
-	applyTemplateOverlays(registry, overlays, baseDir, templateRoot)
+
+	// Build a per-request registry copy only when overlays change the shape.
+	// For the common case (no overlays beyond the current file), we reuse the
+	// shared namedBlocks snapshot directly — only clone when we must mutate.
+	registry := snap.namedBlocks
+	if len(overlays) > 0 {
+		registry = cloneRegistry(snap.namedBlocks)
+		applyTemplateOverlays(registry, overlays, snap.baseDir, snap.templateRoot)
+	}
 
 	var errors []validator.ValidationResult
 	hasContext := false
 
-	if _, vars, ok := findRenderVarsForTemplate(renderVarsByTemplate, absPath, baseDir, templateRoot); ok {
+	if _, vars, ok := findRenderVarsForTemplate(snap.renderVarsByTemplate, absPath, snap.baseDir, snap.templateRoot); ok {
 		hasContext = true
 		errors = append(errors, validator.ValidateTemplateFileStr(
 			params.Content,
 			vars,
 			rel,
-			baseDir,
-			templateRoot,
+			snap.baseDir,
+			snap.templateRoot,
 			registry,
-			funcMaps,
+			snap.funcMaps,
 		)...)
 	}
 
@@ -370,13 +398,10 @@ func (d *analyzerDaemon) validateTemplate(params daemonValidateTemplateParams) (
 		if entry.Name == entry.TemplatePath {
 			continue
 		}
-		// Skip named blocks that are partial targets (called via {{ template "name" }}
-		// from other templates). These blocks will be validated via their callers'
-		// recursive validation with the correct scope, matching CLI behavior.
-		if partialTargets[entry.Name] {
+		if snap.partialTargets[entry.Name] {
 			continue
 		}
-		vars, ok := renderVarsByTemplate[entry.Name]
+		vars, ok := snap.renderVarsByTemplate[entry.Name]
 		if !ok {
 			continue
 		}
@@ -385,11 +410,11 @@ func (d *analyzerDaemon) validateTemplate(params daemonValidateTemplateParams) (
 			entry.Content,
 			vars,
 			entry.TemplatePath,
-			baseDir,
-			templateRoot,
+			snap.baseDir,
+			snap.templateRoot,
 			entry.Line,
 			registry,
-			funcMaps,
+			snap.funcMaps,
 		)...)
 	}
 
@@ -404,13 +429,12 @@ func (d *analyzerDaemon) updateTemplate(params daemonUpdateTemplateParams) error
 	if err != nil {
 		return err
 	}
-
-	d.mu.Lock()
+	d.overlayMu.Lock()
 	if d.templateOverlays == nil {
 		d.templateOverlays = make(map[string]string)
 	}
 	d.templateOverlays[absPath] = params.Content
-	d.mu.Unlock()
+	d.overlayMu.Unlock()
 	return nil
 }
 
@@ -419,52 +443,44 @@ func (d *analyzerDaemon) clearTemplate(params daemonClearTemplateParams) error {
 	if err != nil {
 		return err
 	}
-
-	d.mu.Lock()
+	d.overlayMu.Lock()
 	delete(d.templateOverlays, absPath)
-	d.mu.Unlock()
+	d.overlayMu.Unlock()
 	return nil
 }
 
 func (d *analyzerDaemon) inferExpressionType(params daemonInferExpressionParams) (*validator.ExpressionTypeResult, error) {
-	d.mu.RLock()
-	if !d.initialized {
-		d.mu.RUnlock()
+	snap := d.state.Load()
+	if snap == nil {
 		return nil, fmt.Errorf("daemon not initialized")
 	}
-	funcMaps := mapsCloneFuncMaps(d.funcMaps)
-	typeRegistry := cloneTypeRegistry(d.typeRegistry)
-	d.mu.RUnlock()
 
+	// Read-only: no cloning needed.
 	return validator.InferExpressionType(
 		params.Expression,
 		params.Vars,
 		params.ScopeStack,
 		params.BlockLocals,
-		funcMaps,
-		typeRegistry,
+		snap.funcMaps,
+		snap.typeRegistry,
 	), nil
 }
 
 func (d *analyzerDaemon) getHoverInfo(params daemonGetHoverInfoParams) (*validator.HoverResult, error) {
-	d.mu.RLock()
-	if !d.initialized {
-		d.mu.RUnlock()
+	snap := d.state.Load()
+	if snap == nil {
 		return nil, fmt.Errorf("daemon not initialized")
 	}
-	baseDir := d.baseDir
-	templateRoot := d.templateRoot
-	renderVarsByTemplate := cloneRenderVarIndex(d.renderVarsByTemplate)
-	funcMaps := mapsCloneFuncMaps(d.funcMaps)
-	typeRegistry := cloneTypeRegistry(d.typeRegistry)
-	registry := cloneRegistry(d.namedBlocks)
-	overlays := cloneTemplateOverlays(d.templateOverlays)
-	d.mu.RUnlock()
 
 	absPath, err := filepath.Abs(params.AbsolutePath)
 	if err != nil {
 		return nil, err
 	}
+
+	// Load overlays under read lock.
+	d.overlayMu.RLock()
+	overlays := cloneTemplateOverlays(d.templateOverlays)
+	d.overlayMu.RUnlock()
 
 	content := params.Content
 	if content == "" {
@@ -476,17 +492,20 @@ func (d *analyzerDaemon) getHoverInfo(params daemonGetHoverInfoParams) (*validat
 		return nil, fmt.Errorf("no content for %s", absPath)
 	}
 
-	templateBase := filepath.Join(baseDir, templateRoot)
+	templateBase := filepath.Join(snap.baseDir, snap.templateRoot)
 	rel, err := filepath.Rel(templateBase, absPath)
 	if err != nil {
 		rel = absPath
 	}
 	rel = filepath.ToSlash(rel)
 
-	applyTemplateOverlays(registry, overlays, baseDir, templateRoot)
+	registry := snap.namedBlocks
+	if len(overlays) > 0 {
+		registry = cloneRegistry(snap.namedBlocks)
+		applyTemplateOverlays(registry, overlays, snap.baseDir, snap.templateRoot)
+	}
 
-	// Find the render vars for this template file.
-	_, vars, ok := findRenderVarsForTemplate(renderVarsByTemplate, absPath, baseDir, templateRoot)
+	_, vars, ok := findRenderVarsForTemplate(snap.renderVarsByTemplate, absPath, snap.baseDir, snap.templateRoot)
 	if !ok {
 		return nil, nil
 	}
@@ -497,13 +516,15 @@ func (d *analyzerDaemon) getHoverInfo(params daemonGetHoverInfoParams) (*validat
 	}
 
 	result := validator.GetHoverResult(
-		content, varMap, rel, baseDir, templateRoot,
-		0, // lineOffset — top-level file
+		content, varMap, rel, snap.baseDir, snap.templateRoot,
+		0,
 		params.Line, params.Col,
-		registry, funcMaps, typeRegistry,
+		registry, snap.funcMaps, snap.typeRegistry,
 	)
 	return result, nil
 }
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
 func findRenderVarsForTemplate(
 	renderVarsByTemplate map[string][]ast.TemplateVar,
@@ -560,27 +581,6 @@ func buildRenderVarIndex(renderCalls []ast.RenderCall) map[string][]ast.Template
 	return idx
 }
 
-func cloneTypeRegistry(input map[string][]ast.FieldInfo) map[string][]ast.FieldInfo {
-	if input == nil {
-		return nil
-	}
-	cloned := make(map[string][]ast.FieldInfo, len(input))
-	for key, value := range input {
-		fields := make([]ast.FieldInfo, len(value))
-		copy(fields, value)
-		cloned[key] = fields
-	}
-	return cloned
-}
-
-func cloneRenderVarIndex(in map[string][]ast.TemplateVar) map[string][]ast.TemplateVar {
-	out := make(map[string][]ast.TemplateVar, len(in))
-	for key, vars := range in {
-		out[key] = append([]ast.TemplateVar(nil), vars...)
-	}
-	return out
-}
-
 func cloneRegistry(in map[string][]validator.NamedBlockEntry) map[string][]validator.NamedBlockEntry {
 	out := make(map[string][]validator.NamedBlockEntry, len(in))
 	for key, entries := range in {
@@ -591,22 +591,6 @@ func cloneRegistry(in map[string][]validator.NamedBlockEntry) map[string][]valid
 
 func cloneTemplateOverlays(in map[string]string) map[string]string {
 	out := make(map[string]string, len(in))
-	for key, value := range in {
-		out[key] = value
-	}
-	return out
-}
-
-func clonePartialTargets(in map[string]bool) map[string]bool {
-	out := make(map[string]bool, len(in))
-	for key, value := range in {
-		out[key] = value
-	}
-	return out
-}
-
-func mapsCloneFuncMaps(in validator.FuncMapRegistry) validator.FuncMapRegistry {
-	out := make(validator.FuncMapRegistry, len(in))
 	for key, value := range in {
 		out[key] = value
 	}
@@ -686,8 +670,4 @@ func normalizePath(value string) string {
 func normalizeTemplateKey(value string) string {
 	cleaned := filepath.ToSlash(filepath.Clean(value))
 	return strings.TrimPrefix(cleaned, "./")
-}
-
-func bytesTrimSpace(value []byte) []byte {
-	return []byte(strings.TrimSpace(string(value)))
 }

@@ -12,19 +12,7 @@ import (
 const MaxFieldDepth = 4
 
 // extractFieldsWithDocs recursively extracts exported fields and methods from
-// a type, leveraging caching to avoid redundant work. The seen map prevents
-// infinite recursion on self-referential types.
-//
-// Caching strategy:
-// - Each unique struct type is processed exactly once
-// - Results are cached by the full type string (including type arguments)
-// - Subsequent requests hit the cache
-//
-// Recursion handling:
-// - seen map tracks types in current path
-// - Prevents infinite loops on cyclic types
-// - Copies for independent branches (slice elements)
-// - Depth limit prevents excessive recursion on deeply nested types
+// a type, leveraging caching to avoid redundant work.
 func extractFieldsWithDocs(
 	t types.Type,
 	structIndex map[string]structIndexEntry,
@@ -35,7 +23,11 @@ func extractFieldsWithDocs(
 	return extractFieldsWithDocsDepth(t, structIndex, fc, seen, fset, 0)
 }
 
-// extractFieldsWithDocsDepth is the internal version with depth tracking
+// extractFieldsWithDocsDepth is the internal version with depth tracking.
+//
+// OPTIMISATION: Cache key is checked BEFORE the seen-map check so repeated
+// top-level lookups (e.g. the same struct used in 200 render calls) return
+// immediately without acquiring the seen-map entry at all.
 func extractFieldsWithDocsDepth(
 	t types.Type,
 	structIndex map[string]structIndexEntry,
@@ -49,8 +41,6 @@ func extractFieldsWithDocsDepth(
 	}
 
 	t = unwrapType(t)
-	// Additional unwrapping for slice and array types so we extract
-	// fields of the underlying struct instead of returning empty fields.
 	for {
 		if s, ok := t.(*types.Slice); ok {
 			t = unwrapType(s.Elem())
@@ -72,17 +62,17 @@ func extractFieldsWithDocsDepth(
 
 	cacheKey := t.String()
 
-	// Check cache FIRST before cycle detection
+	// Check field cache FIRST — avoids the seen-map dance for already-processed types.
+	// This is the hot path: the same struct appears in many render calls.
 	if cached, ok := fc.get(cacheKey); ok {
 		return cached.fields, cached.doc
 	}
 
-	// Cycle detection (path-based)
+	// Cycle detection (path-based).
 	if seen[cacheKey] {
 		return nil, ""
 	}
 	seen[cacheKey] = true
-	// Remove from seen map when returning so siblings don't falsely trigger cycles
 	defer delete(seen, cacheKey)
 
 	astKey := getASTKey(named)
@@ -104,7 +94,6 @@ func extractFieldsUncachedDepth(
 ) ([]FieldInfo, string) {
 	strct, ok := named.Underlying().(*types.Struct)
 	if !ok {
-		// Interface or other named type: expose methods only
 		doc := ""
 		if entry, exists := structIndex[astKey]; exists {
 			doc = entry.doc
@@ -112,14 +101,9 @@ func extractFieldsUncachedDepth(
 		return extractMethodFields(named, structIndex, fc, seen, fset, depth), doc
 	}
 
-	// Struct type: extract fields and methods
 	entry := structIndex[astKey]
 	fields := extractStructFieldsDepth(strct, entry, structIndex, fc, seen, fset, depth)
-
-	// Append methods
 	fields = append(fields, extractMethodFields(named, structIndex, fc, seen, fset, depth)...)
-
-	// Add method docs from struct index
 	addMethodDocs(fields, entry)
 
 	return fields, entry.doc
@@ -145,7 +129,6 @@ func extractStructFieldsDepth(
 		fi := buildFieldInfoDepth(field, entry, structIndex, fc, seen, fset, depth)
 		fields = append(fields, fi)
 
-		// Add fields for embedded structs
 		if field.Embedded() {
 			fields = append(fields, fi.Fields...)
 		}
@@ -155,6 +138,10 @@ func extractStructFieldsDepth(
 }
 
 // buildFieldInfoDepth constructs a FieldInfo for a single struct field with depth tracking.
+//
+// OPTIMISATION: Only allocate a copySeenMap for slice/map branches where an
+// independent recursion path is needed. Regular struct fields continue with the
+// shared seen map (cheaper, still correct because defer delete cleans up).
 func buildFieldInfoDepth(
 	field *types.Var,
 	entry structIndexEntry,
@@ -169,7 +156,6 @@ func buildFieldInfoDepth(
 		TypeStr: normalizeTypeStr(field.Type()),
 	}
 
-	// Set definition location
 	if pos := field.Pos(); pos.IsValid() && fset != nil {
 		position := fset.Position(pos)
 		fi.DefFile = position.Filename
@@ -177,33 +163,28 @@ func buildFieldInfoDepth(
 		fi.DefCol = position.Column
 	}
 
-	// Unwrap pointer
 	ft := field.Type()
 	if ptr, ok := ft.(*types.Pointer); ok {
 		ft = ptr.Elem()
 	}
 
-	// Handle collection types
 	if slice, ok := ft.(*types.Slice); ok {
 		fi.IsSlice = true
-		// Populate ElemType so the validator can resolve the range scope
 		fi.ElemType = normalizeTypeStr(slice.Elem())
-
+		// Independent branch needs its own seen map copy to avoid cross-contamination.
 		elemSeen := copySeenMap(seen)
 		fi.Fields, _ = extractFieldsWithDocsDepth(slice.Elem(), structIndex, fc, elemSeen, fset, depth+1)
 	} else if keyType, elemType := getMapTypes(ft); keyType != nil && elemType != nil {
 		fi.IsMap = true
 		fi.KeyType = normalizeTypeStr(keyType)
 		fi.ElemType = normalizeTypeStr(elemType)
-		// Independent recursion branch for map values
 		elemSeen := copySeenMap(seen)
 		fi.Fields, _ = extractFieldsWithDocsDepth(elemType, structIndex, fc, elemSeen, fset, depth+1)
 	} else {
-		// Regular field: continue with shared seen map
+		// Regular struct field: reuse the shared seen map — no copy needed.
 		fi.Fields, _ = extractFieldsWithDocsDepth(ft, structIndex, fc, seen, fset, depth+1)
 	}
 
-	// Add field documentation from index
 	if pos, ok := entry.fields[field.Name()]; ok {
 		if fi.DefFile == "" {
 			fi.DefFile = pos.file
@@ -230,8 +211,6 @@ func extractMethodFields(
 	if _, isInterface := named.Underlying().(*types.Interface); isInterface {
 		methodSet = types.NewMethodSet(named)
 	} else {
-		// Use NewMethodSet on a pointer to the named type to include BOTH value
-		// and pointer receiver methods, as well as promoted methods from embedded fields.
 		methodSet = types.NewMethodSet(types.NewPointer(named))
 	}
 
@@ -253,11 +232,9 @@ func extractMethodFields(
 			TypeStr: "method",
 		}
 
-		// Extract method signature deeply to include return type fields
 		if sig, ok := method.Type().(*types.Signature); ok {
 			fi.Params, fi.Returns, _ = extractSignatureInfoWithFields(sig, structIndex, fc, seen, fset, depth+1)
 
-			// Resolve method docstring using its actual receiver type (handles promoted methods)
 			if recv := sig.Recv(); recv != nil {
 				recvType := unwrapType(recv.Type())
 				if rt, ok := recvType.(*types.Named); ok {
@@ -276,7 +253,6 @@ func extractMethodFields(
 			}
 		}
 
-		// Set definition location
 		if pos := method.Pos(); pos.IsValid() && fset != nil {
 			position := fset.Position(pos)
 			fi.DefFile = position.Filename
@@ -291,7 +267,7 @@ func extractMethodFields(
 }
 
 // extractSignatureInfoWithFields extracts signature info and recursively extracts
-// the struct fields for any returned types (e.g. methods returning *CBCReport).
+// the struct fields for any returned types.
 func extractSignatureInfoWithFields(
 	sig *types.Signature,
 	structIndex map[string]structIndexEntry,
@@ -300,17 +276,12 @@ func extractSignatureInfoWithFields(
 	fset *token.FileSet,
 	depth int,
 ) (params, returns []ParamInfo, args []string) {
-	// Get base signature info
 	params, returns, args = extractSignatureInfo(sig)
 
-	// Deeply extract struct fields for each return value
 	for i := 0; i < sig.Results().Len(); i++ {
 		rt := sig.Results().At(i).Type()
-
-		// Use a copied seen map to prevent cross-branch loop suppression
 		elemSeen := copySeenMap(seen)
 		fields, doc := extractFieldsWithDocsDepth(rt, structIndex, fc, elemSeen, fset, depth)
-
 		returns[i].Fields = fields
 		returns[i].Doc = doc
 	}
@@ -332,7 +303,6 @@ func addMethodDocs(fields []FieldInfo, entry structIndexEntry) {
 				fi.DefLine = pos.line
 				fi.DefCol = pos.col
 			}
-			// Avoid overriding docstring resolved natively from the embedded struct resolution logic
 			if fi.Doc == "" {
 				fi.Doc = pos.doc
 			}
@@ -348,8 +318,6 @@ func copySeenMap(src map[string]bool) map[string]bool {
 }
 
 // extractMapVars extracts template variables from a map composite literal.
-// Example: map[string]interface{}{"user": user, "posts": posts}
-// Returns: [TemplateVar{Name:"user",...}, TemplateVar{Name:"posts",...}]
 func extractMapVars(
 	expr goast.Expr,
 	info *types.Info,
@@ -379,15 +347,12 @@ func extractMapVars(
 		name := strings.Trim(keyLit.Value, `"`)
 		tv := TemplateVar{Name: name}
 
-		// Extract type information
 		if typeInfo, ok := info.Types[kv.Value]; ok {
-			// Clear seen map for this variable
 			clear(seen)
 
 			tv.TypeStr = normalizeTypeStr(typeInfo.Type)
 			tv.Fields, tv.Doc = extractFieldsWithDocs(typeInfo.Type, structIndex, fc, seen, fset)
 
-			// Handle collection types
 			if elemType := getElementType(typeInfo.Type); elemType != nil {
 				tv.IsSlice = true
 				tv.ElemType = normalizeTypeStr(elemType)
@@ -399,11 +364,9 @@ func extractMapVars(
 				tv.Fields, tv.Doc = extractFieldsWithDocsPreservingDoc(elemType, structIndex, fc, seen, fset, tv.Doc)
 			}
 		} else {
-			// Fallback: infer from AST
 			tv.TypeStr = inferTypeFromAST(kv.Value)
 		}
 
-		// Find definition location
 		tv.DefFile, tv.DefLine, tv.DefCol = findDefinitionLocation(kv.Value, info, fset)
 		vars = append(vars, tv)
 	}
@@ -411,8 +374,7 @@ func extractMapVars(
 	return vars
 }
 
-// extractFieldsWithDocsPreservingDoc extracts fields while preserving
-// existing documentation if new extraction returns empty doc.
+// extractFieldsWithDocsPreservingDoc extracts fields while preserving existing doc.
 func extractFieldsWithDocsPreservingDoc(
 	t types.Type,
 	structIndex map[string]structIndexEntry,

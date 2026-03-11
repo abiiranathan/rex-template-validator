@@ -8,18 +8,15 @@ import (
 )
 
 // MaxAssignmentsPerVar is the maximum number of string assignments to track per variable
-// This prevents excessive memory usage on variables assigned in loops
 const MaxAssignmentsPerVar = 10
 
 // processFunc analyzes a single function or declaration to extract:
-// 1. String literal assignments (for template name resolution)
-// 2. FuncMap assignments (template function definitions)
-// 3. Template render calls
-// 4. Context variable Set calls
+//  1. String literal assignments (for template name resolution)
+//  2. FuncMap assignments (template function definitions)
+//  3. Template render calls
+//  4. Context variable Set calls
 //
-// The analysis proceeds in two passes:
-// Pass 1: Collect assignments to build a local symbol table
-// Pass 2: Identify and process template-related calls
+// OPTIMISATION: Merged into a single AST walk instead of two separate passes.
 func processFunc(
 	n goast.Node,
 	info *types.Info,
@@ -38,52 +35,47 @@ func processFunc(
 	stringAssignments := make(map[string][]string, 8)
 	funcMapAssignments := make(map[string]*goast.CompositeLit, 4)
 
-	collectAssignments(n, info, fset, filesMap, &scope, stringAssignments, funcMapAssignments, structIndex, fc, seenPool, mutatorIndex, stringMapIndex)
-	findTemplateOperations(n, info, fset, structIndex, fc, config, filesMap, seenPool, &scope, stringAssignments)
-
-	return scope
-}
-
-// collectAssignments walks the AST to build local symbol tables.
-// This enables template name resolution when names are passed via variables.
-func collectAssignments(
-	n goast.Node,
-	info *types.Info,
-	fset *token.FileSet,
-	filesMap map[string]*goast.File,
-	scope *FuncScope,
-	stringAssignments map[string][]string,
-	funcMapAssignments map[string]*goast.CompositeLit,
-	structIndex map[string]structIndexEntry,
-	fc *fieldCache,
-	seenPool *seenMapPool,
-	mutatorIndex map[string][]*goast.KeyValueExpr,
-	stringMapIndex map[string][]string,
-) {
+	// Single fused walk: collect assignments AND find template operations together.
 	goast.Inspect(n, func(child goast.Node) bool {
+		// Stop descending into nested function literals (they get their own processFunc call).
 		if child != n {
 			if _, isFunc := child.(*goast.FuncLit); isFunc {
 				return false
 			}
 		}
+
 		switch node := child.(type) {
 		case *goast.AssignStmt:
-			processAssignStmt(node, info, fset, filesMap, scope, stringAssignments, funcMapAssignments, structIndex, fc, seenPool, stringMapIndex)
+			processAssignStmt(node, info, fset, filesMap, &scope, stringAssignments, funcMapAssignments, structIndex, fc, seenPool, stringMapIndex)
+			// Also check for render/set calls on the RHS.
+			for _, rhs := range node.Rhs {
+				if call, ok := rhs.(*goast.CallExpr); ok {
+					processCallExpr(call, info, fset, structIndex, fc, config, seenPool, &scope, stringAssignments)
+				}
+			}
+
 		case *goast.GenDecl:
-			processGenDecl(node, info, fset, filesMap, scope, stringAssignments, funcMapAssignments, structIndex, fc, seenPool)
+			processGenDecl(node, info, fset, filesMap, &scope, stringAssignments, funcMapAssignments, structIndex, fc, seenPool)
+
 		case *goast.CallExpr:
-			applyMapMutatorCall(node, scope, mutatorIndex)
+			// Apply map mutator AND check for render/set in one step.
+			applyMapMutatorCall(node, &scope, mutatorIndex)
+			processCallExpr(node, info, fset, structIndex, fc, config, seenPool, &scope, stringAssignments)
+
+		case *goast.CompositeLit:
+			// Inline FuncMap literals.
+			if isFuncMapCompositeLit(node, info) {
+				scope.FuncMaps = append(scope.FuncMaps, extractFuncMaps(node, info, fset, filesMap, structIndex, fc, seenPool)...)
+			}
 		}
+
 		return true
 	})
+
+	return scope
 }
 
-// processAssignStmt handles assignment statements, extracting:
-// - String literals assigned to variables (with limit)
-// - FuncMap composite literals
-// - Map index assignments to FuncMap[key]
-// - Map variable assignments for data argument resolution
-// - Map-lookup assignments: `view, ok := someStringMap[key]`
+// processAssignStmt handles assignment statements.
 func processAssignStmt(
 	assign *goast.AssignStmt,
 	info *types.Info,
@@ -97,21 +89,12 @@ func processAssignStmt(
 	seenPool *seenMapPool,
 	stringMapIndex map[string][]string,
 ) {
-	// ── Special case: map-index read  `v, ok := someMap[key]` ────────────────
-	//
-	// When the RHS is a single index expression (e.g. labforms[request.ReportType])
-	// and the indexed map is in stringMapIndex, expand the LHS variable(s) that
-	// receive the value (ignoring the boolean "ok" result) to all possible string
-	// values from that map.
-	//
-	// Handles both two-result  (v, ok := m[k])  and single-result  (v := m[k]).
+	// ── Special case: map-index read  `v, ok := someMap[key]` ───────────────
 	if assign.Tok == token.DEFINE || assign.Tok == token.ASSIGN {
 		if len(assign.Rhs) == 1 {
 			if idx, ok := assign.Rhs[0].(*goast.IndexExpr); ok {
 				if ident, ok := idx.X.(*goast.Ident); ok {
 					if vals, found := stringMapIndex[ident.Name]; found {
-						// The first LHS identifier receives the map value.
-						// (The second, if present, is the "ok" boolean — skip it.)
 						if len(assign.Lhs) >= 1 {
 							if lhsIdent, ok := assign.Lhs[0].(*goast.Ident); ok && lhsIdent.Name != "_" {
 								if len(stringAssignments[lhsIdent.Name]) < MaxAssignmentsPerVar {
@@ -122,7 +105,6 @@ func processAssignStmt(
 								}
 							}
 						}
-						// Don't fall through: the RHS is not a regular assignment.
 						return
 					}
 				}
@@ -130,7 +112,7 @@ func processAssignStmt(
 		}
 	}
 
-	// ── Regular per-LHS processing ────────────────────────────────────────────
+	// ── Regular per-LHS processing ───────────────────────────────────────────
 	for i, lhs := range assign.Lhs {
 		if i >= len(assign.Rhs) {
 			continue
@@ -168,14 +150,7 @@ func processAssignStmt(
 	}
 }
 
-// trackMapIndexAssign records an index-assignment mutation on a map variable
-// that is already tracked in scope.MapAssignments. This handles the pattern:
-//
-//	ctx := rex.Map{"key": val}
-//	ctx["extra"] = val2
-//
-// We synthesise a new composite literal that merges the original entries with
-// the new key so that downstream var extraction sees the full picture.
+// trackMapIndexAssign records an index-assignment mutation on a map variable.
 func trackMapIndexAssign(indexExpr *goast.IndexExpr, rhs goast.Expr, scope *FuncScope) {
 	ident, ok := indexExpr.X.(*goast.Ident)
 	if !ok {
@@ -192,8 +167,6 @@ func trackMapIndexAssign(indexExpr *goast.IndexExpr, rhs goast.Expr, scope *Func
 		return
 	}
 
-	// Append the new key-value pair to a shallow copy of the composite literal
-	// so the original AST node is not mutated.
 	updated := &goast.CompositeLit{
 		Type:   existing.Type,
 		Lbrace: existing.Lbrace,
@@ -210,8 +183,7 @@ func trackMapIndexAssign(indexExpr *goast.IndexExpr, rhs goast.Expr, scope *Func
 }
 
 // isDataMapType returns true when ident has a map type whose key is string and
-// whose value is interface{} / any. This matches rex.Map, gin.H, echo.Map, and
-// raw map[string]interface{} / map[string]any literals.
+// whose value is interface{} / any.
 func isDataMapType(ident *goast.Ident, info *types.Info) bool {
 	if info == nil {
 		return false
@@ -223,7 +195,6 @@ func isDataMapType(ident *goast.Ident, info *types.Info) bool {
 	}
 
 	t := tv.Type()
-	// Unwrap named types (rex.Map, gin.H, etc.)
 	if named, ok := t.(*types.Named); ok {
 		t = named.Underlying()
 	}
@@ -233,18 +204,15 @@ func isDataMapType(ident *goast.Ident, info *types.Info) bool {
 		return false
 	}
 
-	// Key must be string
 	if basic, ok := m.Key().(*types.Basic); !ok || basic.Kind() != types.String {
 		return false
 	}
 
-	// Value must be interface{} / any
 	_, isIface := m.Elem().Underlying().(*types.Interface)
 	return isIface
 }
 
 // processGenDecl handles general declarations (var, const, type).
-// Extracts string and FuncMap literals from var/const declarations.
 func processGenDecl(
 	decl *goast.GenDecl,
 	info *types.Info,
@@ -300,48 +268,7 @@ func processGenDecl(
 	}
 }
 
-// findTemplateOperations walks the AST to identify:
-// - Template render calls
-// - Context variable Set calls
-// - Inline FuncMap composite literals
-func findTemplateOperations(
-	n goast.Node,
-	info *types.Info,
-	fset *token.FileSet,
-	structIndex map[string]structIndexEntry,
-	fc *fieldCache,
-	config AnalysisConfig,
-	filesMap map[string]*goast.File,
-	seenPool *seenMapPool,
-	scope *FuncScope,
-	stringAssignments map[string][]string,
-) {
-	goast.Inspect(n, func(child goast.Node) bool {
-		// Stop at nested function literals
-		if child != n {
-			if _, isFunc := child.(*goast.FuncLit); isFunc {
-				return false
-			}
-		}
-
-		switch node := child.(type) {
-		case *goast.CompositeLit:
-			// Inline FuncMap literals
-			if isFuncMapCompositeLit(node, info) {
-				scope.FuncMaps = append(scope.FuncMaps, extractFuncMaps(node, info, fset, filesMap, structIndex, fc, seenPool)...)
-			}
-
-		case *goast.CallExpr:
-			processCallExpr(node, info, fset, structIndex, fc, config, seenPool, scope, stringAssignments)
-		}
-
-		return true
-	})
-}
-
-// processCallExpr handles function calls, identifying:
-// - Template render calls
-// - Context Set calls
+// processCallExpr handles function calls, identifying render calls and Set calls.
 func processCallExpr(
 	call *goast.CallExpr,
 	info *types.Info,
@@ -353,7 +280,6 @@ func processCallExpr(
 	scope *FuncScope,
 	stringAssignments map[string][]string,
 ) {
-	// Check for render calls
 	if isRenderCall(call, config) {
 		if resolved := resolveRenderCall(call, info, stringAssignments); resolved != nil {
 			scope.RenderNodes = append(scope.RenderNodes, *resolved)
@@ -361,7 +287,6 @@ func processCallExpr(
 		return
 	}
 
-	// Check for Set calls
 	if setVar := extractSetCallVarOptimized(call, info, fset, structIndex, fc, config, seenPool); setVar != nil {
 		scope.SetVars = append(scope.SetVars, *setVar)
 	}
