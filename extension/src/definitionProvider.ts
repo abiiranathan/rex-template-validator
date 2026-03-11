@@ -140,19 +140,26 @@ export class DefinitionProvider {
         }
 
         if (ctx.partialSourceVar) {
-            const loc = this.findDefinitionInVar(pathForDef, ctx.partialSourceVar, ctx);
+            const loc = this.findDefinitionInVar(pathForDef, ctx.partialSourceVar, ctx, stack);
             if (loc) return loc;
         }
 
         const stackDefLoc = this.findDefinitionInScope(pathForDef, hitVars, stack, ctx);
+
         if (stackDefLoc) return stackDefLoc;
 
         for (const rc of ctx.renderCalls) {
             const passedVar = rc.vars.find(v => v.name === topVarName);
             if (passedVar) {
+                let fields = passedVar.fields ?? [];
+                if (fields.length === 0 && passedVar.type) {
+                    const resolver = this.scope.buildFieldResolver(hitVars, stack);
+                    fields = resolver(passedVar.type) ?? [];
+                }
                 const fieldLoc = this.navigateToFieldDefinition(
-                    pathForDef.slice(1), passedVar.fields ?? [], ctx
+                    pathForDef.slice(1), fields, ctx, stack
                 );
+
                 if (fieldLoc) return fieldLoc;
                 if (passedVar.defFile && passedVar.defLine) {
                     const abs = this.resolveGoFile(passedVar.defFile);
@@ -308,7 +315,8 @@ export class DefinitionProvider {
     private navigateToFieldDefinition(
         fieldPath: string[],
         fields: FieldInfo[],
-        ctx: TemplateContext
+        ctx: TemplateContext,
+        stack: ScopeFrame[] = []
     ): vscode.Location | null {
         if (fieldPath.length === 0) return null;
         let current = fields;
@@ -331,7 +339,12 @@ export class DefinitionProvider {
                 }
                 return null;
             }
-            current = field.fields ?? [];
+            let nextFields = field.fields ?? [];
+            if (nextFields.length === 0 && field.type) {
+                const resolver = this.scope.buildFieldResolver(ctx.vars, stack);
+                nextFields = resolver(field.type) ?? [];
+            }
+            current = nextFields;
         }
         return null;
     }
@@ -339,9 +352,15 @@ export class DefinitionProvider {
     private findDefinitionInVar(
         path: string[],
         sourceVar: TemplateVar,
-        ctx: TemplateContext
+        ctx: TemplateContext,
+        stack: ScopeFrame[] = []
     ): vscode.Location | null {
         let currentFields = sourceVar.fields ?? [];
+        if (currentFields.length === 0 && sourceVar.type) {
+            const resolver = this.scope.buildFieldResolver(ctx.vars, stack);
+            currentFields = resolver(sourceVar.type) ?? [];
+        }
+
         let currentTarget: TemplateVar | FieldInfo = sourceVar;
         for (const part of path) {
             if (part === '.' || part === '$' || part === '[]') continue;
@@ -352,6 +371,10 @@ export class DefinitionProvider {
             }
             currentTarget = field;
             currentFields = field.fields ?? [];
+            if (currentFields.length === 0 && field.type) {
+                const resolver = this.scope.buildFieldResolver(ctx.vars, stack);
+                currentFields = resolver(field.type) ?? [];
+            }
         }
         const t = currentTarget as TemplateVar & FieldInfo;
         if (t.defFile && t.defLine) {
@@ -388,8 +411,13 @@ export class DefinitionProvider {
         const topVar = vars.get(topVarName);
         if (topVar) {
             if (searchPath.length > 1) {
+                let fields = topVar.fields ?? [];
+                if (fields.length === 0 && topVar.type) {
+                    const resolver = this.scope.buildFieldResolver(vars, scopeStack);
+                    fields = resolver(topVar.type) ?? [];
+                }
                 const loc = this.navigateToFieldDefinition(
-                    searchPath.slice(1), topVar.fields ?? [], ctx
+                    searchPath.slice(1), fields, ctx, scopeStack
                 );
                 if (loc) return loc;
             }
@@ -408,8 +436,13 @@ export class DefinitionProvider {
         }
 
         const dotFrame = scopeStack.slice().reverse().find(f => f.key === '.');
-        if (dotFrame?.fields) {
-            return this.navigateToFieldDefinition(searchPath, dotFrame.fields, ctx);
+        if (dotFrame) {
+            let fields = dotFrame.fields ?? [];
+            if (fields.length === 0 && dotFrame.typeStr && dotFrame.typeStr !== 'context' && dotFrame.typeStr !== 'unknown') {
+                const resolver = this.scope.buildFieldResolver(vars, scopeStack);
+                fields = resolver(dotFrame.typeStr) ?? [];
+            }
+            return this.navigateToFieldDefinition(searchPath, fields, ctx, scopeStack);
         }
         return null;
     }
@@ -493,12 +526,19 @@ export class DefinitionProvider {
             if (!frame.isRange || !frame.fields) continue;
             const field = frame.fields.find(f => f.name === firstName);
             if (!field) continue;
+
             if (targetPath.length > 1) {
+                let fields = field.fields ?? [];
+                if (fields.length === 0 && field.type) {
+                    const resolver = this.scope.buildFieldResolver(ctx.vars, scopeStack);
+                    fields = resolver(field.type) ?? [];
+                }
                 const loc = this.navigateToFieldDefinition(
-                    targetPath.slice(1), field.fields ?? [], ctx
+                    targetPath.slice(1), fields, ctx, scopeStack
                 );
                 if (loc) return loc;
             }
+
             if (field.defFile && field.defLine) {
                 const abs = this.resolveGoFile(field.defFile);
                 if (abs) {

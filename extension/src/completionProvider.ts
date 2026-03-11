@@ -105,12 +105,13 @@ export class CompletionProvider {
         );
         const stack = scopeResult?.stack ?? [] as ScopeFrame[];
         const locals = scopeResult?.locals ?? new Map<string, TemplateVar>();
+        const scopeVars = scopeResult?.vars ?? ctx.vars;
 
         const match = linePrefix.match(/(?:\(|\|)\s*(.*)$/);
         if (!match) return null;
 
         const partialExpr = match[1].trim();
-        const exprType = await this.inferExpressionType(document, partialExpr, ctx.vars, stack, locals);
+        const exprType = await this.inferExpressionType(document, partialExpr, scopeVars, stack, locals);
         if (!exprType?.fields?.length) return null;
 
         return exprType.fields.map(f => this.fieldToCompletionItem(f, null));
@@ -215,14 +216,27 @@ export class CompletionProvider {
                             isSlice: callCtx.isSlice,
                         }],
                         locals: new Map(),
+                        vars: new Map(
+                            (callCtx.fields ?? []).map(f => [f.name, {
+                                name: f.name,
+                                type: f.type,
+                                fields: f.fields,
+                                isSlice: f.isSlice ?? false,
+                                isMap: f.isMap,
+                                keyType: f.keyType,
+                                elemType: f.elemType,
+                                doc: f.doc
+                            }])
+                        ),
                     };
                 }
             }
         }
 
-        const { stack, locals } = scopeResult ?? {
+        const { stack, locals, vars: scopeVars } = scopeResult ?? {
             stack: [] as ScopeFrame[],
             locals: new Map<string, TemplateVar>(),
+            vars: ctx.vars,
         };
 
         const replacementRange = new vscode.Range(
@@ -267,7 +281,7 @@ export class CompletionProvider {
                 const repRange = new vscode.Range(position.line, matchStart, position.line, position.character);
 
                 this.addGlobalVariablesToCompletion(
-                    ctx.vars, completionItems, filterPrefix, repRange
+                    scopeVars, completionItems, filterPrefix, repRange
                 );
                 this.addLocalVariablesToCompletion(
                     stack, locals, completionItems, filterPrefix, repRange
@@ -277,6 +291,7 @@ export class CompletionProvider {
                 );
                 this.addBuiltInFunctionsToCompletion(completionItems, filterPrefix, repRange);
             }
+
             return completionItems;
         }
 
@@ -301,7 +316,7 @@ export class CompletionProvider {
                         position.line, matchStart, position.line, position.character
                     );
                     this.addGlobalVariablesToCompletion(
-                        ctx.vars, completionItems, filterPrefix, repRange
+                        scopeVars, completionItems, filterPrefix, repRange
                     );
                     this.addLocalVariablesToCompletion(
                         stack, locals, completionItems, filterPrefix, repRange
@@ -314,12 +329,12 @@ export class CompletionProvider {
                     let fields: FieldInfo[] | undefined = dotFrame?.fields;
 
                     if (dotFrame && (!fields || fields.length === 0) && dotFrame.typeStr && dotFrame.typeStr !== 'context' && dotFrame.typeStr !== 'unknown') {
-                        const resolver = this.scope.buildFieldResolver(ctx.vars, stack);
+                        const resolver = this.scope.buildFieldResolver(scopeVars, stack);
                         fields = resolver(dotFrame.typeStr) ?? [];
                     }
 
                     if (!dotFrame || (!fields && dotFrame.typeStr === 'context')) {
-                        fields = [...ctx.vars.values()].map(v => ({
+                        fields = [...scopeVars.values()].map(v => ({
                             name: v.name,
                             type: v.type,
                             fields: v.fields,
@@ -335,6 +350,7 @@ export class CompletionProvider {
                         { fields }, completionItems, filterPrefix, repRange
                     );
                 }
+
                 return completionItems;
             }
             filterPrefix = rawPath.slice(lastDot + 1);
@@ -353,12 +369,12 @@ export class CompletionProvider {
             let fields: FieldInfo[] | undefined = dotFrame?.fields;
 
             if (dotFrame && (!fields || fields.length === 0) && dotFrame.typeStr && dotFrame.typeStr !== 'context' && dotFrame.typeStr !== 'unknown') {
-                const resolver = this.scope.buildFieldResolver(ctx.vars, stack);
+                const resolver = this.scope.buildFieldResolver(scopeVars, stack);
                 fields = resolver(dotFrame.typeStr) ?? [];
             }
 
             if (!dotFrame || (!fields && dotFrame.typeStr === 'context')) {
-                fields = [...ctx.vars.values()].map(v => ({
+                fields = [...scopeVars.values()].map(v => ({
                     name: v.name,
                     type: v.type,
                     fields: v.fields,
@@ -377,7 +393,7 @@ export class CompletionProvider {
         // Case C: Bare "$" — show root vars and locals.
         if (lookupPath.length === 1 && lookupPath[0] === '$') {
             this.addGlobalVariablesToCompletion(
-                ctx.vars, completionItems, filterPrefix, repRange
+                scopeVars, completionItems, filterPrefix, repRange
             );
             this.addLocalVariablesToCompletion(
                 stack, locals, completionItems, filterPrefix, repRange
@@ -387,9 +403,10 @@ export class CompletionProvider {
 
         // Case D: Complex path — resolve to a type and show its fields.
         const res = resolvePath(
-            lookupPath, ctx.vars, stack, locals,
-            this.scope.buildFieldResolver(ctx.vars, stack)
+            lookupPath, scopeVars, stack, locals,
+            this.scope.buildFieldResolver(scopeVars, stack)
         );
+
         if (res.found && res.fields) {
             this.addFieldsToCompletion(
                 { fields: res.fields }, completionItems, filterPrefix, repRange

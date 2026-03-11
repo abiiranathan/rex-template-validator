@@ -816,7 +816,7 @@ export class ScopeUtils {
         rootNodes: TemplateNode[],
         ctx: TemplateContext,
         inheritedLocals?: Map<string, TemplateVar>
-    ): { stack: ScopeFrame[]; locals: Map<string, TemplateVar> } {
+    ): { stack: ScopeFrame[]; locals: Map<string, TemplateVar>; vars: Map<string, TemplateVar> } {
         const blockLocals = inheritedLocals
             ? new Map(inheritedLocals)
             : new Map<string, TemplateVar>();
@@ -937,7 +937,7 @@ export class ScopeUtils {
                             node.elseChildren, position, vars, scopeStack, rootNodes, ctx, blockLocals
                         );
                     }
-                    return { stack: scopeStack, locals: blockLocals };
+                    return { stack: scopeStack, locals: blockLocals, vars };
                 }
 
                 if (node.children && node.children.length > 0) {
@@ -946,11 +946,11 @@ export class ScopeUtils {
                         rootNodes, ctx, childLocals
                     );
                 }
-                return { stack: childStack, locals: childLocals };
+                return { stack: childStack, locals: childLocals, vars: childVars };
             }
         }
 
-        return { stack: scopeStack, locals: blockLocals };
+        return { stack: scopeStack, locals: blockLocals, vars };
     }
 
     // ── Utilities ─────────────────────────────────────────────────────────────
@@ -1133,13 +1133,15 @@ export class ScopeUtils {
 
         const localCtx = this.findCallSiteContext(currentFileNodes, blockName, currentFileVars, []);
 
-        // When the local call resolves to an empty-field context (e.g. the block
-        // definition itself with no file-level context), look for cross-file
-        // callers first — they may have the real scope.  Only fall back to the
-        // local result if no cross-file caller is found.
-        const localHasFields = localCtx && localCtx.fields && localCtx.fields.length > 0;
+        // If local context was found, even if it has no fields (e.g. map/slice), return it if it has a valid typeStr.
+        const localIsValid = localCtx && localCtx.typeStr && localCtx.typeStr !== 'unknown';
 
-        if (localCtx && localHasFields) {
+        if (localIsValid) {
+            if (!localCtx.fields || localCtx.fields.length === 0) {
+                if (blockCtx && blockCtx.vars.size > 0) {
+                    localCtx.fields = [...blockCtx.vars.values()] as unknown as FieldInfo[];
+                }
+            }
             return localCtx;
         }
 
@@ -1158,21 +1160,19 @@ export class ScopeUtils {
                 const callCtx = this.findCallSiteContext(
                     fileNodes, blockName, templateCtx.vars, []
                 );
-                if (callCtx) {
+                if (callCtx && callCtx.typeStr && callCtx.typeStr !== 'unknown') {
                     if ((!callCtx.fields || callCtx.fields.length === 0) && blockCtx) {
                         const synthFields = [...blockCtx.vars.values()] as unknown as FieldInfo[];
                         if (synthFields.length > 0) {
                             return { ...callCtx, fields: synthFields };
                         }
                     }
-                    if (callCtx.fields && callCtx.fields.length > 0) {
-                        return callCtx;
-                    }
+                    return callCtx;
                 }
             } catch { /* ignore */ }
         }
 
-        // No cross-file caller found — fall back to local context
+        // No cross-file caller found — fall back to local context even if it's unknown
         if (localCtx) {
             if ((!localCtx.fields || localCtx.fields.length === 0) && blockCtx) {
                 const synthFields = [...blockCtx.vars.values()] as unknown as FieldInfo[];
