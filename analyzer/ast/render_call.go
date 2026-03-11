@@ -10,9 +10,9 @@ import (
 // generateRenderCalls transforms collected scope information into structured
 // RenderCall entries with full variable information. Each render call is
 // associated with:
-// - Source location (file, line, column range)
-// - Template name(s)
-// - Available template variables (local + scope + global)
+//   - Source location (file, line, column range)
+//   - Template name(s)
+//   - Available template variables (local + scope + global)
 func generateRenderCalls(
 	scopes []FuncScope,
 	globalImplicitVars []TemplateVar,

@@ -1,7 +1,7 @@
 // Package ast performs comprehensive static analysis on Go source code to extract:
-// 1. Template render calls with their associated data variables
-// 2. Template function maps (custom functions available in templates)
-// 3. Template variable definitions from context setters
+//  1. Template render calls with their associated data variables
+//  2. Template function maps (custom functions available in templates)
+//  3. Template variable definitions from context setters
 package ast
 
 import (
@@ -25,16 +25,11 @@ import (
 // passes the pkgs slice to every downstream step, eliminating the redundant
 // packages.Load that previously happened inside the context-enrichment branch.
 func AnalyzeDir(dir string, contextFile string, config AnalysisConfig) AnalysisResult {
-	// ── 1. Disk cache ────────────────────────────────────────────────────────
 	if diskCached, ok := ReadDiskCache(dir, contextFile); ok {
 		return *diskCached
 	}
-
 	result := AnalysisResult{}
-
-	// ── 2. Load packages – exactly once ──────────────────────────────────────
 	fset := token.NewFileSet()
-
 	cfg := &packages.Config{
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
 			packages.NeedTypes | packages.NeedTypesInfo | packages.NeedImports,
@@ -57,38 +52,35 @@ func AnalyzeDir(dir string, contextFile string, config AnalysisConfig) AnalysisR
 	filesMap = buildFileMap(allFiles, fset)
 	structIndex = buildStructIndex(fset, filesMap)
 
-	// ── 4. Shared analysis infrastructure ────────────────────────────────────
 	fc := newFieldCache()
 	seenPool := newSeenMapPool()
 
-	// ── 5. Collect function scopes (concurrent) ───────────────────────────────
+	//  Collect function scopes (concurrent)
 	scopes := collectFuncScopesOptimized(allFiles, info, fset, structIndex, fc, config, filesMap, seenPool)
 
-	// ── 6. Extract global implicit variables ──────────────────────────────────
+	// Extract global implicit variables
 	globalImplicitVars := extractGlobalImplicitVars(scopes)
 
-	// ── 7. Generate render calls ──────────────────────────────────────────────
+	// Generate render calls
 	result.RenderCalls = generateRenderCalls(scopes, globalImplicitVars, info, fset, dir, structIndex, fc, seenPool)
 
-	// ── 8. Aggregate function maps ────────────────────────────────────────────
+	// Aggregate function maps
 	result.FuncMaps = aggregateFuncMaps(scopes)
 
-	// ── 9. Context enrichment – reuse already-loaded pkgs, no second Load! ───
+	// Context enrichment – reuse already-loaded pkgs, no second Load! ───
 	if contextFile != "" {
 		result.RenderCalls = enrichRenderCallsWithContext(
 			result.RenderCalls, contextFile, pkgs, structIndex, fc, fset, config, seenPool,
 		)
 	}
 
-	// ── 10. Persist to disk cache for future cold starts ─────────────────────
+	// Persist to disk cache for future cold starts
 	// Synchronous write (inside AnalyzeDir before return) prevents data races
 	// with callers that modify the returned result (e.g. Flatten).
 	WriteDiskCache(dir, contextFile, result)
 
 	return result
 }
-
-
 
 // extractGlobalImplicitVars identifies template variables that are set outside
 // any render call context (e.g. in middleware functions).  These are available

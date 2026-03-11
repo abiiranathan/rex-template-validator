@@ -40,11 +40,12 @@ func computeSourceHash(dir, contextFile string) string {
 		if err != nil {
 			return nil
 		}
+
 		if d.IsDir() {
+			// Skip vendor, node_modules, and hidden directories to avoid unnecessary cache misses
 			name := d.Name()
 			if name == "vendor" ||
 				name == "node_modules" ||
-				name == ".git" ||
 				strings.HasPrefix(name, ".") {
 				return filepath.SkipDir
 			}
