@@ -393,9 +393,14 @@ func validateRenderCallsConcurrently(
 
 var validTemplateName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
-// ValidateTemplateFile validates a single template file against its expected
-// variable context.  If the file does not exist it falls back to the named
-// block registry before reporting an error.
+// ValidateTemplateFile — accept the pre-built registry so the internal
+// ValidateTemplateContent call uses validateTemplateContentWithRegistry.
+// Public signature gains an optional variadic registry parameter so existing
+// callers (tests, external packages) need no changes.
+//
+// NOTE: The existing variadic `funcMaps ...FuncMapRegistry` parameter means we
+// cannot add a second variadic. Instead, thread the registry through the
+// existing non-variadic path and add an internal helper.
 func ValidateTemplateFile(
 	templatePath string,
 	vars []ast.TemplateVar,
@@ -405,17 +410,14 @@ func ValidateTemplateFile(
 	funcMaps ...FuncMapRegistry,
 ) []ValidationResult {
 	effectiveFuncMaps := optionalFuncMapRegistry(funcMaps...)
+
 	if entry, ok := findOverlayTemplateEntry(registry, templateName); ok {
 		varMap := buildVarMap(vars)
-		return ValidateTemplateContent(
-			entry.Content,
-			varMap,
-			entry.TemplatePath,
-			baseDir,
-			templateRoot,
-			1,
-			registry,
-			effectiveFuncMaps,
+		// Overlay content: merge once then use internal path.
+		effectiveRegistry := mergeNamedBlockRegistry(registry, entry.Content, entry.TemplatePath)
+		return validateTemplateContentWithRegistry(
+			entry.Content, varMap, entry.TemplatePath,
+			baseDir, templateRoot, 1, effectiveRegistry, effectiveFuncMaps,
 		)
 	}
 
@@ -424,43 +426,31 @@ func ValidateTemplateFile(
 		if entries, ok := registry[templateName]; ok && len(entries) > 0 {
 			varMap := buildVarMap(vars)
 			entry := entries[0]
-			return ValidateTemplateContent(
-				entry.Content,
-				varMap,
-				entry.TemplatePath,
-				baseDir,
-				templateRoot,
-				entry.Line,
-				registry,
-				effectiveFuncMaps,
+			effectiveRegistry := mergeNamedBlockRegistry(registry, entry.Content, entry.TemplatePath)
+			return validateTemplateContentWithRegistry(
+				entry.Content, varMap, entry.TemplatePath,
+				baseDir, templateRoot, entry.Line, effectiveRegistry, effectiveFuncMaps,
 			)
 		}
 
-		// May be an inline identifier — skip gracefully.
 		if !validTemplateName.MatchString(templateName) {
 			return []ValidationResult{}
 		}
 
 		return []ValidationResult{{
-			Template: templateName,
-			Line:     1,
-			Column:   1,
-			Variable: "",
+			Template: templateName, Line: 1, Column: 1,
 			Message:  fmt.Sprintf("Template or named block not found: %s", templateName),
 			Severity: "error",
 		}}
 	}
 
 	varMap := buildVarMap(vars)
-	return ValidateTemplateContent(
-		string(content),
-		varMap,
-		templateName,
-		baseDir,
-		templateRoot,
-		1,
-		registry,
-		effectiveFuncMaps,
+	// Merge once here; all recursive calls through validateTemplateContentWithRegistry
+	// will use this registry without re-merging.
+	effectiveRegistry := mergeNamedBlockRegistry(registry, string(content), templateName)
+	return validateTemplateContentWithRegistry(
+		string(content), varMap, templateName,
+		baseDir, templateRoot, 1, effectiveRegistry, effectiveFuncMaps,
 	)
 }
 

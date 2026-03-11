@@ -9,9 +9,15 @@ import (
 	"github.com/rex-template-analyzer/ast"
 )
 
-// validateTemplateCall processes a {{template}} action, validating its context
-// argument and recursively validating the nested template or named block.
-func validateTemplateCall(
+// validateTemplateCallWithRegistry is the hot-path implementation. It accepts
+// an already-merged registry and passes it directly into recursive
+// ValidateTemplateContent calls, breaking the re-merge cycle.
+//
+// The critical difference from the old validateTemplateCall: named block
+// validation calls validateTemplateContentWithRegistry (the internal variant)
+// instead of ValidateTemplateContent (the public variant), bypassing the
+// mergeNamedBlockRegistry call entirely since the registry is already current.
+func validateTemplateCallWithRegistry(
 	action string,
 	scopeStack []ScopeType,
 	varMap map[string]ast.TemplateVar,
@@ -46,10 +52,6 @@ func validateTemplateCall(
 		}
 	}
 
-	// pinCallSite rewrites every diagnostic that came from inside the
-	// named block / partial so it points at the {{ template }} call site
-	// in the CALLER, not at an internal line inside the callee.
-	// The callee path is preserved in the Message so it's still visible.
 	pinCallSite := func(inner []ValidationResult) []ValidationResult {
 		for i := range inner {
 			e := &inner[i]
@@ -67,20 +69,20 @@ func validateTemplateCall(
 	}
 
 	if entries, ok := registry[tmplName]; ok && len(entries) > 0 {
-		// Aggregate validation results for all call sites (contexts)
 		anyValid := false
 		allErrors := make([]ValidationResult, 0)
 		for _, nt := range entries {
 			partialScope := resolvePartialScope(contextArg, scopeStack, varMap, funcMaps)
 			partialVarMap := buildPartialVarMap(contextArg, partialScope, scopeStack, varMap)
-			partialErrors := ValidateTemplateContent(
+			// Use the internal variant — registry is already merged, skip re-merge.
+			partialErrors := validateTemplateContentWithRegistry(
 				nt.Content,
 				partialVarMap,
 				nt.TemplatePath,
 				baseDir,
 				templateRoot,
 				nt.Line,
-				registry,
+				registry, // pass through unchanged
 				funcMaps,
 			)
 			if len(partialErrors) == 0 {
@@ -115,7 +117,7 @@ func validateTemplateCall(
 			tmplName,
 			baseDir,
 			templateRoot,
-			registry,
+			registry, // pass through — ValidateTemplateFile already handles merge
 			funcMaps,
 		)
 		errors = append(errors, pinCallSite(partialErrors)...)

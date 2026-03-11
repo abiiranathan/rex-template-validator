@@ -2,6 +2,7 @@ package validator
 
 import (
 	"fmt"
+	"maps"
 	"strings"
 
 	"github.com/rex-template-analyzer/ast"
@@ -51,23 +52,38 @@ func ValidateTemplateContent(
 	registry map[string][]NamedBlockEntry,
 	funcMaps ...FuncMapRegistry,
 ) []ValidationResult {
-	var errors []ValidationResult
 	effectiveFuncMaps := optionalFuncMapRegistry(funcMaps...)
+	// Merge once at the entry point. All recursive calls receive this merged
+	// registry directly and skip the merge entirely.
 	effectiveRegistry := mergeNamedBlockRegistry(registry, content, templateName)
+	return validateTemplateContentWithRegistry(content, varMap, templateName, baseDir, templateRoot, lineOffset, effectiveRegistry, effectiveFuncMaps)
+}
+
+// validateTemplateContentWithRegistry is the internal implementation that
+// accepts a pre-merged registry. validateTemplateCall passes this registry
+// directly to recursive ValidateTemplateContent calls, avoiding the
+// O(registry + content) re-merge cost on every partial invocation.
+func validateTemplateContentWithRegistry(
+	content string,
+	varMap map[string]ast.TemplateVar,
+	templateName string,
+	baseDir, templateRoot string,
+	lineOffset int,
+	effectiveRegistry map[string][]NamedBlockEntry,
+	effectiveFuncMaps FuncMapRegistry,
+) []ValidationResult {
+	var errors []ValidationResult
 
 	// Initialize scope stack with root scope
 	var scopeStack []ScopeType
 	rootScope := buildRootScope(varMap)
 	scopeStack = append(scopeStack, rootScope)
 
-	// Track depth inside {{define}} blocks (validation is skipped)
 	defineSkipDepth := 0
-
-	// openingActions tracks the keyword that opened each scope-stack frame
 	openingActions := []string{"root"}
 
 	cur := 0
-	lineNum := 0 // 0-based offset from the start of this content block
+	lineNum := 0
 
 	for cur < len(content) {
 		openRel := strings.Index(content[cur:], "{{")
@@ -76,7 +92,6 @@ func ValidateTemplateContent(
 		}
 		openIdx := cur + openRel
 
-		// Count newlines between cur and openIdx
 		lineNum += strings.Count(content[cur:openIdx], "\n")
 		actualLineNum := lineNum + lineOffset
 
@@ -93,7 +108,6 @@ func ValidateTemplateContent(
 		}
 		closeIdx := openIdx + closeRel
 
-		// Trim whitespace and the optional '-' trim markers from the action body
 		contentStart := openIdx + 2
 		if contentStart < closeIdx && content[contentStart] == '-' {
 			contentStart++
@@ -110,7 +124,6 @@ func ValidateTemplateContent(
 			contentEnd--
 		}
 
-		// Column is relative to the start of the action content
 		lastNewline := strings.LastIndexByte(content[:openIdx], '\n')
 		col := contentStart - lastNewline
 
@@ -119,11 +132,9 @@ func ValidateTemplateContent(
 			action = content[contentStart:contentEnd]
 		}
 
-		// Advance cursor and count newlines inside the tag
 		lineNumInside := strings.Count(content[openIdx:closeIdx+2], "\n")
 		cur = closeIdx + 2
 
-		// Skip template comments
 		if strings.Contains(action, "/*") && strings.Contains(action, "*/") {
 			lineNum += lineNumInside
 			continue
@@ -133,29 +144,22 @@ func ValidateTemplateContent(
 		first := ""
 		if len(words) > 0 {
 			first = words[0]
-			// Handle cases like `if(eq` where there is no space before parenthesis
 			if idx := strings.IndexByte(first, '('); idx != -1 {
 				first = first[:idx]
 			}
 		}
 
-		// ── Skip everything inside {{define}} / {{block}} bodies ────────────
 		if defineSkipDepth > 0 {
 			switch first {
 			case "if", "with", "range", "block", "define":
 				defineSkipDepth++
 			case "end":
 				defineSkipDepth--
-				lineNum += lineNumInside
-				continue
-			case "else":
-				// Intentionally ignored
 			}
 			lineNum += lineNumInside
 			continue
 		}
 
-		// ── Handle scope popping (else, end) BEFORE validation ──────────
 		isElse := first == "else"
 		var elseAction string
 
@@ -174,7 +178,6 @@ func ValidateTemplateContent(
 			openingActions = openingActions[:len(openingActions)-1]
 			if len(words) > 1 {
 				elseAction = words[1]
-				// Handle cases like `else if(eq`
 				if idx := strings.IndexByte(elseAction, '('); idx != -1 {
 					elseAction = elseAction[:idx]
 				}
@@ -196,8 +199,6 @@ func ValidateTemplateContent(
 			continue
 		}
 
-		// ── Validate variables in action ────────────────────────────────
-		// Extract and validate all variable references in this action.
 		assignmentTargets := assignmentTargetSet(action)
 		errors = append(errors, validateActionFunctions(action, first, templateName, actualLineNum, col, effectiveFuncMaps)...)
 		extractVariablesFromAction(action, func(v string) {
@@ -219,14 +220,10 @@ func ValidateTemplateContent(
 			syntheticAction := "template " + strings.TrimSpace(strings.TrimPrefix(action, "block"))
 			parts := parseTemplateAction(syntheticAction)
 			if len(parts) >= 2 {
-				// If other {{template "name"}} calls exist in the content for this
-				// block, skip validation at the definition site — the template
-				// call sites will each validate the block with their own scope.
-				// This avoids false positives when the block is designed to be
-				// called from a narrower scope (e.g. inside a range).
 				blockName := parts[0]
 				if !hasTemplateCallForBlock(content, blockName) {
-					partialErrs := validateTemplateCall(syntheticAction, scopeStack, varMap, actualLineNum, col, templateName, baseDir, templateRoot, effectiveRegistry, effectiveFuncMaps)
+					// Pass effectiveRegistry directly — no re-merge.
+					partialErrs := validateTemplateCallWithRegistry(syntheticAction, scopeStack, varMap, actualLineNum, col, templateName, baseDir, templateRoot, effectiveRegistry, effectiveFuncMaps)
 					errors = append(errors, partialErrs...)
 				}
 			}
@@ -236,27 +233,23 @@ func ValidateTemplateContent(
 			registerInlineLocalAssignments(action, scopeStack, varMap, effectiveFuncMaps, templateName, actualLineNum, col, &errors)
 		}
 
-		// ── {{block}} and {{define}} open a skip region ──────────────────────
 		if first == "block" || first == "define" {
 			defineSkipDepth++
 			lineNum += lineNumInside
 			continue
 		}
 
-		// ── Push new scope for if / with / range ─────────────────────────────
 		actionToPush := first
 		exprToParse := action
 
 		if isElse {
 			if elseAction != "" {
-				// Handle `else if`, `else with`, `else range`
 				actionToPush = elseAction
 				idx := strings.Index(action, words[1])
 				if idx != -1 {
 					exprToParse = action[idx:]
 				}
 			} else {
-				// Plain {{else}}: inherit current scope
 				top := ScopeType{}
 				if len(scopeStack) > 0 {
 					top = scopeStack[len(scopeStack)-1]
@@ -296,7 +289,6 @@ func ValidateTemplateContent(
 			openingActions = append(openingActions, "with")
 
 		case "if":
-			// {{if}} does not change the dot context
 			top := ScopeType{}
 			if len(scopeStack) > 0 {
 				top = childScope(scopeStack[len(scopeStack)-1])
@@ -310,17 +302,15 @@ func ValidateTemplateContent(
 			openingActions = append(openingActions, "if")
 		}
 
-		// ── Handle {{template}} calls ───────────────────────────────────
-		// Template calls invoke other templates/named blocks with a context.
+		// Pass effectiveRegistry directly to avoid re-merge inside the recursive call.
 		if first == "template" {
-			partialErrs := validateTemplateCall(action, scopeStack, varMap, actualLineNum, col, templateName, baseDir, templateRoot, effectiveRegistry, effectiveFuncMaps)
+			partialErrs := validateTemplateCallWithRegistry(action, scopeStack, varMap, actualLineNum, col, templateName, baseDir, templateRoot, effectiveRegistry, effectiveFuncMaps)
 			errors = append(errors, partialErrs...)
 		}
 
 		lineNum += lineNumInside
 	}
 
-	// ── Post-parse structural check ──────────────────────────────────────────
 	if len(scopeStack) > 1 {
 		unclosed := make([]string, 0, len(openingActions)-1)
 		for _, a := range openingActions[1:] {
@@ -380,13 +370,83 @@ func optionalFuncMapRegistry(funcMaps ...FuncMapRegistry) FuncMapRegistry {
 	return funcMaps[0]
 }
 
+// mergeNamedBlockRegistry returns a registry that includes any {{define}} /
+// {{block}} declarations found in content. It avoids the O(registry) clone
+// entirely when content contributes no new named blocks — the common case for
+// leaf templates and partials that contain no define/block actions.
+//
+// When new blocks ARE found, only the new entries are merged into a shallow
+// copy of the registry; entries from the incoming registry are referenced, not
+// deep-copied, which keeps allocation proportional to the number of NEW blocks
+// rather than the total registry size.
 func mergeNamedBlockRegistry(registry map[string][]NamedBlockEntry, content, templateName string) map[string][]NamedBlockEntry {
-	merged := make(map[string][]NamedBlockEntry)
-	for name, entries := range registry {
-		merged[name] = append([]NamedBlockEntry(nil), entries...)
+	// Fast path: content has no define/block actions — return registry as-is.
+	// This avoids the O(registry) clone for the vast majority of templates.
+	if !contentHasNamedBlocks(content) {
+		return registry
 	}
-	extractNamedTemplatesFromContent(content, templateName, templateName, merged)
+
+	// Extract only what this content contributes.
+	local := make(map[string][]NamedBlockEntry, 4)
+	extractNamedTemplatesFromContent(content, templateName, templateName, local)
+
+	if len(local) == 0 {
+		return registry
+	}
+
+	// Shallow-merge: new map references existing slices from registry directly.
+	merged := make(map[string][]NamedBlockEntry, len(registry)+len(local))
+	maps.Copy(merged, registry)
+
+	for name, entries := range local {
+		existing := merged[name]
+		if len(existing) == 0 {
+			merged[name] = entries
+		} else {
+			combined := make([]NamedBlockEntry, len(existing), len(existing)+len(entries))
+			copy(combined, existing)
+			merged[name] = append(combined, entries...)
+		}
+	}
 	return merged
+}
+
+// contentHasNamedBlocks reports whether content contains any {{define ...}} or
+// {{block ...}} actions. It uses a simple byte scan — no allocations, no regexp.
+// This is the fast-path gate for mergeNamedBlockRegistry.
+func contentHasNamedBlocks(content string) bool {
+	i := 0
+	n := len(content)
+	for i < n-1 {
+		// Find next '{{'
+		if content[i] != '{' || content[i+1] != '{' {
+			i++
+			continue
+		}
+		j := i + 2
+		// Skip whitespace and optional '-' trim marker
+		for j < n && (content[j] == ' ' || content[j] == '\t' || content[j] == '-') {
+			j++
+		}
+		// Match "define" or "block" as a prefix followed by whitespace or '"'
+		if j+6 <= n {
+			kw6 := content[j : j+6]
+			if kw6 == "define" || kw6 == "block " || kw6 == "block\t" || kw6 == "block\"" {
+				return true
+			}
+		}
+		if j+5 <= n && content[j:j+5] == "block" {
+			// check that the next char is a delimiter
+			if j+5 < n {
+				c := content[j+5]
+				if c == ' ' || c == '\t' || c == '"' || c == '`' || c == '-' {
+					return true
+				}
+			}
+		}
+		i++
+	}
+	return false
 }
 
 func assignmentTargetSet(action string) map[string]bool {
@@ -571,41 +631,109 @@ type functionCandidate struct {
 	offset int
 }
 
+// FILE: validator/content_validator.go
+// Replace functionCandidates to eliminate strings.Split / strings.Fields allocations.
+
+// functionCandidates extracts identifiers in a pipeline that could be function
+// calls. It uses index-based scanning instead of strings.Split / strings.Fields
+// to avoid per-action slice allocations. This is on the hot path: called once
+// per template action during validation.
 func functionCandidates(expr string) []functionCandidate {
-	var candidates []functionCandidate
-	segments := strings.Split(expr, "|")
-	segmentOffset := 0
-	for index, segment := range segments {
-		trimmed := strings.TrimSpace(segment)
-		if trimmed == "" {
-			segmentOffset += len(segment) + 1
-			continue
-		}
-
-		tokens := strings.Fields(trimmed)
-		if len(tokens) == 0 {
-			segmentOffset += len(segment) + 1
-			continue
-		}
-
-		candidate := ""
-		if tokens[0] == "call" {
-			if len(tokens) > 1 {
-				candidate = strings.Trim(tokens[1], "()")
-			}
-		} else if index > 0 || len(tokens) > 1 {
-			candidate = strings.Trim(tokens[0], "()")
-		}
-
-		if isFunctionIdentifier(candidate) {
-			if offset := strings.Index(segment, candidate); offset >= 0 {
-				candidates = append(candidates, functionCandidate{name: candidate, offset: segmentOffset + offset})
-			}
-		}
-
-		segmentOffset += len(segment) + 1
+	// Fast path: no pipe and no leading function identifier.
+	// The vast majority of actions are pure field accesses (.Foo, $.Bar) which
+	// contain no function candidates at all.
+	if len(expr) == 0 {
+		return nil
 	}
+
+	var candidates []functionCandidate
+	segmentStart := 0
+	segmentIndex := 0
+
+	// Scan through the expression, splitting on '|' without allocating.
+	for pos := 0; pos <= len(expr); pos++ {
+		if pos < len(expr) && expr[pos] != '|' {
+			continue
+		}
+
+		seg := expr[segmentStart:pos]
+		candidate := extractCandidateFromSegment(seg, segmentIndex, segmentStart)
+		if candidate != "" {
+			if off := indexOfToken(expr[segmentStart:pos], candidate); off >= 0 {
+				candidates = append(candidates, functionCandidate{name: candidate, offset: segmentStart + off})
+			}
+		}
+		segmentStart = pos + 1
+		segmentIndex++
+	}
+
 	return candidates
+}
+
+// extractCandidateFromSegment returns the function-call candidate name from a
+// single pipeline segment, or "" if none exists.
+// segment is the raw segment text; segmentIndex is its position in the pipeline.
+func extractCandidateFromSegment(segment string, segmentIndex int, _ int) string {
+	// Trim leading ASCII whitespace without allocating.
+	start := 0
+	for start < len(segment) && isWhitespaceByte(segment[start]) {
+		start++
+	}
+	if start == len(segment) {
+		return ""
+	}
+	trimmed := segment[start:]
+
+	// Find the first token (up to first whitespace).
+	end := 0
+	for end < len(trimmed) && !isWhitespaceByte(trimmed[end]) {
+		end++
+	}
+	if end == 0 {
+		return ""
+	}
+	firstToken := trimmed[:end]
+
+	var candidate string
+	if firstToken == "call" {
+		// call <fn> args... — the function is the second token.
+		rest := trimmed[end:]
+		// skip whitespace
+		rstart := 0
+		for rstart < len(rest) && isWhitespaceByte(rest[rstart]) {
+			rstart++
+		}
+		rend := rstart
+		for rend < len(rest) && !isWhitespaceByte(rest[rend]) {
+			rend++
+		}
+		if rend > rstart {
+			candidate = strings.Trim(rest[rstart:rend], "()")
+		}
+	} else if segmentIndex > 0 || end < len(trimmed) {
+		// Non-first segment, or first segment with more than one token:
+		// the first token is a potential function name.
+		candidate = strings.Trim(firstToken, "()")
+	}
+
+	if !isFunctionIdentifier(candidate) {
+		return ""
+	}
+	return candidate
+}
+
+// indexOfToken finds the byte offset of token within s using a simple scan.
+// Returns -1 if not found.
+func indexOfToken(s, token string) int {
+	if token == "" || len(token) > len(s) {
+		return -1
+	}
+	for i := 0; i <= len(s)-len(token); i++ {
+		if s[i:i+len(token)] == token {
+			return i
+		}
+	}
+	return -1
 }
 
 func isFunctionIdentifier(value string) bool {

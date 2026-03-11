@@ -28,9 +28,6 @@ import (
 // passes the pkgs slice to every downstream step, eliminating the redundant
 // packages.Load that previously happened inside the context-enrichment branch.
 func AnalyzeDir(dir string, contextFile string, config AnalysisConfig) AnalysisResult {
-	if diskCached, ok := ReadDiskCache(dir, contextFile); ok {
-		return *diskCached
-	}
 	result := AnalysisResult{}
 	fset := token.NewFileSet()
 	cfg := &packages.Config{
@@ -99,12 +96,6 @@ func AnalyzeDir(dir string, contextFile string, config AnalysisConfig) AnalysisR
 			result.RenderCalls, contextFile, pkgs, structIndex, fc, fset, config, seenPool,
 		)
 	}
-
-	// Persist to disk cache for future cold starts
-	// Synchronous write (inside AnalyzeDir before return) prevents data races
-	// with callers that modify the returned result (e.g. Flatten).
-	WriteDiskCache(dir, contextFile, result)
-
 	return result
 }
 

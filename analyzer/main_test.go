@@ -14,7 +14,7 @@ import (
 func BenchmarkColdStart(b *testing.B) {
 	absDir := "/home/nabiizy/Code/go/eclinichmsgo"
 	templateBase := absDir
-	contextFile := absDir + "/rex.json"
+	contextFile := absDir + "/gotpl.json"
 	templateRoot := "templates"
 
 	for b.Loop() {
@@ -31,7 +31,7 @@ func BenchmarkColdStart(b *testing.B) {
 func BenchmarkWarmStart(b *testing.B) {
 	absDir := "/home/nabiizy/Code/go/eclinichmsgo"
 	templateBase := absDir
-	contextFile := absDir + "/rex.json"
+	contextFile := absDir + "/gotpl.json"
 	templateRoot := "templates"
 
 	// Run once before the timer starts to populate the cache
