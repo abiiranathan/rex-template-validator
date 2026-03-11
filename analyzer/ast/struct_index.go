@@ -52,10 +52,10 @@ func extractStructFieldsWorker(
 	for f := range fileChan {
 		pkgName := f.Name.Name
 
-		goast.Inspect(f, func(n goast.Node) bool {
-			genDecl, ok := n.(*goast.GenDecl)
+		for _, decl := range f.Decls {
+			genDecl, ok := decl.(*goast.GenDecl)
 			if !ok || genDecl.Tok != token.TYPE {
-				return true
+				continue
 			}
 
 			for _, spec := range genDecl.Specs {
@@ -106,9 +106,7 @@ func extractStructFieldsWorker(
 				key := pkgName + "." + typeSpec.Name.Name
 				sharedIndex.Store(key, entry)
 			}
-
-			return true
-		})
+		}
 	}
 }
 

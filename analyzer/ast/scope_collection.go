@@ -56,20 +56,25 @@ func identifyFuncNodes(files []*goast.File) []funcWorkUnit {
 	funcNodes := make([]funcWorkUnit, 0, len(files)*8)
 
 	for _, f := range files {
-		goast.Inspect(f, func(n goast.Node) bool {
-			switch node := n.(type) {
-			case *goast.FuncDecl, *goast.FuncLit:
-				// Function declarations (func Foo()) and literals (func() {})
+		for _, decl := range f.Decls {
+			switch node := decl.(type) {
+			case *goast.FuncDecl:
 				funcNodes = append(funcNodes, funcWorkUnit{node: node})
-
+				// Only inspect the body for closures, skipping the rest of the file
+				if node.Body != nil {
+					goast.Inspect(node.Body, func(n goast.Node) bool {
+						if lit, ok := n.(*goast.FuncLit); ok {
+							funcNodes = append(funcNodes, funcWorkUnit{node: lit})
+						}
+						return true
+					})
+				}
 			case *goast.GenDecl:
-				// Top-level variables and constants can contain template operations
 				if node.Tok == token.VAR || node.Tok == token.CONST {
 					funcNodes = append(funcNodes, funcWorkUnit{node: node})
 				}
 			}
-			return true
-		})
+		}
 	}
 
 	return funcNodes

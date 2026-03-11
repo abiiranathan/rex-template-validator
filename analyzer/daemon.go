@@ -649,11 +649,21 @@ func registryEntriesForFile(registry map[string][]validator.NamedBlockEntry, abs
 	return entries
 }
 
+// dedupKey is a struct used to identify unique validation errors for deduplication purposes.
+// Since all fields are comparable, we can use this as a key in a map without memory allocation.
+type dedupKey struct {
+	Template string
+	Line     int
+	Column   int
+	Variable string
+	Message  string
+}
+
 func dedupeValidationErrors(in []validator.ValidationResult) []validator.ValidationResult {
-	seen := make(map[string]bool, len(in))
+	seen := make(map[dedupKey]bool, len(in))
 	out := make([]validator.ValidationResult, 0, len(in))
 	for _, err := range in {
-		key := fmt.Sprintf("%s|%d|%d|%s|%s", err.Template, err.Line, err.Column, err.Variable, err.Message)
+		key := dedupKey{err.Template, err.Line, err.Column, err.Variable, err.Message}
 		if seen[key] {
 			continue
 		}

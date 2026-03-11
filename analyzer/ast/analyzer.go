@@ -8,6 +8,9 @@ import (
 	"fmt"
 	goast "go/ast"
 	"go/token"
+	"io/fs"
+	"path/filepath"
+	"strings"
 
 	"golang.org/x/tools/go/packages"
 )
@@ -38,7 +41,30 @@ func AnalyzeDir(dir string, contextFile string, config AnalysisConfig) AnalysisR
 		Tests: false,
 	}
 
-	pkgs, err := packages.Load(cfg, "./...")
+	var loadDirs []string
+	filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if d.IsDir() {
+			name := d.Name()
+			if name == "vendor" ||
+				name == "node_modules" ||
+				name == "testdata" ||
+				name == "tests" ||
+				strings.HasPrefix(name, ".") ||
+				strings.HasPrefix(name, "generated") {
+				return filepath.SkipDir
+			}
+
+			relPath, err := filepath.Rel(dir, path)
+			if err != nil {
+				return err
+			}
+			relPath = filepath.ToSlash(relPath)
+			loadDirs = append(loadDirs, "./"+relPath)
+		}
+		return nil
+	})
+
+	pkgs, err := packages.Load(cfg, loadDirs...)
 	if err != nil {
 		result.Errors = append(result.Errors, fmt.Sprintf("load error: %v", err))
 		return result
