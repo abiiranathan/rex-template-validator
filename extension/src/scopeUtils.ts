@@ -717,21 +717,56 @@ export class ScopeUtils {
             let childLocals = new Map(blockLocals);
 
             if ((node.kind === 'define' || node.kind === 'block') && node.blockName) {
-                const callCtx = this.resolveNamedBlockCallCtxForPosition(
-                    node.blockName, vars, rootNodes, currentFilePath
-                );
-                if (callCtx) {
-                    childVars = this.fieldsToVarMap(callCtx.fields ?? []);
+                const graph = this.graphBuilder.getGraph();
+                const blockCtx = graph.templates.get(node.blockName);
+                const cfCall = blockCtx?.renderCalls.find(rc => rc.file === 'context-file');
+
+                if (cfCall && cfCall.vars) {
+                    childVars = this.fieldsToVarMap(cfCall.vars as unknown as FieldInfo[]);
                     childStack = [{
                         key: '.',
-                        typeStr: callCtx.typeStr,
-                        fields: callCtx.fields ?? [],
-                        isMap: callCtx.isMap,
-                        keyType: callCtx.keyType,
-                        elemType: callCtx.elemType,
-                        isSlice: callCtx.isSlice,
+                        typeStr: 'context',
+                        fields: cfCall.vars as unknown as FieldInfo[],
+                        isMap: false,
+                        isSlice: false,
                     }];
                     childLocals = new Map();
+                } else {
+                    const callCtx = this.resolveNamedBlockCallCtxForPosition(
+                        node.blockName, vars, rootNodes, currentFilePath
+                    );
+                    if (callCtx) {
+                        childVars = this.fieldsToVarMap(callCtx.fields ?? []);
+                        childStack = [{
+                            key: '.',
+                            typeStr: callCtx.typeStr,
+                            fields: callCtx.fields ?? [],
+                            isMap: callCtx.isMap,
+                            keyType: callCtx.keyType,
+                            elemType: callCtx.elemType,
+                            isSlice: callCtx.isSlice,
+                        }];
+                        childLocals = new Map();
+                    } else if (node.kind === 'block') {
+                        const result = resolvePath(
+                            node.path, vars, scopeStack, childLocals,
+                            this.buildFieldResolver(vars, scopeStack)
+                        );
+                        if (result.found) {
+                            let fields = result.fields ?? [];
+                            if (fields.length === 0 && result.typeStr === 'context') {
+                                fields = [...vars.values()] as unknown as FieldInfo[];
+                            }
+                            childStack = [
+                                ...scopeStack,
+                                { key: '.', typeStr: result.typeStr, fields: fields },
+                            ];
+                        }
+                    } else if (node.kind === 'define') {
+                        childVars = new Map();
+                        childStack = [];
+                        childLocals = new Map();
+                    }
                 }
             } else {
                 const childScope = this.buildChildScope(
@@ -835,6 +870,25 @@ export class ScopeUtils {
                             elemType: callCtx.elemType,
                             isSlice: callCtx.isSlice,
                         }];
+                        childLocals = new Map();
+                    } else if (node.kind === 'block') {
+                        const result = resolvePath(
+                            node.path, vars, scopeStack, childLocals,
+                            this.buildFieldResolver(vars, scopeStack)
+                        );
+                        if (result.found) {
+                            let fields = result.fields ?? [];
+                            if (fields.length === 0 && result.typeStr === 'context') {
+                                fields = [...vars.values()] as unknown as FieldInfo[];
+                            }
+                            childStack = [
+                                ...scopeStack,
+                                { key: '.', typeStr: result.typeStr, fields: fields },
+                            ];
+                        }
+                    } else if (node.kind === 'define') {
+                        childVars = new Map();
+                        childStack = [];
                         childLocals = new Map();
                     }
                 }
@@ -1129,6 +1183,15 @@ export class ScopeUtils {
             return localCtx;
         }
 
+        if (blockCtx && blockCtx.vars.size > 0) {
+            const synthFields = [...blockCtx.vars.values()] as unknown as FieldInfo[];
+            return {
+                typeStr: 'context',
+                fields: synthFields,
+                isMap: false,
+                isSlice: false,
+            };
+        }
         return null;
     }
 }

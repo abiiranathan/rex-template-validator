@@ -100,9 +100,16 @@ export class HoverProvider {
                     const md = new vscode.MarkdownString();
                     md.isTrusted = true;
                     md.appendCodeblock(`. : ${callCtx.typeStr}`, 'go');
-                    if (callCtx.fields?.length) {
+
+                    let fields = callCtx.fields;
+                    if ((!fields || fields.length === 0) && callCtx.typeStr && callCtx.typeStr !== 'context' && callCtx.typeStr !== 'unknown') {
+                        const resolver = this.scope.buildFieldResolver(ctx.vars, []);
+                        fields = resolver(callCtx.typeStr) ?? [];
+                    }
+
+                    if (fields && fields.length > 0) {
                         md.appendMarkdown('\n\n---\n\n**Fields:**\n\n');
-                        for (const f of callCtx.fields.slice(0, 30)) {
+                        for (const f of fields.slice(0, 30)) {
                             md.appendMarkdown(
                                 `**${f.name}** \`${(f as FieldInfo).isSlice ? `[]${f.type}` : f.type}\`\n\n`
                             );
@@ -159,7 +166,7 @@ export class HoverProvider {
         const isPartialDotCtx =
             node.kind === 'partial' && (node.partialContext ?? '.') === '.';
         if (isBareVarDot || isPartialDotCtx) {
-            return this.buildDotHover(stack, hitVars);
+            return this.buildDotHover(stack, hitVars, this.scope.buildFieldResolver(hitVars, stack));
         }
 
         let result = resolvePath(
@@ -394,13 +401,20 @@ export class HoverProvider {
     /** Builds a hover card for the bare "." current-context reference. */
     buildDotHover(
         scopeStack: ScopeFrame[],
-        vars: Map<string, TemplateVar>
+        vars: Map<string, TemplateVar>,
+        fieldResolver: (typeStr: string) => FieldInfo[] | undefined
     ): vscode.Hover | null {
         const dotFrame = scopeStack.slice().reverse().find(f => f.key === '.');
         const typeStr = dotFrame ? (dotFrame.typeStr ?? 'unknown') : 'RenderContext';
-        const fields: FieldInfo[] =
-            dotFrame?.fields ??
-            [...vars.values()].map(v => ({
+
+        let fields: FieldInfo[] | undefined = dotFrame?.fields;
+
+        if (dotFrame && (!fields || fields.length === 0) && dotFrame.typeStr && dotFrame.typeStr !== 'context' && dotFrame.typeStr !== 'unknown') {
+            fields = fieldResolver(dotFrame.typeStr) ?? [];
+        }
+
+        if (!dotFrame || (!fields && dotFrame.typeStr === 'context')) {
+            fields = [...vars.values()].map(v => ({
                 name: v.name,
                 type: v.type,
                 fields: v.fields,
@@ -410,12 +424,13 @@ export class HoverProvider {
                 keyType: v.keyType,
                 elemType: v.elemType,
             } as FieldInfo));
+        }
 
         const md = new vscode.MarkdownString();
         md.isTrusted = true;
         md.appendCodeblock(`. : ${typeStr}`, 'go');
 
-        if (fields.length > 0) {
+        if (fields && fields.length > 0) {
             md.appendMarkdown('\n\n---\n\n**Fields:**\n\n');
             for (const f of fields.slice(0, 30)) {
                 md.appendMarkdown(

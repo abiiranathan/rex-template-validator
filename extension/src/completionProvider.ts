@@ -311,8 +311,15 @@ export class CompletionProvider {
                         position.line, matchStart, position.line, position.character
                     );
                     const dotFrame = stack.slice().reverse().find(f => f.key === '.');
-                    const fields: FieldInfo[] = dotFrame?.fields ??
-                        [...ctx.vars.values()].map(v => ({
+                    let fields: FieldInfo[] | undefined = dotFrame?.fields;
+
+                    if (dotFrame && (!fields || fields.length === 0) && dotFrame.typeStr && dotFrame.typeStr !== 'context' && dotFrame.typeStr !== 'unknown') {
+                        const resolver = this.scope.buildFieldResolver(ctx.vars, stack);
+                        fields = resolver(dotFrame.typeStr) ?? [];
+                    }
+
+                    if (!dotFrame || (!fields && dotFrame.typeStr === 'context')) {
+                        fields = [...ctx.vars.values()].map(v => ({
                             name: v.name,
                             type: v.type,
                             fields: v.fields,
@@ -322,6 +329,8 @@ export class CompletionProvider {
                             keyType: v.keyType,
                             elemType: v.elemType,
                         } as FieldInfo));
+                    }
+
                     this.addFieldsToCompletion(
                         { fields }, completionItems, filterPrefix, repRange
                     );
@@ -341,14 +350,26 @@ export class CompletionProvider {
         // Case B: Bare "." — show current dot-context fields.
         if (lookupPath.length === 1 && (lookupPath[0] === '.' || lookupPath[0] === '')) {
             const dotFrame = stack.slice().reverse().find(f => f.key === '.');
-            const fields: FieldInfo[] = dotFrame?.fields ??
-                [...ctx.vars.values()].map(v => ({
+            let fields: FieldInfo[] | undefined = dotFrame?.fields;
+
+            if (dotFrame && (!fields || fields.length === 0) && dotFrame.typeStr && dotFrame.typeStr !== 'context' && dotFrame.typeStr !== 'unknown') {
+                const resolver = this.scope.buildFieldResolver(ctx.vars, stack);
+                fields = resolver(dotFrame.typeStr) ?? [];
+            }
+
+            if (!dotFrame || (!fields && dotFrame.typeStr === 'context')) {
+                fields = [...ctx.vars.values()].map(v => ({
                     name: v.name,
                     type: v.type,
                     fields: v.fields,
                     isSlice: v.isSlice ?? false,
                     doc: v.doc,
+                    isMap: v.isMap,
+                    keyType: v.keyType,
+                    elemType: v.elemType,
                 } as FieldInfo));
+            }
+
             this.addFieldsToCompletion({ fields }, completionItems, filterPrefix, repRange);
             return completionItems;
         }

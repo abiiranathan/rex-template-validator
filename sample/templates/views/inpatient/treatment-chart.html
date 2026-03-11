@@ -55,8 +55,8 @@
     {{ template "roles" .roles }}
 
     {{/* Same-file block */}}
-    {{ block "user-msg" .currentUser }}
-    <h1>Hello: {{ .Name }}</h1>
+    {{ block "user-msg" . }}
+    <h1>Hello: {{ .Title }}</h1>
     {{ end }}
 
     {{ $large := index $.billedDrugs 0 }}
