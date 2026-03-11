@@ -25,7 +25,7 @@ else
     EXT=".exe"
   fi
 
-  go build -o "$OUT_DIR/gotpl-analyzer$EXT" .
+  go build -ldflags='-w -s -extldflags="-static"' -o "$OUT_DIR/gotpl-analyzer$EXT" .
   echo "  ✓ Analyzer built → out/gotpl-analyzer$EXT"
 fi
 

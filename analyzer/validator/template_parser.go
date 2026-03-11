@@ -56,11 +56,9 @@ func processTemplateFilesConcurrently(templateFiles []string, root string) map[s
 
 	var wg sync.WaitGroup
 	for range numWorkers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			processTemplateFileWorker(fileChan, root, &mu, registry)
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -158,7 +156,7 @@ func extractNamedTemplatesFromContent(content, absolutePath, templatePath string
 		// Found '{{' at i.
 		fullStart := i
 		j := i + 2
-		for j < n-1 && !(content[j] == '}' && content[j+1] == '}') {
+		for j < n-1 && (content[j] != '}' || content[j+1] != '}') {
 			j++
 		}
 		if j >= n-1 {
