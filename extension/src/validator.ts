@@ -115,7 +115,7 @@ export class TemplateValidator {
     }
 
     /**
-     * Returns the definition location when the cursor is on a rex.Render() template
+     * Returns the definition location when the cursor is on a Render() template
      * path string inside a Go source file.  Returns null otherwise.
      */
     getTemplateDefinitionFromGo(

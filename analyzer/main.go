@@ -1,5 +1,5 @@
 /*
-Package main provides the command-line interface for the Rex template analyzer.
+Package main provides the command-line interface for the go template LSP.
 
 It performs static analysis on Go source code to identify template rendering
 invocations, function map declarations, and validate templates against their

@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
 
-const extensionNamespace = 'rex';
+// Centralized configuration management for the extension
+// Namespace: gotpl
+const extensionNamespace = 'gotpl';
 
 class Config {
     private config: vscode.WorkspaceConfiguration;

@@ -1,6 +1,6 @@
 /**
  * Package definitionProvider implements the VS Code go-to-definition provider
- * for Rex templates.  It resolves template variables, fields, funcMap functions,
+ * for templates.  It resolves template variables, fields, funcMap functions,
  * partial templates, and named blocks to their declaration sites in Go source files
  * or template files.
  */
@@ -182,7 +182,7 @@ export class DefinitionProvider {
     }
 
     /**
-     * Returns the definition location when the cursor is on a rex.Render() template
+     * Returns the definition location when the cursor is on a Render() template
      * path string inside a Go source file.  Returns null otherwise.
      */
     getTemplateDefinitionFromGo(

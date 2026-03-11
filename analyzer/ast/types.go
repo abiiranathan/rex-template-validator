@@ -153,7 +153,8 @@ type AnalysisConfig struct {
 	GlobalTemplateName string
 }
 
-// DefaultConfig provides the default configuration for the Rex template analyzer, tailored for common Rex framework conventions.
+// DefaultConfig provides the default configuration for the go template LSP,
+// tailored for common go template conventions.
 var DefaultConfig = AnalysisConfig{
 	RenderFunctionName:          "Render",
 	ExecuteTemplateFunctionName: "ExecuteTemplate",

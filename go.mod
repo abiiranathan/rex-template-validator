@@ -1,4 +1,4 @@
-module rex-template-validator
+module go-template-lsp
 
 go 1.25.7
 

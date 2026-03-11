@@ -1,5 +1,5 @@
 /**
- * Package hoverProvider implements the VS Code hover provider for Rex templates.
+ * Package hoverProvider implements the VS Code hover provider for golang templates.
  * It resolves the template variable or function under the cursor and returns a
  * rich Markdown tooltip with type, documentation, and field information.
  */

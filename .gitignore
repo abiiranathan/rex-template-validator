@@ -1,5 +1,6 @@
 # Binaries
 rex-analyzer
+gotpl-analyzer
 *.exe
 *.dll
 *.so
@@ -29,6 +30,9 @@ extension/dist/
 # Go
 analyzer/analyzer
 analyzer/rex-analyzer
+analyzer/gotpl-analyzer
+analyzer/gotpl-analyzer.exe
+analyzer/rex-analyzer.exe
 .opencode
 prompt*.txt
 *.test

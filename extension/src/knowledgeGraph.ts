@@ -19,6 +19,7 @@ import { TemplateParser, resolvePath } from './templateParser';
 import { normalizeDictArg } from './scopeUtils';
 import { inferExpressionType } from './compiler/expressionParser';
 import { extractBareType } from './types';
+import { config } from './config';
 
 export class KnowledgeGraphBuilder {
     private graph: KnowledgeGraph = {
@@ -78,10 +79,9 @@ export class KnowledgeGraphBuilder {
     }
 
     private getTemplateBase(): string {
-        const config = vscode.workspace.getConfiguration('rex');
-        const sourceDir: string = config.get('sourceDir') ?? '.';
-        const templateBaseDir: string = config.get('templateBaseDir') ?? '';
-        const templateRoot: string = config.get('templateRoot') ?? '';
+        const sourceDir: string = config.sourceDir();
+        const templateBaseDir: string = config.templateBaseDir();
+        const templateRoot: string = config.templateRoot();
 
         const baseDir = templateBaseDir
             ? path.resolve(this.workspaceRoot, templateBaseDir)
@@ -384,8 +384,6 @@ export class KnowledgeGraphBuilder {
         }
 
         const templateBase = this.getTemplateBase();
-        const config = vscode.workspace.getConfiguration('rex');
-        const sourceDir: string = config.get('sourceDir') ?? '.';
 
         const candidates = [
             path.join(path.dirname(currentFile), partialName),

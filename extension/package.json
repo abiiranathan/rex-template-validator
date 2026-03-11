@@ -1,11 +1,11 @@
 {
-  "name": "rex",
-  "displayName": "Golang Template Validator and Language Server",
-  "description": "Validates Go template variables in .html/.tmpl files and provides intellisense, go to definition etc",
+  "name": "go-template-lsp",
+  "displayName": "Go Template LSP (Language Server)",
+  "description": "Language Server Protocol extension for Go templates: validation, intellisense, go to definition, and more.",
   "version": "0.2.0",
   "publisher": "Dr. Abiira Nathan",
   "repository": {
-    "url": "https://github.com/abiiranathan/rex-template-validator.git"
+    "url": "https://github.com/abiiranathan/go-template-lsp.git"
   },
   "license": "MIT",
   "engines": {
@@ -20,9 +20,13 @@
     "golang",
     "template",
     "html",
-    "rex",
+    "lsp",
+    "language server",
     "validation",
-    "Html Language Server"
+    "intellisense",
+    "autocomplete",
+    "definition",
+    "go-template-lsp"
   ],
   "activationEvents": [
     "workspaceContains:**/*.go",
@@ -34,68 +38,68 @@
   "contributes": {
     "commands": [
       {
-        "command": "rexAnalyzer.validate",
-        "title": "Rex: Validate Template Variables",
+        "command": "gotpl.validate",
+        "title": "GoTpl: Validate Template Variables",
         "icon": "$(check-all)"
       },
       {
-        "command": "rexAnalyzer.rebuildIndex",
-        "title": "Rex: Rebuild Template Index",
+        "command": "gotpl.rebuildIndex",
+        "title": "GoTpl: Rebuild Template Index",
         "icon": "$(refresh)"
       },
       {
-        "command": "rexAnalyzer.showKnowledgeGraph",
-        "title": "Rex: Show Template Knowledge Graph"
+        "command": "gotpl.showKnowledgeGraph",
+        "title": "GoTpl: Show Template Knowledge Graph"
       }
     ],
     "menus": {
       "editor/title": [
         {
-          "command": "rexAnalyzer.validate",
+          "command": "gotpl.validate",
           "when": "resourceExtname == .html || resourceExtname == .tmpl",
           "group": "navigation"
         }
       ]
     },
     "configuration": {
-      "title": "Rex LSP",
+      "title": "Go Template LSP",
       "properties": {
-        "rex.goAnalyzerPath": {
+        "gotpl.goAnalyzerPath": {
           "type": "string",
           "default": "",
-          "description": "Path to the rex analyzer binary. Leave empty to use the bundled binary."
+          "description": "Path to the gotpl analyzer binary. Leave empty to use the bundled binary."
         },
-        "rex.sourceDir": {
+        "gotpl.sourceDir": {
           "type": "string",
           "default": ".",
           "description": "Go source directory relative to the workspace root, passed as the -dir flag to the CLI (e.g. 'sample' if your Go files live in a subdirectory)."
         },
-        "rex.templateRoot": {
+        "gotpl.templateRoot": {
           "type": "string",
           "default": "",
           "description": "Root directory for templates, relative to sourceDir, passed as the -template-root flag (e.g. 'templates')."
         },
-        "rex.templateBaseDir": {
+        "gotpl.templateBaseDir": {
           "type": "string",
           "default": "",
           "description": "Base directory for templates, relative to the workspace root, used as the -template-base-dir flag. If empty, defaults to the workspace root."
         },
-        "rex.contextFile": {
+        "gotpl.contextFile": {
           "type": "string",
           "default": "",
           "description": "Path to a JSON file containing additional context variables (e.g. injected by middleware). Can be absolute or relative to workspace root."
         },
-        "rex.debounceMs": {
+        "gotpl.debounceMs": {
           "type": "number",
           "default": 1500,
           "description": "Debounce delay in milliseconds before re-validating on file change."
         },
-        "rex.compress": {
+        "gotpl.compress": {
           "type": "boolean",
           "default": false,
           "description": "Enable GZIP compression from analyzer"
         },
-        "rex.validate": {
+        "gotpl.validate": {
           "type": "boolean",
           "default": true,
           "description": "Validate variables passed into the context and template names"
@@ -107,8 +111,8 @@
     "vscode:prepublish": "npm run compile && npm run build-analyzer",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "build-analyzer": "cd ../analyzer && go build -o ../extension/out/rex .",
-    "package": "vsce package"
+    "build-analyzer": "cd ../analyzer && go build -o ../extension/out/gotpl-analyzer .",
+    "package": "npx vsce package"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

@@ -7,7 +7,7 @@ EXT_DIR="$ROOT/extension"
 OUT_DIR="$EXT_DIR/out"
 
 echo "══════════════════════════════════════"
-echo "  Rex LSP — Build"
+echo "  GoTpl LSP — Build"
 echo "══════════════════════════════════════"
 
 # ─── Build Go Analyzer ───────────────────
@@ -25,8 +25,8 @@ else
     EXT=".exe"
   fi
 
-  go build -o "$OUT_DIR/rex-analyzer$EXT" .
-  echo "  ✓ Analyzer built → out/rex-analyzer$EXT"
+  go build -o "$OUT_DIR/gotpl-analyzer$EXT" .
+  echo "  ✓ Analyzer built → out/gotpl-analyzer$EXT"
 fi
 
 # ─── Build TypeScript Extension ──────────

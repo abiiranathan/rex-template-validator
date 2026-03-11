@@ -49,12 +49,12 @@ export class GoAnalyzer {
     }
 
     const ext = process.platform === 'win32' ? '.exe' : '';
-    const bundled = path.join(context.extensionPath, 'out', `rex-analyzer${ext}`);
+    const bundled = path.join(context.extensionPath, 'out', `gotpl-analyzer${ext}`);
     if (fs.existsSync(bundled)) {
       return bundled;
     }
 
-    return 'rex-analyzer';
+    return 'gotpl-analyzer';
   }
 
   /**
@@ -197,7 +197,6 @@ export class GoAnalyzer {
     }
 
     const args = ['-dir', absSourceDir];
-
     if (validate) {
       args.push('-validate')
     }
@@ -268,7 +267,7 @@ export class GoAnalyzer {
         this.outputChannel.appendLine(`[Analyzer] Failed to spawn: ${err.message}`);
         resolve({
           renderCalls: [],
-          errors: [`Failed to run analyzer: ${err.message}. Make sure rex-analyzer is built.`],
+          errors: [`Failed to run analyzer: ${err.message}. Make sure gotpl-analyzer is built.`],
         });
       });
 

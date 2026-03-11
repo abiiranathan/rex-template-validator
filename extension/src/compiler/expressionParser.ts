@@ -764,9 +764,8 @@ export class TypeInferencer {
     }
 
     private inferCallType(func: string, args: ExprNode[]): TypeResult | null {
-        // 1. Prioritize user-defined functions from FuncMap. 
-        // This allows them to override built-ins like 'add' and directly provides the precise return type.
-        // NOTE: We always infer dict call from builtins for proper context resolution.
+        // 1. Prioritize user-defined functions from FuncMap. This allows them to override built-ins like 'add' and directly provides the precise return type.
+        // Always infer dict call from builtins for proper context resolution.
         if (func != "dict" && this.funcMaps?.has(func)) {
             const fn = this.funcMaps.get(func)!;
             if (fn.returns && fn.returns.length > 0) {

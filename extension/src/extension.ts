@@ -6,6 +6,7 @@ import { KnowledgeGraphBuilder, setKnowledgeGraphBuilder } from './knowledgeGrap
 import { TemplateValidator } from './validator';
 import { KnowledgeGraphPanel } from './graphPanel';
 import { KnowledgeGraph, GoValidationError, NamedBlockDuplicateError } from './types';
+import { config } from './config';
 
 const TEMPLATE_SELECTOR: vscode.DocumentSelector = [
   { language: 'html', scheme: 'file' },
@@ -44,17 +45,17 @@ export async function activate(context: vscode.ExtensionContext) {
   statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
   context.subscriptions.push(statusBarItem);
 
-  outputChannel = vscode.window.createOutputChannel('Rex LSP');
-  analyzerCollection = vscode.languages.createDiagnosticCollection('rex-analyzer');
-  editorCollection = vscode.languages.createDiagnosticCollection('rex-editor');
-  namedBlockCollection = vscode.languages.createDiagnosticCollection('rex-named-blocks');
+  outputChannel = vscode.window.createOutputChannel('GoTpl LSP');
+  analyzerCollection = vscode.languages.createDiagnosticCollection('gotpl-analyzer');
+  editorCollection = vscode.languages.createDiagnosticCollection('gotpl-editor');
+  namedBlockCollection = vscode.languages.createDiagnosticCollection('gotpl-named-blocks');
 
   context.subscriptions.push(outputChannel, analyzerCollection, editorCollection, namedBlockCollection);
-  outputChannel.appendLine('[Rex] Extension activated');
+  outputChannel.appendLine('[GoTpl] Extension activated');
 
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   if (!workspaceRoot) {
-    outputChannel.appendLine('[Rex] No workspace folder found');
+    outputChannel.appendLine('[GoTpl] No workspace folder found');
     return;
   }
 
@@ -69,23 +70,23 @@ export async function activate(context: vscode.ExtensionContext) {
   // ── Commands ───────────────────────────────────────────────────────────────
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('rexAnalyzer.validate', async () => {
+    vscode.commands.registerCommand('gotpl.validate', async () => {
       const doc = vscode.window.activeTextEditor?.document;
       if (doc && isTemplate(doc)) {
         await validateDocument(doc);
       }
     }),
 
-    vscode.commands.registerCommand('rexAnalyzer.rebuildIndex', async () => {
+    vscode.commands.registerCommand('gotpl.rebuildIndex', async () => {
       await rebuildIndex(workspaceRoot);
     }),
 
-    vscode.commands.registerCommand('rexAnalyzer.showKnowledgeGraph', () => {
+    vscode.commands.registerCommand('gotpl.showKnowledgeGraph', () => {
       if (currentGraph) {
         KnowledgeGraphPanel.show(context, currentGraph);
       } else {
         vscode.window.showInformationMessage(
-          'No template index yet. Run "Rex: Rebuild Template Index" first.'
+          'No template index yet. Run "GoTpl: Rebuild Template Index" first.'
         );
       }
     })
@@ -182,7 +183,7 @@ export async function activate(context: vscode.ExtensionContext) {
         latestValidationVersions.set(doc.uri.toString(), doc.version);
         if (analyzer) {
           void analyzer.updateTemplate(workspaceRoot, doc.uri.fsPath, doc.getText()).catch((err) => {
-            outputChannel.appendLine(`[Rex] Failed to sync open template ${doc.uri.fsPath}: ${err}`);
+            outputChannel.appendLine(`[GoTpl] Failed to sync open template ${doc.uri.fsPath}: ${err}`);
           });
         }
         validateDocument(doc, doc.version);
@@ -197,13 +198,13 @@ export async function activate(context: vscode.ExtensionContext) {
             graphBuilder.updateTemplateFile(doc.uri.fsPath, doc.getText());
             applyNamedBlockDiagnostics();
           } catch (err) {
-            outputChannel.appendLine(`[Rex] Incremental graph update failed for ${doc.uri.fsPath}: ${err}`);
+            outputChannel.appendLine(`[GoTpl] Incremental graph update failed for ${doc.uri.fsPath}: ${err}`);
           }
         }
         latestValidationVersions.set(doc.uri.toString(), doc.version);
         if (analyzer) {
           void analyzer.updateTemplate(workspaceRoot, doc.uri.fsPath, doc.getText()).catch((err) => {
-            outputChannel.appendLine(`[Rex] Failed to sync template ${doc.uri.fsPath}: ${err}`);
+            outputChannel.appendLine(`[GoTpl] Failed to sync template ${doc.uri.fsPath}: ${err}`);
           });
         }
         scheduleValidateDocument(doc);
@@ -223,7 +224,7 @@ export async function activate(context: vscode.ExtensionContext) {
       latestValidationVersions.delete(key);
       if (analyzer) {
         void analyzer.clearTemplate(workspaceRoot, doc.uri.fsPath).catch((err) => {
-          outputChannel.appendLine(`[Rex] Failed to clear template sync ${doc.uri.fsPath}: ${err}`);
+          outputChannel.appendLine(`[GoTpl] Failed to clear template sync ${doc.uri.fsPath}: ${err}`);
         });
       }
     }),
@@ -242,8 +243,8 @@ export async function activate(context: vscode.ExtensionContext) {
 
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration('rex-analyzer')) {
-        outputChannel.appendLine('[Rex] Configuration changed, rebuilding index...');
+      if (e.affectsConfiguration('gotpl-analyzer')) {
+        outputChannel.appendLine('[GoTpl] Configuration changed, rebuilding index...');
         scheduleRebuild(workspaceRoot);
       }
     })
@@ -266,7 +267,7 @@ export async function activate(context: vscode.ExtensionContext) {
   // ── Initial build ──────────────────────────────────────────────────────────
 
   await rebuildIndex(workspaceRoot);
-  outputChannel.appendLine('[Rex] Ready');
+  outputChannel.appendLine('[GoTpl] Ready');
 }
 
 // ── Template detection ─────────────────────────────────────────────────────────
@@ -283,28 +284,27 @@ function isTemplate(doc: vscode.TextDocument): boolean {
 async function rebuildIndex(workspaceRoot: string) {
   if (!analyzer || !graphBuilder) return;
 
-  statusBarItem.text = '$(sync~spin) Rex: Analyzing Go sources...';
+  statusBarItem.text = '$(sync~spin) GoTpl: Analyzing Go sources...';
   statusBarItem.show();
 
-  const config = vscode.workspace.getConfiguration('rex');
-  const sourceDir: string = config.get('sourceDir') ?? '.';
-  const templateRoot: string = config.get('templateRoot') ?? '';
-  const templateBaseDir: string = config.get('templateBaseDir') ?? '';
+  const sourceDir: string = config.sourceDir();
+  const templateRoot: string = config.templateRoot();
+  const templateBaseDir: string = config.templateBaseDir();
 
   try {
     const result = await analyzer.analyzeWorkspace(workspaceRoot);
     currentGraph = graphBuilder.build(result);
 
     if (result.errors?.length) {
-      outputChannel.appendLine('[Rex] Analysis warnings:');
+      outputChannel.appendLine('[GoTpl] Analysis warnings:');
       result.errors.slice(0, 10).forEach(e => outputChannel.appendLine(`  ${e}`));
     }
 
     const count = currentGraph.templates.size;
     if (count === 0) {
-      outputChannel.appendLine('[Rex] No templates found.');
+      outputChannel.appendLine('[GoTpl] No templates found.');
       if (!result.renderCalls.length) {
-        outputChannel.appendLine('[Rex] No render calls found. Check your Go code calls c.Render().');
+        outputChannel.appendLine('[GoTpl] No render calls found. Check your Go code calls c.Render().');
       }
     }
 
@@ -350,12 +350,12 @@ async function rebuildIndex(workspaceRoot: string) {
 
     await validateOpenTemplateDocuments();
 
-    statusBarItem.text = `$(check) Rex: ${count} template${count === 1 ? '' : 's'} indexed`;
+    statusBarItem.text = `$(check) GoTpl: ${count} template${count === 1 ? '' : 's'} indexed`;
     statusBarItem.show();
     setTimeout(() => statusBarItem.hide(), 5000);
   } catch (err) {
-    outputChannel.appendLine(`[Rex] Rebuild failed: ${err}`);
-    statusBarItem.text = '$(error) Rex: Analysis failed';
+    outputChannel.appendLine(`[GoTpl] Rebuild failed: ${err}`);
+    statusBarItem.text = '$(error) GoTpl: Analysis failed';
     statusBarItem.show();
   }
 }
@@ -388,7 +388,7 @@ function applyNamedBlockDiagnostics() {
       );
 
       const diag = new vscode.Diagnostic(range, msg, vscode.DiagnosticSeverity.Error);
-      diag.source = 'Rex';
+      diag.source = 'GoTpl';
       diag.code = 'duplicate-named-block';
 
       diag.relatedInformation = err.entries
@@ -415,7 +415,7 @@ function applyNamedBlockDiagnostics() {
   }
 
   outputChannel.appendLine(
-    `[Rex] Applied ${duplicateErrors.length} duplicate named-block diagnostic(s)`
+    `[GoTpl] Applied ${duplicateErrors.length} duplicate named-block diagnostic(s)`
   );
 }
 
@@ -427,9 +427,7 @@ async function applyAnalyzerDiagnostics(
   templateBaseDir: string
 ) {
   analyzerCollection.clear();
-  const config = vscode.workspace.getConfiguration('rex');
-  const contextFile: string = config.get('contextFile') ?? '';
-
+  const contextFile: string = config.contextFile();
   const issuesByFile = new Map<string, vscode.Diagnostic[]>();
 
   for (const err of validationErrors) {
@@ -505,7 +503,7 @@ async function applyAnalyzerDiagnostics(
       err.message,
       err.severity === 'warning' ? vscode.DiagnosticSeverity.Warning : vscode.DiagnosticSeverity.Error
     );
-    diag.source = 'Rex';
+    diag.source = 'GoTpl';
     if (relatedInfo) {
       diag.relatedInformation = relatedInfo;
     }
@@ -519,7 +517,7 @@ async function applyAnalyzerDiagnostics(
     analyzerCollection.set(vscode.Uri.file(filePath), issues);
   }
 
-  outputChannel.appendLine(`[Rex] Applied ${validationErrors.length} analyzer diagnostics`);
+  outputChannel.appendLine(`[GoTpl] Applied ${validationErrors.length} analyzer diagnostics`);
 }
 
 // ── Per-document validation ────────────────────────────────────────────────────
@@ -545,7 +543,7 @@ async function validateDocument(doc: vscode.TextDocument, requestedVersion = doc
       return;
     }
     outputChannel.appendLine(
-      `[Rex] Live validation ${doc.uri.fsPath}: hasContext=${result.hasContext} errors=${result.validationErrors.length}`
+      `[GoTpl] Live validation ${doc.uri.fsPath}: hasContext=${result.hasContext} errors=${result.validationErrors.length}`
     );
     if (!result.hasContext) {
       editorCollection.delete(doc.uri);
@@ -554,62 +552,19 @@ async function validateDocument(doc: vscode.TextDocument, requestedVersion = doc
     editorCollection.set(doc.uri, diagnosticsFromValidationErrors(result.validationErrors));
     analyzerCollection.delete(doc.uri);
   } catch (err) {
-    outputChannel.appendLine(`[Rex] Live validation failed for ${doc.uri.fsPath}: ${err}`);
+    outputChannel.appendLine(`[GoTpl] Live validation failed for ${doc.uri.fsPath}: ${err}`);
   }
 }
 
-/**
- * Validates a template file that is NOT currently open in a VS Code editor.
- *
- * Uses fs.readFileSync directly so we never call vscode.workspace.openTextDocument,
- * which would fire onDidOpenTextDocument and cascade into another full revalidation.
- */
-async function validateFileDirect(filePath: string): Promise<void> {
-  if (!analyzer) return;
-
-  const config = vscode.workspace.getConfiguration('rex');
-  const validationEnabled: boolean = config.get('validate') ?? true;
-  if (!validationEnabled) return;
-
-  const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-  if (!workspaceRoot) return;
-
-  let content: string;
-  try {
-    content = fs.readFileSync(filePath, 'utf8');
-  } catch {
-    return;
-  }
-
-  try {
-    const result = await analyzer.validateTemplate(workspaceRoot, filePath, content);
-    const uri = vscode.Uri.file(filePath);
-    outputChannel.appendLine(
-      `[Rex] Live validation ${filePath}: hasContext=${result.hasContext} errors=${result.validationErrors.length}`
-    );
-    if (!result.hasContext) {
-      editorCollection.delete(uri);
-      return;
-    }
-    editorCollection.set(uri, diagnosticsFromValidationErrors(result.validationErrors));
-    analyzerCollection.delete(uri);
-  } catch (err) {
-    outputChannel.appendLine(`[Rex] Live validation failed for ${filePath}: ${err}`);
-  }
-}
-
-// ── Debounce helpers ───────────────────────────────────────────────────────────
 
 function scheduleRebuild(workspaceRoot: string) {
-  const config = vscode.workspace.getConfiguration('rex');
-  const debounceMs = config.get<number>('debounceMs') ?? 1000;
+  const debounceMs = config.debounceMs();
   if (rebuildTimer) clearTimeout(rebuildTimer);
   rebuildTimer = setTimeout(() => rebuildIndex(workspaceRoot), debounceMs);
 }
 
 function scheduleValidateDocument(doc: vscode.TextDocument) {
-  const config = vscode.workspace.getConfiguration('rex');
-  const debounceMs = config.get<number>('debounceMs') ?? 1000;
+  const debounceMs = config.debounceMs();
   const docKey = doc.uri.toString();
   latestValidationVersions.set(docKey, doc.version);
 
@@ -632,8 +587,7 @@ function scheduleValidateDocument(doc: vscode.TextDocument) {
 }
 
 function scheduleValidateOpenTemplateDocuments(excludeDocKey?: string) {
-  const config = vscode.workspace.getConfiguration('rex');
-  const debounceMs = config.get<number>('debounceMs') ?? 1000;
+  const debounceMs = config.debounceMs();
 
   if (validateOpenTemplatesTimer) clearTimeout(validateOpenTemplatesTimer);
   validateOpenTemplatesTimer = setTimeout(async () => {
@@ -662,7 +616,7 @@ function diagnosticsFromValidationErrors(errors: GoValidationError[]): vscode.Di
       err.message,
       err.severity === 'warning' ? vscode.DiagnosticSeverity.Warning : vscode.DiagnosticSeverity.Error
     );
-    diagnostic.source = 'Rex';
+    diagnostic.source = 'GoTpl';
     return diagnostic;
   });
 }

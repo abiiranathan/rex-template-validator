@@ -1,5 +1,5 @@
 /**
- * Package completionProvider implements the VS Code completion provider for Rex templates.
+ * Package completionProvider implements the VS Code completion provider for go templates.
  * It resolves completion items based on the scope at the cursor position, offering
  * template variables, struct fields, and funcMap functions.
  */
@@ -20,7 +20,7 @@ import { ScopeUtils } from './scopeUtils';
 import { GoAnalyzer } from './analyzer';
 
 /**
- * CompletionProvider supplies IntelliSense completion items for Rex template files.
+ * CompletionProvider supplies IntelliSense completion items for go template files.
  */
 export class CompletionProvider {
     private readonly parser: TemplateParser;

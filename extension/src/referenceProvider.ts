@@ -1,6 +1,6 @@
 /**
  * Package referenceProvider implements the VS Code find-references provider for
- * Rex templates.  When the cursor is on a block name inside any of:
+ * templates.  When the cursor is on a block name inside any of:
  *
  *   {{ template "block_name" . }}   ← call site
  *   {{ block   "block_name" . }}   ← declaration + call site
@@ -12,7 +12,7 @@
 
 import * as fs from 'fs';
 import * as vscode from 'vscode';
-import { TemplateNode, TemplateContext } from './types';
+import { TemplateNode } from './types';
 import { TemplateParser } from './templateParser';
 import { KnowledgeGraphBuilder } from './knowledgeGraph';
 

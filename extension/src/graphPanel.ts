@@ -14,8 +14,8 @@ export class KnowledgeGraphPanel {
     }
 
     const panel = vscode.window.createWebviewPanel(
-      'rexKnowledgeGraph',
-      'Rex Template Knowledge Graph',
+      'gotplKnowledgeGraph',
+      'GoTpl Template Knowledge Graph',
       vscode.ViewColumn.Beside,
       { enableScripts: true }
     );
@@ -180,7 +180,7 @@ export class KnowledgeGraphPanel {
 </head>
 <body>
   <div class="header">
-    <h1>Rex Templates</h1>
+    <h1>GoTpl Templates</h1>
     <div class="stats">
       <div class="stat-item">
         <span class="stat-value">${stats.templates}</span>
