@@ -542,14 +542,17 @@ async function validateDocument(doc: vscode.TextDocument, requestedVersion = doc
     if (latestValidationVersions.get(docKey) !== requestedVersion) {
       return;
     }
+
+    const errors = result.validationErrors ?? [];
+
     outputChannel.appendLine(
-      `[GoTpl] Live validation ${doc.uri.fsPath}: hasContext=${result.hasContext} errors=${result.validationErrors.length}`
+      `[GoTpl] Live validation ${doc.uri.fsPath}: hasContext=${result.hasContext} errors=${errors.length}`
     );
     if (!result.hasContext) {
       editorCollection.delete(doc.uri);
       return;
     }
-    editorCollection.set(doc.uri, diagnosticsFromValidationErrors(result.validationErrors));
+    editorCollection.set(doc.uri, diagnosticsFromValidationErrors(errors));
     analyzerCollection.delete(doc.uri);
   } catch (err) {
     outputChannel.appendLine(`[GoTpl] Live validation failed for ${doc.uri.fsPath}: ${err}`);
@@ -607,6 +610,8 @@ async function validateOpenTemplateDocuments(excludeDocKey?: string) {
 }
 
 function diagnosticsFromValidationErrors(errors: GoValidationError[]): vscode.Diagnostic[] {
+  if (!errors) return [];
+
   return errors.map(err => {
     const line = Math.max(0, err.line - 1);
     const col = Math.max(0, err.column - 1);

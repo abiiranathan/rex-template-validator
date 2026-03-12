@@ -519,16 +519,16 @@ export class ScopeUtils {
                     this.parser.parseDotPath(normalizedCtx), vars, scopeStack, blockLocals,
                     this.buildFieldResolver(vars, scopeStack)
                 );
-                return result.found
-                    ? {
+                if (result.found) {
+                    return {
                         typeStr: result.typeStr,
                         fields: result.fields,
                         isMap: result.isMap,
                         keyType: result.keyType,
                         elemType: result.elemType,
                         isSlice: result.isSlice,
-                    }
-                    : null;
+                    };
+                }
             }
 
             if (node.children) {
@@ -621,6 +621,9 @@ export class ScopeUtils {
 
     private rawBlockContext(node: TemplateNode): string {
         if (node.path.length === 0) {
+            return '.';
+        }
+        if (node.path.length === 1 && node.path[0] === '.') {
             return '.';
         }
         if (node.path[0] === '$') {

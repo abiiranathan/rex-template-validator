@@ -65,12 +65,6 @@
     {{ $authUser := getAuthUser 1 }}
     {{ $authUser.Name }}
 
-    {{/* ------------------------------------------------------------------ */}}
-    {{/* Complex nested block: role-aware prescription summary */}}
-    {{/* Tests: nested range>with>if>else, $-access, local vars, template */}}
-    {{/* call inside range, and else-range fallback path. */}}
-    {{/* ------------------------------------------------------------------ */}}
-
     {{ block "prescription-summary" . }}
     <section class="prescription-summary">
         <h2>{{ $.Title }} — Prescription Summary</h2>
