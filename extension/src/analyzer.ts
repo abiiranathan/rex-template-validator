@@ -36,25 +36,11 @@ export class GoAnalyzer {
     reject: (reason?: unknown) => void;
   }>();
 
-  constructor(context: vscode.ExtensionContext, outputChannel: vscode.OutputChannel) {
+  constructor(resolvedAnalyzerPath: string, outputChannel: vscode.OutputChannel) {
     this.outputChannel = outputChannel;
-    this.analyzerPath = this.resolveAnalyzerPath(context);
-  }
-
-  private resolveAnalyzerPath(context: vscode.ExtensionContext): string {
+    // Allow manual config override, otherwise use the path resolved by the installer
     const configPath = config.analyzerPath();
-
-    if (configPath && fs.existsSync(configPath)) {
-      return configPath;
-    }
-
-    const ext = process.platform === 'win32' ? '.exe' : '';
-    const bundled = path.join(context.extensionPath, 'out', `gotpl-analyzer${ext}`);
-    if (fs.existsSync(bundled)) {
-      return bundled;
-    }
-
-    return 'gotpl-analyzer';
+    this.analyzerPath = (configPath && fs.existsSync(configPath)) ? configPath : resolvedAnalyzerPath;
   }
 
   /**

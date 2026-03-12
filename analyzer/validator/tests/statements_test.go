@@ -3,8 +3,8 @@ package validator_test
 import (
 	"testing"
 
-	"github.com/rex-template-analyzer/ast"
-	"github.com/rex-template-analyzer/validator"
+	"github.com/abiiranathan/gotpl-analyzer/ast"
+	"github.com/abiiranathan/gotpl-analyzer/validator"
 )
 
 func TestStatementsAndFunctions(t *testing.T) {

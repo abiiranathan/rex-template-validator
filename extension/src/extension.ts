@@ -7,6 +7,7 @@ import { TemplateValidator } from './validator';
 import { KnowledgeGraphPanel } from './graphPanel';
 import { KnowledgeGraph, GoValidationError, NamedBlockDuplicateError } from './types';
 import { config } from './config';
+import { AnalyzerInstaller } from './installer';
 
 const TEMPLATE_SELECTOR: vscode.DocumentSelector = [
   { language: 'html', scheme: 'file' },
@@ -59,7 +60,13 @@ export async function activate(context: vscode.ExtensionContext) {
     return;
   }
 
-  analyzer = new GoAnalyzer(context, outputChannel);
+  // Ensure the Go analyzer binary is installed via `go install`
+  const analyzerExecutablePath = await AnalyzerInstaller.ensureInstalled(context, outputChannel);
+  if (!analyzerExecutablePath) {
+    outputChannel.appendLine('[GoTpl] Analyzer not installed. Extension disabled.');
+    return; // Exit early if user declined installation or it failed
+  }
+  analyzer = new GoAnalyzer(analyzerExecutablePath, outputChannel);
 
   // Pass the shared statusBarItem into the builder so it can show progress
   // messages without creating a second item.

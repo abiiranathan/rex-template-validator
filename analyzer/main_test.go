@@ -3,8 +3,8 @@ package main
 import (
 	"testing"
 
-	"github.com/rex-template-analyzer/ast"
-	"github.com/rex-template-analyzer/validator"
+	"github.com/abiiranathan/gotpl-analyzer/ast"
+	"github.com/abiiranathan/gotpl-analyzer/validator"
 )
 
 // BenchmarkColdStart profiles the absolute worst-case scenario (initial load)

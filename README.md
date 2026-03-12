@@ -58,7 +58,7 @@ go build -o gotpl-analyzer .
 
 Available flags:
 ```txt
-Usage of ./rex-analyzer:
+Usage of ./gotpl-analyzer:
   -compress
     	Output gzip-compressed JSON
   -context-file string
@@ -87,12 +87,6 @@ Usage of ./rex-analyzer:
 *   Node.js & npm
 
 ### Build Instructions
-Use the included build script to compile both the Go analyzer binary and the VS Code extension:
-
-```bash
-./build.sh
-```
-
 To debug in VS Code:
 1. Open the `extension` folder.
 2. Press `F5` to launch the Extension Development Host.

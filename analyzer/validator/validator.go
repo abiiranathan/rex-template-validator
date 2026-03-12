@@ -24,7 +24,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/rex-template-analyzer/ast"
+	"github.com/abiiranathan/gotpl-analyzer/ast"
 )
 
 // ValidateTemplates validates all templates against their render calls AND

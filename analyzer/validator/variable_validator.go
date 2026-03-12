@@ -3,7 +3,7 @@ package validator
 import (
 	"strings"
 
-	"github.com/rex-template-analyzer/ast"
+	"github.com/abiiranathan/gotpl-analyzer/ast"
 )
 
 // knownTypeMethods maps fully-qualified (or short) type names to the set of

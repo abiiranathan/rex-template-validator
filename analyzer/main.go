@@ -19,8 +19,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/rex-template-analyzer/ast"
-	"github.com/rex-template-analyzer/validator"
+	"github.com/abiiranathan/gotpl-analyzer/ast"
+	"github.com/abiiranathan/gotpl-analyzer/validator"
 )
 
 // ValidationOutput represents the JSON structure emitted when

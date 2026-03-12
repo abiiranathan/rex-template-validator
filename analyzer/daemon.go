@@ -11,8 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/rex-template-analyzer/ast"
-	"github.com/rex-template-analyzer/validator"
+	"github.com/abiiranathan/gotpl-analyzer/ast"
+	"github.com/abiiranathan/gotpl-analyzer/validator"
 )
 
 type rpcRequest struct {

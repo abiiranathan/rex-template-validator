@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/rex-template-analyzer/ast"
-	"github.com/rex-template-analyzer/validator"
+	"github.com/abiiranathan/gotpl-analyzer/ast"
+	"github.com/abiiranathan/gotpl-analyzer/validator"
 )
 
 func hoverVarMap() map[string]ast.TemplateVar {

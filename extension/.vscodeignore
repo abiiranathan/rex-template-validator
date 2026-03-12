@@ -1,0 +1,11 @@
+# .vscodeignore
+.vscode/**
+.vscode-test/**
+src/**
+.gitignore
+tsconfig.json
+**/*.map
+**/*.ts
+
+# Ignore leftover local Go binaries from older builds
+out/gotpl-analyzer*

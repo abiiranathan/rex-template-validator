@@ -3,7 +3,7 @@ package validator_test
 import (
 	"testing"
 
-	"github.com/rex-template-analyzer/validator"
+	"github.com/abiiranathan/gotpl-analyzer/validator"
 )
 
 func TestExtractNamedTemplates(t *testing.T) {

@@ -4,7 +4,7 @@ import (
 	"maps"
 	"strings"
 
-	"github.com/rex-template-analyzer/ast"
+	"github.com/abiiranathan/gotpl-analyzer/ast"
 )
 
 // resolvePartialScope determines what scope/type the context argument refers to

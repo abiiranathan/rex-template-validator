@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/rex-template-analyzer/ast"
+	"github.com/abiiranathan/gotpl-analyzer/ast"
 )
 
 // IsFileBasedPartial determines if a template name refers to a file path

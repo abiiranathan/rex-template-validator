@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/rex-template-analyzer/ast"
+	"github.com/abiiranathan/gotpl-analyzer/ast"
 )
 
 // validateTemplateCallWithRegistry is the hot-path implementation. It accepts

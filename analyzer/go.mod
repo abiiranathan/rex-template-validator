@@ -1,6 +1,6 @@
-module github.com/rex-template-analyzer
+module github.com/abiiranathan/gotpl-analyzer
 
-go 1.25.7
+go 1.25
 
 require golang.org/x/tools v0.42.0
 

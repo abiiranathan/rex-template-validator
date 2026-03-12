@@ -4,7 +4,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/rex-template-analyzer/ast"
+	"github.com/abiiranathan/gotpl-analyzer/ast"
 )
 
 // PositionScope captures everything needed for hover / completion / go-to-definition

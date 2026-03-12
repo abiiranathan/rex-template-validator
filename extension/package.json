@@ -120,10 +120,9 @@
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run compile && npm run build-analyzer",
+    "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "build-analyzer": "cd ../analyzer && go build -ldflags='-w -s -extldflags=\"-static\"' -o ../extension/out/gotpl-analyzer .",
     "package": "npx vsce package"
   },
   "devDependencies": {

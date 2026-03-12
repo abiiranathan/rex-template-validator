@@ -5,7 +5,7 @@ import (
 	"maps"
 	"strings"
 
-	"github.com/rex-template-analyzer/ast"
+	"github.com/abiiranathan/gotpl-analyzer/ast"
 )
 
 // ValidateTemplateContent performs comprehensive validation of template content

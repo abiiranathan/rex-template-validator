@@ -7,7 +7,7 @@ import (
 	"text/template"
 	templateparse "text/template/parse"
 
-	"github.com/rex-template-analyzer/ast"
+	"github.com/abiiranathan/gotpl-analyzer/ast"
 )
 
 type ExpressionTypeResult struct {

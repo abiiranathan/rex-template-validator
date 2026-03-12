@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/rex-template-analyzer/ast"
-	"github.com/rex-template-analyzer/validator"
+	"github.com/abiiranathan/gotpl-analyzer/ast"
+	"github.com/abiiranathan/gotpl-analyzer/validator"
 )
 
 // sharedVars is the common variable set used across tests.

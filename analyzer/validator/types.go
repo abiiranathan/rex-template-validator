@@ -1,6 +1,6 @@
 package validator
 
-import "github.com/rex-template-analyzer/ast"
+import "github.com/abiiranathan/gotpl-analyzer/ast"
 
 type FuncMapRegistry map[string]ast.FuncMapInfo
 
