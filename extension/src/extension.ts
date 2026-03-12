@@ -89,6 +89,74 @@ export async function activate(context: vscode.ExtensionContext) {
           'No template index yet. Run "GoTpl: Rebuild Template Index" first.'
         );
       }
+    }),
+
+    vscode.commands.registerCommand('gotpl.goToRenderCall', async () => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor || !isTemplate(editor.document)) return;
+
+      if (!graphBuilder) {
+        vscode.window.showErrorMessage('Template index is not ready.');
+        return;
+      }
+
+      let ctx = graphBuilder.findContextForFile(editor.document.uri.fsPath);
+
+      // If no direct render calls, see if it's used as a partial (inherits calls from parent)
+      if (!ctx || ctx.renderCalls.length === 0) {
+        const partialCtx = await graphBuilder.findContextForFileAsPartialAsync(editor.document.uri.fsPath);
+        if (partialCtx) ctx = partialCtx;
+      }
+
+      if (!ctx) {
+        vscode.window.showInformationMessage('No Go render calls found for this template.');
+        return;
+      }
+
+      // Filter out synthetic context file calls
+      const realCalls = ctx.renderCalls.filter(rc => rc.file !== 'context-file');
+
+      if (realCalls.length === 0) {
+        vscode.window.showInformationMessage('No Go render calls found for this template (only synthetic context).');
+        return;
+      }
+
+      const jumpTo = async (rc: any) => {
+        const absPath = graphBuilder!.resolveGoFilePath(rc.file);
+        if (!absPath) {
+          vscode.window.showErrorMessage(`Could not resolve Go file: ${rc.file}`);
+          return;
+        }
+        const goDoc = await vscode.workspace.openTextDocument(absPath);
+        const goEditor = await vscode.window.showTextDocument(goDoc);
+        const line = Math.max(0, rc.line - 1);
+        const col = Math.max(0, (rc.templateNameStartCol ?? 1) - 1);
+        const pos = new vscode.Position(line, col);
+
+        goEditor.selection = new vscode.Selection(pos, pos);
+        goEditor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
+      };
+
+      if (realCalls.length === 1) {
+        await jumpTo(realCalls[0]);
+      } else {
+        const items = realCalls.map(rc => ({
+          label: `$(go) ${rc.file}:${rc.line}`,
+          description: rc.vars && rc.vars.length > 0
+            ? `Context vars: ${rc.vars.map((v: any) => v.name).join(', ')}`
+            : 'No context vars',
+          rc: rc
+        }));
+
+        const selected = await vscode.window.showQuickPick(items, {
+          placeHolder: 'Select a Go render call to jump to',
+          matchOnDescription: true
+        });
+
+        if (selected) {
+          await jumpTo(selected.rc);
+        }
+      }
     })
   );
 

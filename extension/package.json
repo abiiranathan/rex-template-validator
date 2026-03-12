@@ -50,6 +50,11 @@
       {
         "command": "gotpl.showKnowledgeGraph",
         "title": "GoTpl: Show Template Knowledge Graph"
+      },
+      {
+        "command": "gotpl.goToRenderCall",
+        "title": "GoTpl: Go to Render Call",
+        "category": "GoTpl"
       }
     ],
     "menus": {
@@ -58,6 +63,13 @@
           "command": "gotpl.validate",
           "when": "resourceExtname == .html || resourceExtname == .tmpl",
           "group": "navigation"
+        }
+      ],
+      "editor/context": [
+        {
+          "when": "resourceLangId == go-template || resourceExtname == .html || resourceExtname == .tmpl",
+          "command": "gotpl.goToRenderCall",
+          "group": "navigation@2"
         }
       ]
     },
