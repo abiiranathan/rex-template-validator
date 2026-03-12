@@ -161,11 +161,11 @@ export class HoverProvider {
             }
         }
 
-        const isBareVarDot =
-            node.kind === 'variable' && node.path.length === 1 && node.path[0] === '.';
+        const isDotPath = node.path.length === 1 && node.path[0] === '.';
         const isPartialDotCtx =
             node.kind === 'partial' && (node.partialContext ?? '.') === '.';
-        if (isBareVarDot || isPartialDotCtx) {
+
+        if (isDotPath || isPartialDotCtx) {
             return this.buildDotHover(stack, hitVars, this.scope.buildFieldResolver(hitVars, stack));
         }
 
