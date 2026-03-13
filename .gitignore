@@ -1,6 +1,6 @@
 # Binaries
 rex-analyzer
-gotpl-analyzer
+gotpl-analyzer/gotpl-analyzer
 *.exe
 *.dll
 *.so

@@ -23,6 +23,11 @@ If you've ever been frustrated by discovering template typos, missing variables,
 ## 🛠 Usage
 
 The extension automatically activates when you open a Go or HTML/TMPL file in a workspace containing Go code. 
+If you want to install a standalone version, you can run:
+
+```bash
+go install github.com/abiiranathan/go-template-lsp/gotpl-analyzer@latest
+```
 
 ### Available Commands
 Open the Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`) and type `GoTpl`:

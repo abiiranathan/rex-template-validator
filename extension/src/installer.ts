@@ -5,7 +5,7 @@ import * as fs from 'fs';
 import * as util from 'util';
 
 const exec = util.promisify(cp.exec);
-const MODULE_PATH = 'github.com/abiiranathan/go-template-lsp/analyzer@latest';
+const MODULE_PATH = 'github.com/abiiranathan/go-template-lsp/gotpl-analyzer@latest';
 const BINARY_NAME = process.platform === 'win32' ? 'gotpl-analyzer.exe' : 'gotpl-analyzer';
 
 export class AnalyzerInstaller {
@@ -26,8 +26,8 @@ export class AnalyzerInstaller {
      * Builds the analyzer locally when running in Extension Development Mode.
      */
     static async buildLocalAnalyzer(context: vscode.ExtensionContext, outputChannel: vscode.OutputChannel): Promise<string | null> {
-        // workspace structure: /repo/extension and /repo/analyzer
-        const analyzerSourceDir = path.join(context.extensionPath, '..', 'analyzer');
+        // workspace structure: /repo/extension and /repo/gotpl-analyzer
+        const analyzerSourceDir = path.join(context.extensionPath, '..', 'gotpl-analyzer');
         const outputBinary = path.join(analyzerSourceDir, BINARY_NAME);
 
         if (!fs.existsSync(analyzerSourceDir)) {
