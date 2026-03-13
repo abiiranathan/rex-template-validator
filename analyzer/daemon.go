@@ -11,8 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"analyzer/ast"
-	"analyzer/validator"
+	"github.com/abiiranathan/go-template-lsp/analyzer/ast"
+	"github.com/abiiranathan/go-template-lsp/analyzer/validator"
 )
 
 type rpcRequest struct {

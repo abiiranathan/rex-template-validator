@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"analyzer/ast"
+	"github.com/abiiranathan/go-template-lsp/analyzer/ast"
 )
 
 // IsFileBasedPartial determines if a template name refers to a file path

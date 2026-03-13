@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"analyzer/ast"
-	"analyzer/validator"
+	"github.com/abiiranathan/go-template-lsp/analyzer/ast"
+	"github.com/abiiranathan/go-template-lsp/analyzer/validator"
 )
 
 func hoverVarMap() map[string]ast.TemplateVar {

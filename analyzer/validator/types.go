@@ -1,6 +1,6 @@
 package validator
 
-import "analyzer/ast"
+import "github.com/abiiranathan/go-template-lsp/analyzer/ast"
 
 type FuncMapRegistry map[string]ast.FuncMapInfo
 
