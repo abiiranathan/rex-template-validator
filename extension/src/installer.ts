@@ -5,7 +5,7 @@ import * as fs from 'fs';
 import * as util from 'util';
 
 const exec = util.promisify(cp.exec);
-const MODULE_PATH = 'github.com/abiiranathan/go-template-lsp/analyzer@latest';
+const MODULE_PATH = 'analyzer@latest';
 const BINARY_NAME = process.platform === 'win32' ? 'gotpl-analyzer.exe' : 'gotpl-analyzer';
 
 export class AnalyzerInstaller {

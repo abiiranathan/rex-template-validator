@@ -1,4 +1,4 @@
-module github.com/abiiranathan/go-template-lsp/analyzer
+module analyzer
 
 go 1.25
 

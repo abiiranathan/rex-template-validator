@@ -7,7 +7,7 @@ import (
 	"text/template"
 	templateparse "text/template/parse"
 
-	"github.com/abiiranathan/go-template-lsp/analyzer/ast"
+	"analyzer/ast"
 )
 
 type ExpressionTypeResult struct {

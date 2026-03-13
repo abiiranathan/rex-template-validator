@@ -3,8 +3,8 @@ package validator_test
 import (
 	"testing"
 
-	"github.com/abiiranathan/go-template-lsp/analyzer/ast"
-	"github.com/abiiranathan/go-template-lsp/analyzer/validator"
+	"analyzer/ast"
+	"analyzer/validator"
 )
 
 // TestNestedRangeLoops validates field access in double-nested range loops

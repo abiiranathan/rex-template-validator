@@ -4,7 +4,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/abiiranathan/go-template-lsp/analyzer/ast"
+	"analyzer/ast"
 )
 
 // PositionScope captures everything needed for hover / completion / go-to-definition

@@ -3,8 +3,8 @@ package main
 import (
 	"testing"
 
-	"github.com/abiiranathan/go-template-lsp/analyzer/ast"
-	"github.com/abiiranathan/go-template-lsp/analyzer/validator"
+	"analyzer/ast"
+	"analyzer/validator"
 )
 
 // BenchmarkColdStart profiles the absolute worst-case scenario (initial load)

@@ -19,8 +19,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/abiiranathan/go-template-lsp/analyzer/ast"
-	"github.com/abiiranathan/go-template-lsp/analyzer/validator"
+	"analyzer/ast"
+	"analyzer/validator"
 )
 
 // ValidationOutput represents the JSON structure emitted when

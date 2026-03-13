@@ -3,7 +3,7 @@ package validator_test
 import (
 	"testing"
 
-	"github.com/abiiranathan/go-template-lsp/analyzer/validator"
+	"analyzer/validator"
 )
 
 func TestExtractNamedTemplates(t *testing.T) {

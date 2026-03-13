@@ -3,7 +3,7 @@ package validator
 import (
 	"strings"
 
-	"github.com/abiiranathan/go-template-lsp/analyzer/ast"
+	"analyzer/ast"
 )
 
 // knownTypeMethods maps fully-qualified (or short) type names to the set of

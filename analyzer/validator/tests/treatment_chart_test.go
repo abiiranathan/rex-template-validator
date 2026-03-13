@@ -3,8 +3,8 @@ package validator_test
 import (
 	"testing"
 
-	"github.com/abiiranathan/go-template-lsp/analyzer/ast"
-	"github.com/abiiranathan/go-template-lsp/analyzer/validator"
+	"analyzer/ast"
+	"analyzer/validator"
 )
 
 // treatmentChartVars mirrors the variables passed from handler.go's RenderTreatmentChart
