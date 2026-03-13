@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/abiiranathan/gotpl-analyzer/ast"
+	"github.com/abiiranathan/go-template-lsp/analyzer/ast"
 )
 
 func TestFindRenderVarsForTemplateMatchesBySuffix(t *testing.T) {

@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/abiiranathan/gotpl-analyzer/ast"
-	"github.com/abiiranathan/gotpl-analyzer/validator"
+	"github.com/abiiranathan/go-template-lsp/analyzer/ast"
+	"github.com/abiiranathan/go-template-lsp/analyzer/validator"
 )
 
 // sharedVars is the common variable set used across tests.

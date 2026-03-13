@@ -1,4 +1,4 @@
-module go-template-lsp
+module github.com/abiiranathan/go-template-lsp
 
 go 1.25.7
 

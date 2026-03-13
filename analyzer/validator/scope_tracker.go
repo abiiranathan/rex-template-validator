@@ -4,7 +4,7 @@ import (
 	"maps"
 	"strings"
 
-	"github.com/abiiranathan/gotpl-analyzer/ast"
+	"github.com/abiiranathan/go-template-lsp/analyzer/ast"
 )
 
 // resolvePartialScope determines what scope/type the context argument refers to

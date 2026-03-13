@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/abiiranathan/gotpl-analyzer/ast"
+	"github.com/abiiranathan/go-template-lsp/analyzer/ast"
 )
 
 // validateTemplateCallWithRegistry is the hot-path implementation. It accepts

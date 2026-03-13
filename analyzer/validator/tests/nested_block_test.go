@@ -3,8 +3,8 @@ package validator_test
 import (
 	"testing"
 
-	"github.com/abiiranathan/gotpl-analyzer/ast"
-	"github.com/abiiranathan/gotpl-analyzer/validator"
+	"github.com/abiiranathan/go-template-lsp/analyzer/ast"
+	"github.com/abiiranathan/go-template-lsp/analyzer/validator"
 )
 
 // nestedBlockVars mirrors the context for the "prescription-summary" block test.

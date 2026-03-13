@@ -5,7 +5,7 @@ import (
 	"maps"
 	"strings"
 
-	"github.com/abiiranathan/gotpl-analyzer/ast"
+	"github.com/abiiranathan/go-template-lsp/analyzer/ast"
 )
 
 // ValidateTemplateContent performs comprehensive validation of template content

@@ -24,7 +24,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/abiiranathan/gotpl-analyzer/ast"
+	"github.com/abiiranathan/go-template-lsp/analyzer/ast"
 )
 
 // ValidateTemplates validates all templates against their render calls AND
