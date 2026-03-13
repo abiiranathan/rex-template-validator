@@ -2,7 +2,7 @@
   "name": "go-template-lsp",
   "displayName": "Go Template LSP (Language Server)",
   "description": "Language Server Protocol extension for Go templates: validation, intellisense, go to definition, and more.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "yomedicalfiles",
   "repository": {
     "url": "https://github.com/abiiranathan/go-template-lsp.git"
